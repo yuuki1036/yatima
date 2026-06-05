@@ -1,0 +1,30 @@
+name: ingest
+
+# RSS 取得 cron。毎時実行 + 手動実行。
+# Supabase 無料枠の「7日無活動で pause」も毎時アクセスで自然回避できる。
+on:
+  schedule:
+    - cron: "0 * * * *" # 毎時 0 分（UTC）
+  workflow_dispatch: {} # Actions タブから手動実行
+
+# 同時に走らないように直列化
+concurrency:
+  group: ingest
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run ingest
+        env:
+          # GitHub リポジトリの Settings > Secrets and variables > Actions に登録する
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
