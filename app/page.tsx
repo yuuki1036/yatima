@@ -71,6 +71,11 @@ export default async function Home() {
                 {a.is_starred && <span className="text-amber-500">★ </span>}
                 {a.title ?? "(無題)"}
               </a>
+              {a.summary && (
+                <p className="mt-1 line-clamp-2 text-sm text-zinc-600 dark:text-zinc-400">
+                  {a.summary}
+                </p>
+              )}
               <div className="mt-0.5 flex flex-wrap gap-x-2 text-xs text-zinc-500">
                 {a.feeds?.title && <span>{a.feeds.title}</span>}
                 {a.published_at && <span>· {formatDate(a.published_at)}</span>}

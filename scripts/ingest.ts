@@ -6,6 +6,7 @@ config({ path: ".env.local" });
 
 import { createAdminClient } from "../lib/supabase/admin";
 import { ingestAllFeeds } from "../lib/rss/ingest";
+import { summarizeMissing } from "../lib/llm/summarize-batch";
 
 async function main() {
   const supabase = createAdminClient();
@@ -24,6 +25,12 @@ async function main() {
   }
   console.log(
     `\n完了: ${results.length} フィード / 新規 ${total} 記事 / 失敗 ${failed} 件`,
+  );
+
+  // 取得後にバッチ要約（summary IS NULL を埋める）。fail-soft なのでここで CI は赤くしない。
+  const s = await summarizeMissing(supabase);
+  console.log(
+    `要約: 成功 ${s.succeeded} / 失敗 ${s.failed}${s.skipped ? " (ANTHROPIC_API_KEY 未設定でスキップ)" : ""}`,
   );
 
   // 全フィード失敗時は CI を赤くする

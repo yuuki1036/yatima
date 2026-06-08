@@ -10,6 +10,7 @@
     "ingest": "tsx scripts/ingest.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.102.0",
     "@supabase/ssr": "^0.10.3",
     "@supabase/supabase-js": "^2.107.0",
     "next": "16.2.7",
