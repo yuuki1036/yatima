@@ -41,6 +41,5 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# claude code（ローカルログは無視、indie プロジェクト管理は追跡する）
-.claude/*
-!.claude/indie/
+# claude code（ローカル管理。すべて git 管理対象外）
+.claude/
