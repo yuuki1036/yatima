@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { Summarizer, SummarizeInput } from "./types";
+import { sanitizeSummary } from "./sanitize";
 
 // Claude Haiku 4.5 による日本語要約。
 // API キーは ANTHROPIC_API_KEY（NEXT_PUBLIC_ は付けない＝クライアントに鍵を漏らさない）。
@@ -12,6 +13,7 @@ const SYSTEM_PROMPT = [
   "与えられた記事を日本語で1〜2文・80〜120字程度に要約してください。",
   "要点のみを簡潔に述べ、「この記事は」などの前置きや感想は書かないこと。",
   "体言止めも可。マークダウンや箇条書きは使わず、プレーンな文章で返すこと。",
+  "見出し（# 記号）やラベル（「要約:」「記事の要約」など）は一切付けず、要約本文だけを返すこと。",
 ].join("\n");
 
 class HaikuSummarizer implements Summarizer {
@@ -39,11 +41,12 @@ class HaikuSummarizer implements Summarizer {
     });
 
     // text ブロックのみ連結（将来 thinking 等が混在しても弾く）
-    return res.content
+    const text = res.content
       .filter((b): b is Anthropic.TextBlock => b.type === "text")
       .map((b) => b.text)
-      .join("")
-      .trim();
+      .join("");
+    // プロンプト指示を無視して付く見出し/ラベルを後処理で除去
+    return sanitizeSummary(text);
   }
 }
 
