@@ -12,8 +12,8 @@ const MODEL = "claude-haiku-4-5";
 
 const SYSTEM_PROMPT = [
   "あなたは技術記事の要約者です。",
-  "与えられた記事を日本語で1〜2文・80〜120字程度に要約してください。",
-  "要点のみを簡潔に述べ、「この記事は」などの前置きや感想は書かないこと。",
+  "与えられた記事を日本語で3〜4文・150〜250字程度に要約してください。",
+  "要点に加えて背景や具体（何が・なぜ・どう新しいか）も簡潔に述べ、「この記事は」などの前置きや感想は書かないこと。",
   "体言止めも可。マークダウンや箇条書きは使わず、プレーンな文章で返すこと。",
   "見出し（# 記号）やラベル（「要約:」「記事の要約」など）は一切付けず、要約本文だけを返すこと。",
 ].join("\n");
@@ -24,7 +24,7 @@ const ANNOTATE_SYSTEM_PROMPT = [
   "与えられた記事について、日本語の要約とタグを JSON で返してください。",
   "出力は次の形式の JSON オブジェクトのみ。前置き・コードフェンス・説明文は一切付けないこと:",
   '{"summary": "...", "tags": ["...", "..."]}',
-  "summary: 日本語で1〜2文・80〜120字程度。要点のみ簡潔に。「この記事は」等の前置きや感想は書かず、体言止めも可。マークダウンやラベルは付けない。",
+  "summary: 日本語で3〜4文・150〜250字程度。要点に加え背景や具体（何が・なぜ・どう新しいか）も簡潔に。「この記事は」等の前置きや感想は書かず、体言止めも可。マークダウンやラベルは付けない。",
   'tags: 次の固定リストから関連する slug を1〜3個選ぶ。リスト外の語は禁止。該当が薄ければ "other" を使う。',
   `タグ候補: ${TAG_VOCAB_PROMPT}`,
 ].join("\n");
@@ -46,7 +46,7 @@ class HaikuSummarizer implements Summarizer {
 
     const res = await this.client.messages.create({
       model: MODEL,
-      max_tokens: 300,
+      max_tokens: 600, // 3〜4文・150〜250字の要約に余裕を持たせる
       // 要約に思考は不要。Haiku は effort パラメータ非対応のため付けない。
       thinking: { type: "disabled" },
       system: SYSTEM_PROMPT,
@@ -72,7 +72,7 @@ class HaikuSummarizer implements Summarizer {
 
     const res = await this.client.messages.create({
       model: MODEL,
-      max_tokens: 500, // 要約 + tags の JSON 分のマージン（要約のみの 300 から増量）
+      max_tokens: 700, // 3〜4文の要約 + tags の JSON 分のマージン
       thinking: { type: "disabled" },
       system: ANNOTATE_SYSTEM_PROMPT,
       messages: [{ role: "user", content: userText }],
@@ -86,6 +86,11 @@ class HaikuSummarizer implements Summarizer {
     const parsed = parseAnnotation(text);
     if (!parsed) {
       // JSON 化失敗 → 生テキストを要約として救済し、タグは諦める（fail-soft）。
+      // タグ欠落は興味順スコアに効くため、無痕跡にせず警告を残す（プロンプト崩れの検知用）。
+      console.warn(
+        "annotate の JSON パース失敗。要約のみ救済しタグは空にフォールバック:",
+        text.slice(0, 120),
+      );
       const summary = sanitizeSummary(text);
       if (!summary) throw new Error("要約が空");
       return { summary, tags: [] };
