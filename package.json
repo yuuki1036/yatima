@@ -11,7 +11,8 @@
     "start": "next start",
     "lint": "eslint",
     "ingest": "tsx scripts/ingest.ts",
-    "migrate": "tsx scripts/migrate.ts"
+    "migrate": "tsx scripts/migrate.ts",
+    "resummarize": "tsx scripts/resummarize.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.102.0",

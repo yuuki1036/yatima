@@ -42,5 +42,8 @@ create index if not exists idx_articles_is_read      on public.articles (is_read
 alter table public.feeds    enable row level security;
 alter table public.articles enable row level security;
 
+-- create policy は非冪等（再実行で 42710）。drop if exists を前置して再適用可能にする。
+drop policy if exists "read feeds"    on public.feeds;
+drop policy if exists "read articles" on public.articles;
 create policy "read feeds"    on public.feeds    for select to anon, authenticated using (true);
 create policy "read articles" on public.articles for select to anon, authenticated using (true);

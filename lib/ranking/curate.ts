@@ -67,16 +67,23 @@ export async function curateToday(
 
   if (scored.length === 0) return { date: today, picked: 0, skipped: false };
 
-  // ── 確定: まず picked_date を一括付与（ガードを原子的に満たす）→ score を個別保存（表示順用）
+  // ── 確定: 先に score を個別保存 → 最後に picked_date を一括付与（日次ガードを満たす commit）。
+  // 順序が肝。score を先にするのは部分失敗時の自己回復のため:
+  // score update がエラーで throw すれば picked_date は未付与のまま → 日次ガードが立たず、
+  // 次回 curate が同じ候補をやり直せる（picked_date 先付与だと部分失敗でも固定されてしまう）。
+  for (const s of scored) {
+    const { error: sErr } = await supabase
+      .from("articles")
+      .update({ score: s.value })
+      .eq("id", s.id);
+    if (sErr) throw sErr;
+  }
   const ids = scored.map((s) => s.id);
   const { error: pickErr } = await supabase
     .from("articles")
     .update({ picked_date: today })
     .in("id", ids);
   if (pickErr) throw pickErr;
-  for (const s of scored) {
-    await supabase.from("articles").update({ score: s.value }).eq("id", s.id);
-  }
 
   return { date: today, picked: scored.length, skipped: false };
 }

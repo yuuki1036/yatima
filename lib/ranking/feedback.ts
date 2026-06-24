@@ -19,6 +19,8 @@ export async function recordFeedback(
       .maybeSingle(),
   ]);
   if (tagRes.error) throw tagRes.error;
+  // prevRes のエラーを無視すると prevAction=null に縮退し、再判定が新規扱いで二重加算される。
+  if (prevRes.error) throw prevRes.error;
 
   const tags = (tagRes.data ?? []).map((r) => r.tag_slug as string);
   const prevAction = (prevRes.data?.action ?? null) as FeedbackAction | null;
