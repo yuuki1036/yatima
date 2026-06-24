@@ -6,7 +6,8 @@ config({ path: ".env.local" });
 
 import { createAdminClient } from "../lib/supabase/admin";
 import { ingestAllFeeds } from "../lib/rss/ingest";
-import { summarizeMissing } from "../lib/llm/summarize-batch";
+import { annotateMissing } from "../lib/llm/summarize-batch";
+import { curateToday } from "../lib/ranking/curate";
 
 async function main() {
   const supabase = createAdminClient();
@@ -27,11 +28,24 @@ async function main() {
     `\n完了: ${results.length} フィード / 新規 ${total} 記事 / 失敗 ${failed} 件`,
   );
 
-  // 取得後にバッチ要約（summary IS NULL を埋める）。fail-soft なのでここで CI は赤くしない。
-  const s = await summarizeMissing(supabase);
+  // 取得後にバッチ要約+タグ付け（summary IS NULL を埋める）。fail-soft なのでここで CI は赤くしない。
+  const s = await annotateMissing(supabase);
   console.log(
-    `要約: 成功 ${s.succeeded} / 失敗 ${s.failed}${s.skipped ? " (ANTHROPIC_API_KEY 未設定でスキップ)" : ""}`,
+    `要約+タグ: 成功 ${s.succeeded} / 失敗 ${s.failed}${s.skipped ? " (ANTHROPIC_API_KEY 未設定でスキップ)" : ""}`,
   );
+
+  // 今日の10件を確定（日次ガードで冪等。毎時 cron でも当日1回だけ確定される）。
+  // キュレーション失敗は ingest 全体を落とさない（fail-soft）。
+  try {
+    const c = await curateToday(supabase);
+    console.log(
+      c.skipped
+        ? `キュレーション: 本日分は確定済み (${c.picked}件)`
+        : `キュレーション: 今日の ${c.picked}件 を確定`,
+    );
+  } catch (e) {
+    console.warn("キュレーション失敗:", e);
+  }
 
   // 全フィード失敗時は CI を赤くする
   if (results.length > 0 && failed === results.length) process.exit(1);
