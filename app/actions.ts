@@ -3,7 +3,11 @@
 import { revalidatePath } from "next/cache";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { ingestAllFeeds } from "@/lib/rss/ingest";
-import { summarizeMissing } from "@/lib/llm/summarize-batch";
+import { annotateMissing } from "@/lib/llm/summarize-batch";
+import { curateToday } from "@/lib/ranking/curate";
+import { recordFeedback } from "@/lib/ranking/feedback";
+import { FEEDBACK_WEIGHT } from "@/lib/ranking/preferences";
+import type { FeedbackAction } from "@/lib/types";
 
 // 書き込みはすべて service role（RLS バイパス）で行う。
 
@@ -24,6 +28,7 @@ export async function deleteFeed(formData: FormData) {
   await supabase.from("feeds").delete().eq("id", id);
   revalidatePath("/feeds");
   revalidatePath("/");
+  revalidatePath("/list");
 }
 
 export async function toggleRead(formData: FormData) {
@@ -32,7 +37,7 @@ export async function toggleRead(formData: FormData) {
   const next = formData.get("is_read") !== "true"; // 現在値の反転
   const supabase = createAdminClient();
   await supabase.from("articles").update({ is_read: next }).eq("id", id);
-  revalidatePath("/");
+  revalidatePath("/list");
 }
 
 export async function toggleStar(formData: FormData) {
@@ -41,15 +46,31 @@ export async function toggleStar(formData: FormData) {
   const next = formData.get("is_starred") !== "true";
   const supabase = createAdminClient();
   await supabase.from("articles").update({ is_starred: next }).eq("id", id);
-  revalidatePath("/");
+  revalidatePath("/list");
 }
 
-// 「今すぐ取得」: 全 active フィードを取得して保存し、続けて未要約記事を要約する。
-// 要約は同期実行（fail-soft）。完了後に revalidate するため、要約付き一覧が即反映される。
+// 「今すぐ取得」: 全 active フィードを取得→保存→未要約記事を要約+タグ付け→今日の10件を確定。
+// すべて同期実行（fail-soft）。完了後に revalidate するため一覧が即反映される。
 export async function refreshNow() {
   const supabase = createAdminClient();
   await ingestAllFeeds(supabase);
-  await summarizeMissing(supabase);
+  await annotateMissing(supabase);
+  await curateToday(supabase);
   revalidatePath("/");
+  revalidatePath("/list");
   revalidatePath("/feeds");
+}
+
+// Tinder カードのフィードバック（開く/役立った/不要）。タグ嗜好を更新し、当日の一覧を再取得させる。
+export async function submitFeedback(formData: FormData) {
+  const id = String(formData.get("id") ?? "");
+  const action = String(formData.get("action") ?? "");
+  // 直 POST 防御: 既知の action 値のみ受け付ける
+  if (!id || !(action in FEEDBACK_WEIGHT)) return;
+  const supabase = createAdminClient();
+  await recordFeedback(supabase, id, action as FeedbackAction);
+  // "/" は revalidate しない: デッキはクライアント側で1枚ずつ進むため、ここで再取得して
+  // 判定済みカードを配列から除外すると、楽観的に進めた index と二重にズレてカードが飛ぶ。
+  // リロード時はサーバクエリが判定済みを除外し、続きから再開する。
+  revalidatePath("/list"); // 「開く」で立てた既読を /list に反映
 }
