@@ -49,6 +49,11 @@ alter table public.tags             enable row level security;
 alter table public.article_tags     enable row level security;
 alter table public.preferences      enable row level security;
 alter table public.article_feedback enable row level security;
+-- create policy は非冪等（再実行で 42710）。drop if exists を前置して再適用可能にする。
+drop policy if exists "read tags"             on public.tags;
+drop policy if exists "read article_tags"     on public.article_tags;
+drop policy if exists "read preferences"      on public.preferences;
+drop policy if exists "read article_feedback" on public.article_feedback;
 create policy "read tags"             on public.tags             for select to anon, authenticated using (true);
 create policy "read article_tags"     on public.article_tags     for select to anon, authenticated using (true);
 create policy "read preferences"      on public.preferences      for select to anon, authenticated using (true);
