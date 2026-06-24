@@ -10,13 +10,15 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "ingest": "tsx scripts/ingest.ts"
+    "ingest": "tsx scripts/ingest.ts",
+    "migrate": "tsx scripts/migrate.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.102.0",
     "@supabase/ssr": "^0.10.3",
     "@supabase/supabase-js": "^2.107.0",
     "next": "16.2.7",
+    "pg": "^8.22.0",
     "react": "19.2.4",
     "react-dom": "19.2.4",
     "rss-parser": "^3.13.0"
@@ -24,6 +26,7 @@
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
+    "@types/pg": "^8.20.0",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "dotenv": "^17.4.2",
