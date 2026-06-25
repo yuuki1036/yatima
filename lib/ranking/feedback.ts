@@ -1,6 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { FeedbackAction } from "@/lib/types";
-import { FEEDBACK_WEIGHT, bumpTagPrefs } from "./preferences";
+import { FEEDBACK_WEIGHT, bumpTagPrefs, bumpSourcePref } from "./preferences";
 
 // フィードバック（開く/役立った/不要）を記録し、その記事のタグ嗜好を更新する。
 // article_feedback は1記事1行の元帳。再判定（2回目）も「新重み-旧重み」の差分加算で整合させる。
@@ -9,9 +9,14 @@ export async function recordFeedback(
   articleId: string,
   action: FeedbackAction,
 ): Promise<void> {
-  // 記事のタグと既存フィードバックを取得
-  const [tagRes, prevRes] = await Promise.all([
+  // 記事のタグ・所属フィード・既存フィードバックを取得
+  const [tagRes, feedRes, prevRes] = await Promise.all([
     supabase.from("article_tags").select("tag_slug").eq("article_id", articleId),
+    supabase
+      .from("articles")
+      .select("feed_id")
+      .eq("id", articleId)
+      .maybeSingle(),
     supabase
       .from("article_feedback")
       .select("action")
@@ -19,17 +24,21 @@ export async function recordFeedback(
       .maybeSingle(),
   ]);
   if (tagRes.error) throw tagRes.error;
+  if (feedRes.error) throw feedRes.error;
   // prevRes のエラーを無視すると prevAction=null に縮退し、再判定が新規扱いで二重加算される。
   if (prevRes.error) throw prevRes.error;
 
   const tags = (tagRes.data ?? []).map((r) => r.tag_slug as string);
+  const feedId = (feedRes.data?.feed_id ?? null) as string | null;
   const prevAction = (prevRes.data?.action ?? null) as FeedbackAction | null;
 
   if (prevAction !== action) {
     // 差分 = 新重み - 旧重み（旧なしは 0）。2 重加算や判定変更を正しく反映する。
     const delta =
       FEEDBACK_WEIGHT[action] - (prevAction ? FEEDBACK_WEIGHT[prevAction] : 0);
+    // タグ嗜好とソース嗜好を同じ差分で更新（ソース項はスコアのソース成分に効く）。
     await bumpTagPrefs(supabase, tags, delta);
+    if (feedId) await bumpSourcePref(supabase, feedId, delta);
     const { error } = await supabase.from("article_feedback").upsert(
       { article_id: articleId, action, created_at: new Date().toISOString() },
       { onConflict: "article_id" },
