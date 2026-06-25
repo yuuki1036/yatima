@@ -1,6 +1,6 @@
 // 線形ランキングのスコア純関数。
-//   score = 新しさ減衰 + Σ(記事に付いたタグの tag_pref)
-// 引数だけに依存する純関数にし、`now` / `tagPrefs` を注入することで
+//   score = 新しさ減衰 + Σ(記事に付いたタグの tag_pref) + ソース嗜好(source_pref)
+// 引数だけに依存する純関数にし、`now` / `tagPrefs` / `sourcePrefs` を注入することで
 // フィード1本でも複数でも同じ関数で計算でき、DB なしでユニットテストできる。
 
 const RECENCY_HALF_LIFE_HOURS = 24; // 新しさ減衰の半減期（24h で 0.5 倍）
@@ -21,8 +21,9 @@ export type ScoreInput = {
   publishedAt: string | null;
   tags: string[];
   tagPrefs: Map<string, number>; // preferences(kind='tag') を Map 化したもの
+  sourceId?: string | null; // 記事のフィード id（preferences(kind='source') のキー）
+  sourcePrefs?: Map<string, number>; // preferences(kind='source') を Map 化したもの
   now?: number;
-  // 将来: sourceId?, sourcePrefs? を足してソース項を加算する
 };
 
 export function score(input: ScoreInput): number {
@@ -32,7 +33,10 @@ export function score(input: ScoreInput): number {
     (s, t) => s + (input.tagPrefs.get(t) ?? 0),
     0,
   );
-  // コールドスタート（tagPrefs 全 0）時は tagScore=0 となり実質「新着順」に縮退する。
-  return recency + tagScore;
-  // 将来: + sourceTerm(input.sourceId, input.sourcePrefs)
+  const sourceScore =
+    input.sourceId && input.sourcePrefs
+      ? (input.sourcePrefs.get(input.sourceId) ?? 0)
+      : 0;
+  // コールドスタート（pref 全 0）時は tagScore=sourceScore=0 となり実質「新着順」に縮退する。
+  return recency + tagScore + sourceScore;
 }
