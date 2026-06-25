@@ -1,7 +1,7 @@
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { formatDate, errorMessage } from "@/lib/format";
 import type { ArticleWithFeed } from "@/lib/types";
-import { toggleRead, toggleStar, refreshNow } from "../actions";
+import { toggleRead, toggleStar } from "../actions";
 
 // 全件ブラウズ用の密リスト（旧トップ）。Tinder（/）の取りこぼし確認・既読/スター操作の受け皿。
 export const dynamic = "force-dynamic";
@@ -35,11 +35,6 @@ export default async function ListPage() {
             ({articles.length})
           </span>
         </h1>
-        <form action={refreshNow}>
-          <button className="rounded-md bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300">
-            今すぐ取得
-          </button>
-        </form>
       </div>
 
       {errorMsg && (
@@ -56,7 +51,7 @@ export default async function ListPage() {
         <p className="py-12 text-center text-sm text-zinc-500">
           記事がありません。
           <br />
-          「フィード」からフィードを追加して「今すぐ取得」を押してください。
+          「フィード」からフィードを追加すると、定期実行で記事が取得されます。
         </p>
       )}
 

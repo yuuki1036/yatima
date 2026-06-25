@@ -63,7 +63,7 @@ export function CurationDeck({ cards, submitFeedbackAction }: Props) {
       <p className="py-16 text-center text-sm text-zinc-500">
         今日のピックはまだありません。
         <br />
-        「今すぐ取得」で記事を集めてください。
+        記事の取得とキュレーションは定期実行されます。少し待って再読み込みしてください。
       </p>
     );
   }

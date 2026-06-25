@@ -92,7 +92,7 @@ export async function summarizeMissing(
 }
 
 // Phase3: 取得→保存の後に呼ぶバッチ「アノテート」。要約とタグを同時生成して保存する。
-// summarizeMissing の上位互換（要約も埋める）。cron / refreshNow からはこちらを呼ぶ。
+// summarizeMissing の上位互換（要約も埋める）。cron からはこちらを呼ぶ。
 export type AnnotateBatchResult = {
   picked: number;
   succeeded: number;
