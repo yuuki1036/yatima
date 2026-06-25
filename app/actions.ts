@@ -2,9 +2,6 @@
 
 import { revalidatePath } from "next/cache";
 import { createAdminClient } from "@/lib/supabase/admin";
-import { ingestAllFeeds } from "@/lib/rss/ingest";
-import { annotateMissing } from "@/lib/llm/summarize-batch";
-import { curateToday } from "@/lib/ranking/curate";
 import { recordFeedback } from "@/lib/ranking/feedback";
 import { FEEDBACK_WEIGHT } from "@/lib/ranking/preferences";
 import type { FeedbackAction } from "@/lib/types";
@@ -47,18 +44,6 @@ export async function toggleStar(formData: FormData) {
   const supabase = createAdminClient();
   await supabase.from("articles").update({ is_starred: next }).eq("id", id);
   revalidatePath("/list");
-}
-
-// 「今すぐ取得」: 全 active フィードを取得→保存→未要約記事を要約+タグ付け→今日の10件を確定。
-// すべて同期実行（fail-soft）。完了後に revalidate するため一覧が即反映される。
-export async function refreshNow() {
-  const supabase = createAdminClient();
-  await ingestAllFeeds(supabase);
-  await annotateMissing(supabase);
-  await curateToday(supabase);
-  revalidatePath("/");
-  revalidatePath("/list");
-  revalidatePath("/feeds");
 }
 
 // Tinder カードのフィードバック（開く/役立った/不要）。タグ嗜好を更新し、当日の一覧を再取得させる。

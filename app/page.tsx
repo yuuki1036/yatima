@@ -1,7 +1,7 @@
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { todayJst, errorMessage } from "@/lib/format";
 import type { CurationCard } from "@/lib/types";
-import { submitFeedback, refreshNow } from "./actions";
+import { submitFeedback } from "./actions";
 import { CurationDeck } from "./_components/curation-deck";
 
 export const dynamic = "force-dynamic";
@@ -61,11 +61,6 @@ export default async function Home() {
     <div>
       <div className="mb-4 flex items-center justify-between">
         <h1 className="text-lg font-semibold">今日のピック</h1>
-        <form action={refreshNow}>
-          <button className="rounded-md bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300">
-            今すぐ取得
-          </button>
-        </form>
       </div>
 
       {errorMsg && (

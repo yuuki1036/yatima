@@ -3,7 +3,7 @@ import { todayJst } from "@/lib/format";
 import { score } from "./score";
 import { loadTagPrefs } from "./preferences";
 
-// 「今日の固定10件」を確定するキュレーション。ingest パイプライン末尾（cron / refreshNow）から呼ぶ。
+// 「今日の固定10件」を確定するキュレーション。ingest パイプライン末尾（cron）から呼ぶ。
 // 日次ガードで冪等: 当日分が既にあれば何もしない（毎時 cron が走っても固定される）。
 
 const DAILY_COUNT = 10;
