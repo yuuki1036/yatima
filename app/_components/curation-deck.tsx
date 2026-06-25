@@ -6,13 +6,20 @@ import { SwipeCard } from "./swipe-card";
 
 type Props = {
   cards: CurationCard[];
+  // 今日の総ピック数（判定済み込み）。リロード後に判定済みを除外した cards が空でも、
+  // 「ピック未生成」と「全件判定済み（完了）」を区別して表示し分けるために使う。
+  pickedToday: number;
   // Server Action を prop で受け取る（Next.js のクライアント連携パターン）。
   submitFeedbackAction: (formData: FormData) => void;
 };
 
 // 今日のカードを1枚ずつ捌く Tinder UI。送り操作はクライアント state で楽観的に前進し、
 // DB 反映（嗜好更新）は Server Action でバックグラウンド送信する（往復待ちで詰まらせない）。
-export function CurationDeck({ cards, submitFeedbackAction }: Props) {
+export function CurationDeck({
+  cards,
+  pickedToday,
+  submitFeedbackAction,
+}: Props) {
   const [index, setIndex] = useState(0);
   const [, startTransition] = useTransition();
 
@@ -59,6 +66,17 @@ export function CurationDeck({ cards, submitFeedbackAction }: Props) {
   }, [current, send]);
 
   if (deck.length === 0) {
+    // ピックは生成されたが全件判定済み（リロード後）→ 完了表示。
+    // 未生成（pickedToday=0）と区別する。
+    if (pickedToday > 0) {
+      return (
+        <p className="py-16 text-center text-sm text-zinc-500">
+          今日は完了です 🎉
+          <br />
+          今日の{pickedToday}件はすべて判定済みです。
+        </p>
+      );
+    }
     return (
       <p className="py-16 text-center text-sm text-zinc-500">
         今日のピックはまだありません。

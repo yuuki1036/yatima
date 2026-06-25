@@ -20,6 +20,7 @@ type PickRow = {
 
 export default async function Home() {
   let cards: CurationCard[] = [];
+  let pickedToday = 0; // 今日の総ピック数（判定済み込み）。「未生成」と「全件完了」の区別に使う
   let errorMsg: string | null = null;
 
   try {
@@ -42,6 +43,7 @@ export default async function Home() {
       (fbRes.data ?? []).map((f) => f.article_id as string),
     );
     const rows = (picksRes.data ?? []) as unknown as PickRow[];
+    pickedToday = rows.length; // 判定前の今日のピック総数
     cards = rows
       .filter((a) => !done.has(a.id)) // 判定済みは除外（リロードで続きから）
       .map((a) => ({
@@ -74,7 +76,11 @@ export default async function Home() {
       )}
 
       {!errorMsg && (
-        <CurationDeck cards={cards} submitFeedbackAction={submitFeedback} />
+        <CurationDeck
+          cards={cards}
+          pickedToday={pickedToday}
+          submitFeedbackAction={submitFeedback}
+        />
       )}
     </div>
   );
