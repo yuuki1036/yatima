@@ -6,6 +6,7 @@ config({ path: ".env.local" });
 
 import { createAdminClient } from "../lib/supabase/admin";
 import { ingestAllFeeds } from "../lib/rss/ingest";
+import { enrichMissingBodies } from "../lib/rss/enrich";
 import { annotateMissing } from "../lib/llm/summarize-batch";
 import { curateToday } from "../lib/ranking/curate";
 
@@ -26,6 +27,12 @@ async function main() {
   }
   console.log(
     `\n完了: ${results.length} フィード / 新規 ${total} 記事 / 失敗 ${failed} 件`,
+  );
+
+  // 要約前に、本文が薄い記事（HN 等）の本文をリンク先から取得して補完する（fail-soft）。
+  const en = await enrichMissingBodies(supabase);
+  console.log(
+    `本文補完: 取得 ${en.enriched} / 失敗 ${en.failed}（対象 ${en.thin} 件）`,
   );
 
   // 取得後にバッチ要約+タグ付け（summary IS NULL を埋める）。fail-soft なのでここで CI は赤くしない。
