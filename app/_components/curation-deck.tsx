@@ -1,8 +1,12 @@
 "use client";
 
-import { useCallback, useEffect, useState, useTransition } from "react";
+import { useCallback, useEffect, useRef, useState, useTransition } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import type { CurationCard, FeedbackAction } from "@/lib/types";
 import { SwipeCard } from "./swipe-card";
+
+// スワイプで送ると判定する閾値（px）。これを超えて指を離すと dismiss/useful を発火。
+const SWIPE_THRESHOLD = 90;
 
 type Props = {
   cards: CurationCard[];
@@ -65,6 +69,63 @@ export function CurationDeck({
     return () => window.removeEventListener("keydown", onKey);
   }, [current, send]);
 
+  // ── フリック（スワイプ）対応: カードを左右にドラッグして送る ─────────────
+  // ポインタ操作（タッチ + マウス兼用）。8px 動いて初めてドラッグ扱いにし、タイトルの
+  // タップ（リンク）を温存する。閾値超えで dismiss/useful を発火。
+  const [dx, setDx] = useState(0); // 現在のドラッグ量（px）
+  const [dragging, setDragging] = useState(false);
+  const [flyOut, setFlyOut] = useState<null | "left" | "right">(null);
+  const dragStartX = useRef(0);
+  const pointerActive = useRef(false);
+  const draggingRef = useRef(false); // 判定は ref で行う（state クロージャの陳腐化を避ける）
+  const dxRef = useRef(0);
+
+  const onPointerDown = useCallback(
+    (e: ReactPointerEvent<HTMLDivElement>) => {
+      if (flyOut) return; // 飛ばし中は新規ドラッグを受けない
+      dragStartX.current = e.clientX;
+      pointerActive.current = true;
+    },
+    [flyOut],
+  );
+  const onPointerMove = useCallback((e: ReactPointerEvent<HTMLDivElement>) => {
+    if (!pointerActive.current) return;
+    const d = e.clientX - dragStartX.current;
+    if (!draggingRef.current) {
+      if (Math.abs(d) < 8) return; // 微動はドラッグ扱いせずタップを温存
+      draggingRef.current = true;
+      setDragging(true); // 見た目（transition/カーソル）用
+      e.currentTarget.setPointerCapture(e.pointerId);
+    }
+    dxRef.current = d;
+    setDx(d);
+  }, []);
+  const endDrag = useCallback(() => {
+    pointerActive.current = false;
+    if (!draggingRef.current) return; // タップ（ドラッグ未開始）は何もしない
+    draggingRef.current = false;
+    setDragging(false);
+    const d = dxRef.current;
+    if (d > SWIPE_THRESHOLD) setFlyOut("right");
+    else if (d < -SWIPE_THRESHOLD) setFlyOut("left");
+    else {
+      dxRef.current = 0;
+      setDx(0); // 閾値未満はスナップバック
+    }
+  }, []);
+
+  // 飛ばし切ったらフィードバックを送って次の1枚へ（飛ぶアニメ後に発火）。
+  useEffect(() => {
+    if (!flyOut || !current) return;
+    const t = setTimeout(() => {
+      send(current, flyOut === "right" ? "useful" : "dismiss");
+      dxRef.current = 0;
+      setDx(0);
+      setFlyOut(null);
+    }, 180);
+    return () => clearTimeout(t);
+  }, [flyOut, current, send]);
+
   if (deck.length === 0) {
     // ピックは生成されたが全件判定済み（リロード後）→ 完了表示。
     // 未生成（pickedToday=0）と区別する。
@@ -102,7 +163,50 @@ export function CurationDeck({
         {index + 1} / {deck.length}
       </div>
 
-      <SwipeCard card={current} />
+      <div
+        className="relative touch-pan-y select-none"
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+      >
+        <div
+          className={dragging ? "cursor-grabbing" : "cursor-grab"}
+          style={{
+            transform: flyOut
+              ? `translateX(${flyOut === "right" ? 1000 : -1000}px) rotate(${
+                  flyOut === "right" ? 18 : -18
+                }deg)`
+              : `translateX(${dx}px) rotate(${dx * 0.04}deg)`,
+            transition: dragging ? "none" : "transform 180ms ease-out",
+            opacity: flyOut ? 0 : 1,
+          }}
+        >
+          <SwipeCard card={current} />
+        </div>
+
+        {/* スワイプ方向のヒント（指の移動量に応じてフェードイン） */}
+        <div className="pointer-events-none absolute inset-0 flex items-start justify-between p-4">
+          <span
+            className="rounded-md border-2 border-rose-400 px-3 py-1 text-base font-bold text-rose-500"
+            style={{
+              opacity: dx < 0 ? Math.min(1, -dx / SWIPE_THRESHOLD) : 0,
+              transform: "rotate(-12deg)",
+            }}
+          >
+            興味なし
+          </span>
+          <span
+            className="rounded-md border-2 border-emerald-400 px-3 py-1 text-base font-bold text-emerald-500"
+            style={{
+              opacity: dx > 0 ? Math.min(1, dx / SWIPE_THRESHOLD) : 0,
+              transform: "rotate(12deg)",
+            }}
+          >
+            興味あり
+          </span>
+        </div>
+      </div>
 
       <div className="mt-5 flex items-center justify-center gap-3">
         <button
