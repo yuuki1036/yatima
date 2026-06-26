@@ -3,6 +3,11 @@ import { Archivo, Inter, IBM_Plex_Mono } from "next/font/google";
 import Link from "next/link";
 import "./globals.css";
 import { SiteNav } from "./_components/site-nav";
+import { ThemeToggle } from "./_components/theme-toggle";
+
+// 描画前に preference を effective(light/dark) に解決して <html data-theme> をセットする。
+// React hydration より前に同期実行され、FOUC（一瞬のライト→ダークのちらつき）を防ぐ。
+const THEME_INIT = `(function(){try{var p=localStorage.getItem('theme')||'system';var d=p==='dark'||(p!=='light'&&matchMedia('(prefers-color-scheme: dark)').matches);document.documentElement.dataset.theme=d?'dark':'light';}catch(e){}})();`;
 
 // 本文・タイトル
 const inter = Inter({
@@ -38,9 +43,11 @@ export default function RootLayout({
   return (
     <html
       lang="ja"
+      suppressHydrationWarning
       className={`${inter.variable} ${archivo.variable} ${ibmPlexMono.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col bg-background font-sans text-foreground">
+        <script dangerouslySetInnerHTML={{ __html: THEME_INIT }} />
         <header className="border-b-2 border-border">
           <div className="mx-auto flex max-w-3xl items-center justify-between gap-6 px-4 py-4">
             <Link
@@ -49,7 +56,10 @@ export default function RootLayout({
             >
               yatima
             </Link>
-            <SiteNav />
+            <div className="flex items-center gap-5">
+              <SiteNav />
+              <ThemeToggle />
+            </div>
           </div>
         </header>
         <main className="mx-auto w-full max-w-3xl flex-1 px-4 py-8">

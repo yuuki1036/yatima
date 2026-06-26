@@ -15,18 +15,19 @@
   --accent-foreground: #ffffff; /* 赤ベタ上の文字 */
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0e0e10;
-    --surface: #161619;
-    --foreground: #e6e6e6;
-    --muted: #9a9a9a;
-    --faint: #7a7a7a;
-    --border: #56565a;
-    --line: #2a2a2e;
-    --accent: #ff5a4d;
-    --accent-foreground: #0e0e10;
-  }
+/* ダークトークン。OS 追従ではなく属性ベース（:root[data-theme="dark"]）で適用する。
+   System/Light/Dark の解決は layout のインラインスクリプトが行い、effective 値を
+   <html data-theme> に同期セットする（FOUC なし）。CSS 側は @media を持たず DRY。 */
+:root[data-theme="dark"] {
+  --background: #0e0e10;
+  --surface: #161619;
+  --foreground: #e6e6e6;
+  --muted: #9a9a9a;
+  --faint: #7a7a7a;
+  --border: #56565a;
+  --line: #2a2a2e;
+  --accent: #ff5a4d;
+  --accent-foreground: #0e0e10;
 }
 
 @theme inline {
