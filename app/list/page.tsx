@@ -2,9 +2,12 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { formatDateShort, errorMessage } from "@/lib/format";
 import type { ArticleWithFeed } from "@/lib/types";
 import { toggleRead, toggleStar } from "../actions";
+import { RefreshButton } from "../_components/refresh-button";
 
 // 全件ブラウズ用の密リスト（旧トップ）。Tinder（/）の取りこぼし確認・既読/スター操作の受け皿。
 export const dynamic = "force-dynamic";
+// 手動「更新」(refreshNow) が取得→要約→curate を同期実行するため、関数時間を延ばす。
+export const maxDuration = 60;
 
 const btn =
   "border border-border px-2.5 py-1 font-mono text-xs tracking-wide transition-colors hover:bg-foreground hover:text-background";
@@ -32,13 +35,16 @@ export default async function ListPage() {
 
   return (
     <div>
-      <div className="mb-5 flex items-baseline justify-between">
+      <div className="mb-5 flex items-center justify-between">
         <span className="font-mono text-xs font-medium tracking-widest text-accent">
           ALL ARTICLES
         </span>
-        <span className="font-mono text-xs tracking-widest text-faint tabular-nums">
-          {String(articles.length).padStart(2, "0")}
-        </span>
+        <div className="flex items-center gap-4">
+          <span className="font-mono text-xs tracking-widest text-faint tabular-nums">
+            {String(articles.length).padStart(2, "0")}
+          </span>
+          <RefreshButton />
+        </div>
       </div>
 
       {errorMsg && (
