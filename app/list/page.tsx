@@ -1,5 +1,5 @@
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import { formatDate, errorMessage } from "@/lib/format";
+import { formatDateShort, errorMessage } from "@/lib/format";
 import type { ArticleWithFeed } from "@/lib/types";
 import { toggleRead, toggleStar } from "../actions";
 
@@ -7,7 +7,7 @@ import { toggleRead, toggleStar } from "../actions";
 export const dynamic = "force-dynamic";
 
 const btn =
-  "rounded-md border border-zinc-300 px-2 py-1 text-xs hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800";
+  "border border-border px-2.5 py-1 font-mono text-xs tracking-wide transition-colors hover:bg-foreground hover:text-background";
 
 export default async function ListPage() {
   let articles: ArticleWithFeed[] = [];
@@ -28,81 +28,99 @@ export default async function ListPage() {
 
   return (
     <div>
-      <div className="mb-4 flex items-center justify-between">
-        <h1 className="text-lg font-semibold">
-          一覧{" "}
-          <span className="text-sm font-normal text-zinc-500">
-            ({articles.length})
-          </span>
-        </h1>
+      <div className="mb-5 flex items-baseline justify-between">
+        <span className="font-mono text-xs font-medium tracking-widest text-accent">
+          ALL ARTICLES
+        </span>
+        <span className="font-mono text-xs tracking-widest text-faint tabular-nums">
+          {String(articles.length).padStart(2, "0")}
+        </span>
       </div>
 
       {errorMsg && (
-        <div className="mb-4 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
+        <div className="mb-4 border-l-2 border-accent bg-surface px-4 py-3 text-sm text-foreground">
           記事を取得できませんでした: {errorMsg}
           <br />
-          <span className="text-xs">
+          <span className="text-xs text-muted">
             .env.local の Supabase 設定と、supabase/migrations の適用を確認してください。
           </span>
         </div>
       )}
 
       {!errorMsg && articles.length === 0 && (
-        <p className="py-12 text-center text-sm text-zinc-500">
+        <p className="border border-line py-12 text-center text-sm text-muted">
           記事がありません。
           <br />
-          「フィード」からフィードを追加すると、定期実行で記事が取得されます。
+          「FEEDS」からフィードを追加すると、定期実行で記事が取得されます。
         </p>
       )}
 
-      <ul className="divide-y divide-zinc-200 dark:divide-zinc-800">
-        {articles.map((a) => (
-          <li key={a.id} className="flex items-start gap-3 py-3">
-            <div className="min-w-0 flex-1">
-              <a
-                href={a.url ?? "#"}
-                target="_blank"
-                rel="noopener noreferrer"
-                className={`block font-medium hover:underline ${
-                  a.is_read ? "text-zinc-400 dark:text-zinc-500" : ""
-                }`}
-              >
-                {a.is_starred && <span className="text-amber-500">★ </span>}
-                {a.title ?? "(無題)"}
-              </a>
-              {a.summary && (
-                <p className="mt-1 line-clamp-2 text-sm text-zinc-600 dark:text-zinc-400">
-                  {a.summary}
-                </p>
-              )}
-              <div className="mt-0.5 flex flex-wrap gap-x-2 text-xs text-zinc-500">
-                {a.feeds?.title && <span>{a.feeds.title}</span>}
-                {a.published_at && <span>· {formatDate(a.published_at)}</span>}
+      {articles.length > 0 && (
+        <ul className="border-t border-line">
+          {articles.map((a, i) => (
+            <li
+              key={a.id}
+              className="flex items-start gap-4 border-b border-line py-4"
+            >
+              <span className="w-7 shrink-0 pt-1 font-mono text-xs tabular-nums text-faint">
+                {String(i + 1).padStart(2, "0")}
+              </span>
+              <div className="min-w-0 flex-1">
+                <a
+                  href={a.url ?? "#"}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className={`block font-semibold hover:text-accent ${
+                    a.is_read ? "text-muted" : ""
+                  }`}
+                >
+                  {a.is_starred && <span className="text-accent">★ </span>}
+                  {a.title ?? "(無題)"}
+                </a>
+                {a.summary && (
+                  <p className="mt-1 line-clamp-2 text-sm text-muted">
+                    {a.summary}
+                  </p>
+                )}
+                <div className="mt-1.5 font-mono text-xs tracking-wide text-faint">
+                  {a.feeds?.title && <span>{a.feeds.title}</span>}
+                  {a.feeds?.title && a.published_at && <span> — </span>}
+                  {a.published_at && (
+                    <span>{formatDateShort(a.published_at)}</span>
+                  )}
+                </div>
               </div>
-            </div>
-            <div className="flex shrink-0 gap-1">
-              <form action={toggleStar}>
-                <input type="hidden" name="id" value={a.id} />
-                <input
-                  type="hidden"
-                  name="is_starred"
-                  value={String(a.is_starred)}
-                />
-                <button className={btn} title="スター">
-                  {a.is_starred ? "★" : "☆"}
-                </button>
-              </form>
-              <form action={toggleRead}>
-                <input type="hidden" name="id" value={a.id} />
-                <input type="hidden" name="is_read" value={String(a.is_read)} />
-                <button className={btn}>
-                  {a.is_read ? "未読に戻す" : "既読にする"}
-                </button>
-              </form>
-            </div>
-          </li>
-        ))}
-      </ul>
+              <div className="flex shrink-0 gap-1.5">
+                <form action={toggleStar}>
+                  <input type="hidden" name="id" value={a.id} />
+                  <input
+                    type="hidden"
+                    name="is_starred"
+                    value={String(a.is_starred)}
+                  />
+                  <button
+                    className={`${btn} ${a.is_starred ? "text-accent" : ""}`}
+                    title="スター"
+                  >
+                    {a.is_starred ? "★" : "☆"}
+                  </button>
+                </form>
+                <form action={toggleRead}>
+                  <input type="hidden" name="id" value={a.id} />
+                  <input
+                    type="hidden"
+                    name="is_read"
+                    value={String(a.is_read)}
+                  />
+                  <button className={btn}>
+                    {a.is_read ? "未読に戻す" : "既読にする"}
+                  </button>
+                </form>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
