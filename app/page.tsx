@@ -3,8 +3,11 @@ import { todayJst, errorMessage } from "@/lib/format";
 import type { CurationCard } from "@/lib/types";
 import { submitFeedback } from "./actions";
 import { CurationDeck } from "./_components/curation-deck";
+import { RefreshButton } from "./_components/refresh-button";
 
 export const dynamic = "force-dynamic";
+// 手動「更新」(refreshNow) が取得→要約→curate を同期実行するため、関数時間を延ばす。
+export const maxDuration = 60;
 
 // Supabase の埋め込み select 結果の素の形（生成型を使っていないので明示する）。
 type PickRow = {
@@ -61,6 +64,10 @@ export default async function Home() {
 
   return (
     <div>
+      <div className="mb-4 flex justify-end">
+        <RefreshButton />
+      </div>
+
       {errorMsg && (
         <>
           <p className="mb-5 font-mono text-xs font-medium tracking-widest text-accent">

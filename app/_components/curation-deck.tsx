@@ -161,7 +161,7 @@ export function CurationDeck({
         <p className="border border-line py-16 text-center text-sm text-muted">
           今日のピックはまだありません。
           <br />
-          記事の取得とキュレーションは定期実行されます。少し待って再読み込みしてください。
+          定期実行で取得されます。「更新」ですぐ取得・生成もできます。
         </p>
       </div>
     );
