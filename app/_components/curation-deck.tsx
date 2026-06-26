@@ -126,42 +126,65 @@ export function CurationDeck({
     return () => clearTimeout(t);
   }, [flyOut, current, send]);
 
+  // セクションラベル（赤・mono）。完了/未生成の各状態でも共通して頭に出す。
+  const sectionLabel = (counter?: string) => (
+    <div className="mb-5 flex items-baseline justify-between">
+      <span className="font-mono text-xs font-medium tracking-widest text-accent">
+        TODAY&apos;S PICK
+      </span>
+      {counter && (
+        <span className="font-mono text-xs tracking-widest text-faint tabular-nums">
+          {counter}
+        </span>
+      )}
+    </div>
+  );
+
   if (deck.length === 0) {
     // ピックは生成されたが全件判定済み（リロード後）→ 完了表示。
     // 未生成（pickedToday=0）と区別する。
     if (pickedToday > 0) {
       return (
-        <p className="py-16 text-center text-sm text-zinc-500">
-          今日は完了です 🎉
-          <br />
-          今日の{pickedToday}件はすべて判定済みです。
-        </p>
+        <div>
+          {sectionLabel()}
+          <p className="border border-line py-16 text-center text-sm text-muted">
+            今日は完了です 🎉
+            <br />
+            今日の{pickedToday}件はすべて判定済みです。
+          </p>
+        </div>
       );
     }
     return (
-      <p className="py-16 text-center text-sm text-zinc-500">
-        今日のピックはまだありません。
-        <br />
-        記事の取得とキュレーションは定期実行されます。少し待って再読み込みしてください。
-      </p>
+      <div>
+        {sectionLabel()}
+        <p className="border border-line py-16 text-center text-sm text-muted">
+          今日のピックはまだありません。
+          <br />
+          記事の取得とキュレーションは定期実行されます。少し待って再読み込みしてください。
+        </p>
+      </div>
     );
   }
 
   if (!current) {
     return (
-      <p className="py-16 text-center text-sm text-zinc-500">
-        今日は完了です 🎉
-        <br />
-        全{deck.length}件を見終わりました。
-      </p>
+      <div>
+        {sectionLabel(`${deck.length} / ${deck.length}`)}
+        <p className="border border-line py-16 text-center text-sm text-muted">
+          今日は完了です 🎉
+          <br />
+          全{deck.length}件を見終わりました。
+        </p>
+      </div>
     );
   }
 
   return (
     <div>
-      <div className="mb-3 text-right text-xs text-zinc-400">
-        {index + 1} / {deck.length}
-      </div>
+      {sectionLabel(
+        `${String(index + 1).padStart(2, "0")} / ${String(deck.length).padStart(2, "0")}`,
+      )}
 
       <div
         className="relative touch-pan-y select-none"
@@ -182,55 +205,55 @@ export function CurationDeck({
             opacity: flyOut ? 0 : 1,
           }}
         >
-          <SwipeCard card={current} />
+          <SwipeCard card={current} index={index + 1} />
         </div>
 
         {/* スワイプ方向のヒント（指の移動量に応じてフェードイン） */}
         <div className="pointer-events-none absolute inset-0 flex items-start justify-between p-4">
           <span
-            className="rounded-md border-2 border-rose-400 px-3 py-1 text-base font-bold text-rose-500"
+            className="border-2 border-border px-3 py-1 font-mono text-base font-bold tracking-widest text-foreground"
             style={{
               opacity: dx < 0 ? Math.min(1, -dx / SWIPE_THRESHOLD) : 0,
               transform: "rotate(-12deg)",
             }}
           >
-            興味なし
+            SKIP
           </span>
           <span
-            className="rounded-md border-2 border-emerald-400 px-3 py-1 text-base font-bold text-emerald-500"
+            className="border-2 border-accent px-3 py-1 font-mono text-base font-bold tracking-widest text-accent"
             style={{
               opacity: dx > 0 ? Math.min(1, dx / SWIPE_THRESHOLD) : 0,
               transform: "rotate(12deg)",
             }}
           >
-            興味あり
+            KEEP
           </span>
         </div>
       </div>
 
-      <div className="mt-5 flex items-center justify-center gap-3">
+      <div className="mt-5 flex border border-border divide-x divide-border font-mono text-sm tracking-widest">
         <button
           onClick={() => send(current, "dismiss")}
-          className="rounded-md border border-zinc-300 px-4 py-2 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+          className="flex-1 px-4 py-3 transition-colors hover:bg-foreground hover:text-background"
         >
-          ← 興味なし
+          ← SKIP
         </button>
         <button
           onClick={() => send(current, "open")}
-          className="rounded-md bg-zinc-900 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
+          className="flex-1 bg-accent px-4 py-3 font-semibold text-accent-foreground transition-opacity hover:opacity-90"
         >
-          開く
+          OPEN
         </button>
         <button
           onClick={() => send(current, "useful")}
-          className="rounded-md border border-zinc-300 px-4 py-2 text-sm hover:bg-zinc-100 dark:border-zinc-700 dark:hover:bg-zinc-800"
+          className="flex-1 px-4 py-3 transition-colors hover:bg-foreground hover:text-background"
         >
-          興味あり →
+          KEEP →
         </button>
       </div>
 
-      <p className="mt-3 text-center text-xs text-zinc-400">
-        ← 興味なし　·　Enter 開く　·　→ 興味あり
+      <p className="mt-3 text-center font-mono text-xs tracking-widest text-faint">
+        ← SKIP　·　ENTER OPEN　·　KEEP →
       </p>
     </div>
   );

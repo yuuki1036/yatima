@@ -61,6 +61,15 @@ export function tagLabel(slug: string): string {
   return LABEL_BY_SLUG.get(slug) ?? slug;
 }
 
+// slug → "TECH / AI" 形式の英大文字カテゴリ表記（UI モックのカテゴリラベル用）。
+// 階層 slug（tech/ai）は "TECH / AI"、parent なし（other）は "OTHER" になる。
+export function categoryLabel(slug: string): string {
+  return slug
+    .split("/")
+    .map((s) => s.toUpperCase())
+    .join(" / ");
+}
+
 // LLM 出力（unknown）を語彙内 leaf のみに正規化する。
 // 配列でない・語彙外・重複は捨て、最大 max 件に切り詰める。sanitizeSummary と同じ「後処理で矯正」思想。
 export function coerceTags(raw: unknown, max = 3): TagSlug[] {

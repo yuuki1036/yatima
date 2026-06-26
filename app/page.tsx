@@ -61,18 +61,19 @@ export default async function Home() {
 
   return (
     <div>
-      <div className="mb-4 flex items-center justify-between">
-        <h1 className="text-lg font-semibold">今日のピック</h1>
-      </div>
-
       {errorMsg && (
-        <div className="mb-4 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
-          記事を取得できませんでした: {errorMsg}
-          <br />
-          <span className="text-xs">
-            .env.local の Supabase 設定と、supabase/migrations の適用を確認してください。
-          </span>
-        </div>
+        <>
+          <p className="mb-5 font-mono text-xs font-medium tracking-widest text-accent">
+            TODAY&apos;S PICK
+          </p>
+          <div className="border-l-2 border-accent bg-surface px-4 py-3 text-sm text-foreground">
+            記事を取得できませんでした: {errorMsg}
+            <br />
+            <span className="text-xs text-muted">
+              .env.local の Supabase 設定と、supabase/migrations の適用を確認してください。
+            </span>
+          </div>
+        </>
       )}
 
       {!errorMsg && (

@@ -1,15 +1,27 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Archivo, Inter, IBM_Plex_Mono } from "next/font/google";
 import Link from "next/link";
 import "./globals.css";
+import { SiteNav } from "./_components/site-nav";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
+// 本文・タイトル
+const inter = Inter({
+  variable: "--font-inter",
   subsets: ["latin"],
 });
 
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
+// ディスプレイ（ワードマーク・特大インデックス番号）。Archivo は可変フォントなので
+// weight 指定は不要（Tailwind の font-extrabold 等で任意ウェイトを使う）。
+const archivo = Archivo({
+  variable: "--font-archivo",
+  subsets: ["latin"],
+});
+
+// ラベル・ナビ・メタ（uppercase + letter-spacing）。IBM Plex Mono は静的フォントなので
+// 使用ウェイトを明示する。
+const ibmPlexMono = IBM_Plex_Mono({
+  variable: "--font-ibm-plex-mono",
+  weight: ["400", "500", "600"],
   subsets: ["latin"],
 });
 
@@ -26,34 +38,21 @@ export default function RootLayout({
   return (
     <html
       lang="ja"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      className={`${inter.variable} ${archivo.variable} ${ibmPlexMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
-        <header className="border-b border-zinc-200 dark:border-zinc-800">
-          <div className="mx-auto flex max-w-3xl items-center gap-6 px-4 py-3">
-            <Link href="/" className="font-semibold tracking-tight">
-              📰 yatima
+      <body className="min-h-full flex flex-col bg-background font-sans text-foreground">
+        <header className="border-b-2 border-border">
+          <div className="mx-auto flex max-w-3xl items-center justify-between gap-6 px-4 py-4">
+            <Link
+              href="/"
+              className="font-display text-lg font-extrabold tracking-tight"
+            >
+              yatima
             </Link>
-            <nav className="flex gap-4 text-sm text-zinc-600 dark:text-zinc-400">
-              <Link href="/" className="hover:text-zinc-900 dark:hover:text-zinc-100">
-                今日
-              </Link>
-              <Link
-                href="/list"
-                className="hover:text-zinc-900 dark:hover:text-zinc-100"
-              >
-                一覧
-              </Link>
-              <Link
-                href="/feeds"
-                className="hover:text-zinc-900 dark:hover:text-zinc-100"
-              >
-                フィード
-              </Link>
-            </nav>
+            <SiteNav />
           </div>
         </header>
-        <main className="mx-auto w-full max-w-3xl flex-1 px-4 py-6">
+        <main className="mx-auto w-full max-w-3xl flex-1 px-4 py-8">
           {children}
         </main>
       </body>
