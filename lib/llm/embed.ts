@@ -9,17 +9,21 @@ const MODEL = "voyage-3.5-lite";
 const DIMENSION = 1024; // 0003_embeddings.sql の vector(1024) と一致させること
 const ENDPOINT = "https://api.voyageai.com/v1/embeddings";
 
-// 無料枠（支払い方法未登録）= 3 RPM / 10K TPM。これを下回るよう保守的に設定する。
-const TOKEN_BUDGET = 6000; // 1 リクエストあたりの推定トークン上限（10K TPM の余裕を見て）
+// 無料枠（支払い方法未登録）= 3 RPM / 10K TPM。TPM は分あたりの累積なので、
+// 「1 リクエストの上限」だけでなく「3 RPM × 上限」が 10K を超えないことが要件。
+// TOKEN_BUDGET=3000 × 3 RPM = 9000 < 10K TPM で両制限を満たす。
+// （支払い方法を登録すると 2000 RPM / 3M TPM に緩和されるので、その場合はここを上げてよい）
+const TOKEN_BUDGET = 3000; // 1 リクエストあたりの推定トークン上限
 const MAX_PER_REQUEST = 128; // Voyage の 1 リクエスト最大入力数
 const MIN_INTERVAL_MS = 21_000; // リクエスト間隔（3 RPM ≒ 20s/req。余裕を見て 21s）
 const MAX_RETRIES = 4; // 429 リトライ回数
 const BACKOFF_BASE_MS = 25_000; // バックオフ初期待機（25s, 50s, ...）
 
 export interface Embedder {
-  // 複数テキストをまとめて埋め込む。返り値は入力と同順の 1024 次元ベクトル配列。
-  // 内部でレート制限に合わせて分割・待機・再試行する。最終的に失敗したら例外を投げる。
-  embed(texts: string[]): Promise<number[][]>;
+  // 複数テキストをまとめて埋め込む。返り値は入力と同順・同長で、各要素はベクトル、
+  // または最終的に失敗したチャンクの要素は null（部分成功を許容）。
+  // 内部でレート制限に合わせて分割・待機・再試行する。
+  embed(texts: string[]): Promise<(number[] | null)[]>;
 }
 
 type VoyageResponse = {
@@ -30,10 +34,12 @@ class RateLimitError extends Error {}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// 粗いトークン見積り（日本語混在を考慮して 1 文字 ≒ 1.3 トークンの保守見積り）。
-// 正確なトークナイザは持たないが、上限割れを避けるための安全側の概算で足りる。
+// 粗いトークン見積り。正確なトークナイザは持たないので「実トークン数の上限」になるよう
+// 保守的に見積もる（これにより TOKEN_BUDGET 遵守 → TPM 遵守が保証される）。
+// 日本語は Voyage の BPE で概ね 1 文字 ≒ 1 トークン前後になるため、安全側で 2.0 倍を使う
+// （英語は 1 文字 ≒ 0.25 トークンなので、混在でも 2.0 倍なら実数を下回らない）。
 function estimateTokens(text: string): number {
-  return Math.ceil(text.length * 1.3);
+  return Math.ceil(text.length * 2.0);
 }
 
 // トークン上限と件数上限でリクエスト単位に分割する。単独で上限超のテキストは単体チャンクにする。
@@ -61,20 +67,30 @@ function chunkByTokens(texts: string[]): { text: string; index: number }[][] {
 class VoyageEmbedder implements Embedder {
   constructor(private apiKey: string) {}
 
-  async embed(texts: string[]): Promise<number[][]> {
+  async embed(texts: string[]): Promise<(number[] | null)[]> {
     if (texts.length === 0) return [];
 
-    const out: number[][] = new Array(texts.length);
+    // 既定 null。成功したチャンクの要素だけ上書きする（部分成功を許容＝後半チャンク失敗で
+    // 前半の成功を捨てない）。失敗チャンクは null のまま返り、呼び出し側で failed に数える。
+    const out: (number[] | null)[] = new Array(texts.length).fill(null);
     const chunks = chunkByTokens(texts);
 
     for (let i = 0; i < chunks.length; i++) {
       if (i > 0) await sleep(MIN_INTERVAL_MS); // 3 RPM 遵守
       const chunk = chunks[i];
-      const vecs = await this.embedChunkWithRetry(chunk.map((c) => c.text));
-      // チャンク内の入力順 → 元の index に書き戻す。
-      chunk.forEach((c, j) => {
-        out[c.index] = vecs[j];
-      });
+      try {
+        const vecs = await this.embedChunkWithRetry(chunk.map((c) => c.text));
+        // チャンク内の入力順 → 元の index に書き戻す。
+        chunk.forEach((c, j) => {
+          out[c.index] = vecs[j];
+        });
+      } catch (e) {
+        // このチャンクは諦めて次へ（該当要素は null のまま）。次回 ingest で再試行され収束する。
+        console.warn(
+          `embed チャンク失敗（${chunk.length}件スキップ）:`,
+          e instanceof Error ? e.message : e,
+        );
+      }
     }
     return out;
   }

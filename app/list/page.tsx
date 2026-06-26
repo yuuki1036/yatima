@@ -17,7 +17,11 @@ export default async function ListPage() {
     const supabase = await createSupabaseServerClient();
     const { data, error } = await supabase
       .from("articles")
-      .select("*, feeds(title, site_url)")
+      // 一覧で使う列だけ明示取得する。`*` だと embedding vector(1024) や content_html まで
+      // 100 件ぶん載りペイロードが肥大するため除外する。
+      .select(
+        "id, url, title, summary, is_read, is_starred, published_at, feeds(title, site_url)",
+      )
       .order("published_at", { ascending: false, nullsFirst: false })
       .limit(100);
     if (error) throw error;

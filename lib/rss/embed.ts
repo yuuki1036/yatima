@@ -15,7 +15,11 @@ export type EmbedBatchResult = {
 
 type Row = { id: string; title: string | null; summary: string | null };
 
-const DEFAULT_LIMIT = 50; // 1 回の実行で埋め込む上限（残りは次回消化）
+// 1 回の実行で埋め込む上限。無料枠（3 RPM / 10K TPM）だと throughput が ~8.5K tokens/分に
+// 制限され、実測で 24 件 embed に約 4 分・ingest 全体で約 6 分かかった。cron の 10 分 timeout に
+// 余裕を持たせるため 16 件に抑える（残りは次回消化。newest-first で候補窓 72h は先に埋まる）。
+// 支払い方法を登録してレート制限が緩んだら上げてよい。
+const DEFAULT_LIMIT = 16;
 
 // pgvector へは文字列リテラル '[v1,v2,...]' で書き込む（PostgREST が text→vector にキャスト）。
 function vecToPg(vec: number[]): string {
@@ -60,12 +64,13 @@ export async function embedMissing(
     return { picked: 0, succeeded: 0, failed: 0, skipped: false };
   }
 
-  // 1 回の API 呼び出しでまとめて埋め込む（Voyage はバッチ入力可）。
-  let vectors: number[][];
+  // まとめて埋め込む（Voyage はバッチ入力可）。embed は内部で分割・レート制御し、
+  // 失敗チャンクの要素は null で返す（部分成功を許容）。
+  let vectors: (number[] | null)[];
   try {
     vectors = await embedder.embed(rows.map(embedText));
   } catch (e) {
-    // 埋め込み呼び出し自体の失敗は全件 failed に畳む（次回再試行で収束）。
+    // embed 全体が throw するのは想定外（チャンク失敗は null 化される）。保険で全件 failed に。
     console.warn("embed API 呼び出しに失敗:", e);
     return { picked: rows.length, succeeded: 0, failed: rows.length, skipped: false };
   }
@@ -74,10 +79,16 @@ export async function embedMissing(
   let failed = 0;
   // 保存は1件ずつ（embedding 値が行ごとに異なるため bulk update できない）。fail-soft。
   for (let i = 0; i < rows.length; i++) {
+    const vec = vectors[i];
+    if (!vec) {
+      // 埋め込み失敗（チャンク失敗）。embedding は NULL のまま残り次回再試行で収束する。
+      failed += 1;
+      continue;
+    }
     try {
       const { error } = await supabase
         .from("articles")
-        .update({ embedding: vecToPg(vectors[i]) })
+        .update({ embedding: vecToPg(vec) })
         .eq("id", rows[i].id);
       if (error) throw error;
       succeeded += 1;
