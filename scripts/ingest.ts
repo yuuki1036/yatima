@@ -8,6 +8,7 @@ import { createAdminClient } from "../lib/supabase/admin";
 import { ingestAllFeeds } from "../lib/rss/ingest";
 import { enrichMissingBodies } from "../lib/rss/enrich";
 import { annotateMissing } from "../lib/llm/summarize-batch";
+import { embedMissing } from "../lib/rss/embed";
 import { curateToday } from "../lib/ranking/curate";
 
 async function main() {
@@ -41,6 +42,12 @@ async function main() {
     `要約+タグ: 成功 ${s.succeeded} / 失敗 ${s.failed}${s.skipped ? " (ANTHROPIC_API_KEY 未設定でスキップ)" : ""}`,
   );
 
+  // 要約済み記事を embed（重複排除用。summary 済み×embedding NULL が対象。fail-soft）。
+  const em = await embedMissing(supabase);
+  console.log(
+    `embedding: 成功 ${em.succeeded} / 失敗 ${em.failed}${em.skipped ? " (VOYAGE_API_KEY 未設定でスキップ)" : ""}`,
+  );
+
   // 今日の10件を確定（日次ガードで冪等。毎時 cron でも当日1回だけ確定される）。
   // キュレーション失敗は ingest 全体を落とさない（fail-soft）。
   try {
@@ -48,7 +55,7 @@ async function main() {
     console.log(
       c.skipped
         ? `キュレーション: 本日分は確定済み (${c.picked}件)`
-        : `キュレーション: 今日の ${c.picked}件 を確定`,
+        : `キュレーション: 今日の ${c.picked}件 を確定${c.deduped ? `（近重複 ${c.deduped}件を除外）` : ""}`,
     );
   } catch (e) {
     console.warn("キュレーション失敗:", e);
