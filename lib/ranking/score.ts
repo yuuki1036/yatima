@@ -1,7 +1,8 @@
 // 線形ランキングのスコア純関数。
-//   score = 新しさ減衰 + Σ(記事に付いたタグの tag_pref) + ソース嗜好(source_pref)
-// 引数だけに依存する純関数にし、`now` / `tagPrefs` / `sourcePrefs` を注入することで
+//   score = 新しさ減衰 + Σ(記事に付いたタグの tag_pref) + ソース嗜好(source_pref) + ソース信頼度(credibility)
+// 引数だけに依存する純関数にし、`now` / `tagPrefs` / `sourcePrefs` / `credibility` を注入することで
 // フィード1本でも複数でも同じ関数で計算でき、DB なしでユニットテストできる。
+// credibility は feeds 列由来の静的 prior（嗜好は学習・信頼度は手当ての固定値）で役割が異なる。
 
 const RECENCY_HALF_LIFE_HOURS = 24; // 新しさ減衰の半減期（24h で 0.5 倍）
 
@@ -23,6 +24,7 @@ export type ScoreInput = {
   tagPrefs: Map<string, number>; // preferences(kind='tag') を Map 化したもの
   sourceId?: string | null; // 記事のフィード id（preferences(kind='source') のキー）
   sourcePrefs?: Map<string, number>; // preferences(kind='source') を Map 化したもの
+  credibility?: number; // feeds.credibility（静的なソース信頼度の prior）
   now?: number;
 };
 
@@ -37,6 +39,8 @@ export function score(input: ScoreInput): number {
     input.sourceId && input.sourcePrefs
       ? (input.sourcePrefs.get(input.sourceId) ?? 0)
       : 0;
-  // コールドスタート（pref 全 0）時は tagScore=sourceScore=0 となり実質「新着順」に縮退する。
-  return recency + tagScore + sourceScore;
+  const credibility = input.credibility ?? 0;
+  // コールドスタート（pref 全 0）時は tagScore=sourceScore=0 に縮退し、score = recency + credibility。
+  // 信頼ソースが上に、汎用アグリゲータが下に来る「厳選された新着順」になる。
+  return recency + tagScore + sourceScore + credibility;
 }

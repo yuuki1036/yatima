@@ -48,14 +48,14 @@ async function main() {
     `embedding: 成功 ${em.succeeded} / 失敗 ${em.failed}${em.skipped ? " (VOYAGE_API_KEY 未設定でスキップ)" : ""}`,
   );
 
-  // 今日の10件を確定（日次ガードで冪等。毎時 cron でも当日1回だけ確定される）。
+  // デッキを未判定10件へ補充（連続トップアップ。未判定が10件あれば skip で冪等）。
   // キュレーション失敗は ingest 全体を落とさない（fail-soft）。
   try {
     const c = await curateToday(supabase);
     console.log(
       c.skipped
-        ? `キュレーション: 本日分は確定済み (${c.picked}件)`
-        : `キュレーション: 今日の ${c.picked}件 を確定${c.deduped ? `（近重複 ${c.deduped}件を除外）` : ""}`,
+        ? `キュレーション: デッキ充足のため補充なし`
+        : `キュレーション: デッキに ${c.picked}件 を補充${c.deduped ? `（近重複 ${c.deduped}件を除外）` : ""}`,
     );
   } catch (e) {
     console.warn("キュレーション失敗:", e);
