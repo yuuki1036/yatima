@@ -72,15 +72,17 @@ export async function toggleStar(formData: FormData) {
   revalidatePath("/list");
 }
 
-// 手動「更新」: 全 active フィードを取得→本文補完→未要約を要約+タグ→今日の10件を確定。
+// 手動「更新」: 全 active フィードを取得→本文補完→未要約を要約+タグ→デッキを未判定 10 件へ補充。
 // embed は含めない（無料枠レート制限で ~2分かかり maxDuration を超えるため cron 専任）。
-// 連打対策に cooldown guard を入れる。useActionState から呼ぶため結果を返す。
-// useActionState のアクション型は引数の少ない関数も受け入れる（prevState/formData は未使用）。
+// 連打対策の cooldown guard は「取得・要約」だけに掛け、デッキ補充（curate）は常に走らせる。
+// こうすると判定し切った直後にクールダウン中でも更新を押せば、既存の要約済みプールから次の
+// 候補が補充されて必ず最大 10 件が並ぶ（「更新で10件」「1日10件で打ち止めにしない」を満たす）。
+// useActionState から呼ぶため結果を返す（prevState/formData は未使用なので引数なしでよい）。
 export async function refreshNow(): Promise<RefreshState> {
   await requireSession();
   const supabase = createAdminClient();
 
-  // ── cooldown: 専用マーカーの更新時刻が COOLDOWN 内ならパイプラインを回さず案内だけ返す。
+  // ── cooldown 判定: 専用マーカーの更新時刻が COOLDOWN 内なら「取得・要約」はスキップする。
   const { data: marker } = await supabase
     .from("preferences")
     .select("updated_at")
@@ -89,40 +91,47 @@ export async function refreshNow(): Promise<RefreshState> {
     .maybeSingle();
   const lastMs = marker?.updated_at ? new Date(marker.updated_at).getTime() : 0;
   const elapsed = Date.now() - lastMs;
-  if (lastMs && elapsed < REFRESH_COOLDOWN_MS) {
-    const mins = Math.ceil((REFRESH_COOLDOWN_MS - elapsed) / 60_000);
-    revalidatePath("/");
-    revalidatePath("/list");
-    return { ok: true, message: `直近に更新済み。約${mins}分後に再実行できます` };
-  }
+  const onCooldown = lastMs > 0 && elapsed < REFRESH_COOLDOWN_MS;
 
-  // ── パイプライン（fail-soft の各段はそのまま流す。embed は除外）。
   try {
-    // ガードを先に前進させる（成否・0件取得に関わらず cooldown を消費し、失敗連打のすり抜けを塞ぐ。
-    // read→upsert の窓は残るが、~10秒のパイプライン実行中の窓を ~ms に縮める。完全遮断は認証が本筋）。
-    await supabase.from("preferences").upsert(
-      {
-        kind: REFRESH_MARKER.kind,
-        key: REFRESH_MARKER.key,
-        weight: 0,
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: "kind,key" },
-    );
-    const results = await ingestAllFeeds(supabase);
-    const inserted = results.reduce((n, r) => n + (r.error ? 0 : r.inserted), 0);
-    await enrichMissingBodies(supabase);
-    const a = await annotateMissing(supabase, { limit: MANUAL_ANNOTATE_LIMIT });
+    let inserted = 0;
+    let annotated = 0;
+    if (!onCooldown) {
+      // ── 取得・要約パイプライン（fail-soft の各段はそのまま流す。embed は除外）。
+      // ガードを先に前進させる（成否・0件取得に関わらず cooldown を消費し、失敗連打のすり抜けを塞ぐ。
+      // read→upsert の窓は残るが、~10秒のパイプライン実行中の窓を ~ms に縮める。完全遮断は認証が本筋）。
+      await supabase.from("preferences").upsert(
+        {
+          kind: REFRESH_MARKER.kind,
+          key: REFRESH_MARKER.key,
+          weight: 0,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "kind,key" },
+      );
+      const results = await ingestAllFeeds(supabase);
+      inserted = results.reduce((n, r) => n + (r.error ? 0 : r.inserted), 0);
+      await enrichMissingBodies(supabase);
+      const a = await annotateMissing(supabase, {
+        limit: MANUAL_ANNOTATE_LIMIT,
+      });
+      annotated = a.succeeded;
+    }
+
+    // ── デッキ補充は取得の有無に関わらず常に実行（クールダウン中でも既存プールから補充できる）。
     const c = await curateToday(supabase);
     revalidatePath("/");
     revalidatePath("/list");
     revalidatePath("/feeds");
-    const curation = c.skipped
-      ? "今日の分は確定済み"
-      : `今日の${c.picked}件を生成`;
+
+    const deck = c.skipped ? "デッキは充足（追加なし）" : `デッキに+${c.picked}`;
+    if (onCooldown) {
+      const mins = Math.ceil((REFRESH_COOLDOWN_MS - elapsed) / 60_000);
+      return { ok: true, message: `${deck}（新規取得は約${mins}分後）` };
+    }
     return {
       ok: true,
-      message: `取得 +${inserted} / 要約 ${a.succeeded} / ${curation}`,
+      message: `取得 +${inserted} / 要約 ${annotated} / ${deck}`,
     };
   } catch (e) {
     console.warn("refreshNow 失敗:", e);

@@ -148,9 +148,9 @@ export function CurationDeck({
         <div>
           {sectionLabel()}
           <p className="border border-line py-16 text-center text-sm text-muted">
-            今日は完了です 🎉
+            ここまで完了です 🎉
             <br />
-            今日の{pickedToday}件はすべて判定済みです。
+            今日は{pickedToday}件を判定済み。「更新」で次の候補を出せます。
           </p>
         </div>
       );
@@ -172,9 +172,9 @@ export function CurationDeck({
       <div>
         {sectionLabel(`${deck.length} / ${deck.length}`)}
         <p className="border border-line py-16 text-center text-sm text-muted">
-          今日は完了です 🎉
+          ここまで完了です 🎉
           <br />
-          全{deck.length}件を見終わりました。
+          全{deck.length}件を見終わりました。「更新」で次の候補を出せます。
         </p>
       </div>
     );
