@@ -16,9 +16,16 @@ const SESSION_MAX_AGE_SEC = 60 * 60 * 24 * 30;
 // バイパスされるため、未設定だけでなく最小長（32 文字 = openssl rand -base64 32 相当）も強制する。
 const MIN_SECRET_LENGTH = 32;
 
-// 共有パスワードはこのアプリ唯一の認証要素。レート制限を置かない代わりに、オンライン総当たりが
-// 事実上不可能な高エントロピーを最小長で要求する（弱いパスワードの設定自体を弾く）。
-const MIN_PASSWORD_LENGTH = 16;
+// 共有パスワードはこのアプリ唯一の認証要素。レート制限を置かない代わりに、設定時に最低限の
+// 強度（8 文字以上・英字と数字の両方を含む）を要求して弱いパスワードを弾く。
+const MIN_PASSWORD_LENGTH = 8;
+
+// APP_PASSWORD がポリシー（最小長・英数字混在）を満たすか。設定値の検証用。
+function meetsPasswordPolicy(pw: string): boolean {
+  return (
+    pw.length >= MIN_PASSWORD_LENGTH && /[a-zA-Z]/.test(pw) && /[0-9]/.test(pw)
+  );
+}
 
 function encodedSecret(): Uint8Array {
   const secret = process.env.SESSION_SECRET;
@@ -36,9 +43,9 @@ function encodedSecret(): Uint8Array {
 // 自前のバイト比較ループは JIT 最適化で定数時間が保証されないため node:crypto に委ねる。
 export function verifyPassword(input: string): boolean {
   const expected = process.env.APP_PASSWORD;
-  if (!expected || expected.length < MIN_PASSWORD_LENGTH) {
+  if (!expected || !meetsPasswordPolicy(expected)) {
     throw new Error(
-      `APP_PASSWORD が未設定または短すぎます（${MIN_PASSWORD_LENGTH} 文字以上必須・レート制限を置かない分エントロピーで守る）`,
+      `APP_PASSWORD が未設定またはポリシー違反です（${MIN_PASSWORD_LENGTH} 文字以上・英字と数字の両方を含む）`,
     );
   }
   const a = createHash("sha256").update(input).digest();
