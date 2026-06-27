@@ -4,6 +4,7 @@ import Link from "next/link";
 import "./globals.css";
 import { SiteNav } from "./_components/site-nav";
 import { ThemeToggle } from "./_components/theme-toggle";
+import { LogoutButton } from "./_components/logout-button";
 
 // 描画前に preference を effective(light/dark) に解決して <html data-theme> をセットする。
 // React hydration より前に同期実行され、FOUC（一瞬のライト→ダークのちらつき）を防ぐ。
@@ -59,6 +60,7 @@ export default function RootLayout({
             <div className="flex items-center gap-5">
               <SiteNav />
               <ThemeToggle />
+              <LogoutButton />
             </div>
           </div>
         </header>

@@ -1,6 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { requireSession } from "@/lib/auth/session";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { recordFeedback } from "@/lib/ranking/feedback";
 import { FEEDBACK_WEIGHT } from "@/lib/ranking/preferences";
@@ -25,7 +26,12 @@ const MANUAL_ANNOTATE_LIMIT = 12;
 // feeds.last_fetched_at は取得成功時しか進まず失敗連打/0件取得をすり抜けるため、専用マーカーで判定する。
 const REFRESH_MARKER = { kind: "meta", key: "last_manual_refresh" } as const;
 
+// 各 mutation は proxy で全ルートをゲート済みだが、公式認証ガイドが「proxy だけを
+// 防御線にするな・Server Action でも検証せよ」と明記しているため、直 POST 対策の
+// 二段目として冒頭で requireSession() を呼ぶ（YAT-12 / [[20260608-server-action-auth]]）。
+
 export async function addFeed(formData: FormData) {
+  await requireSession();
   const url = String(formData.get("url") ?? "").trim();
   if (!url) return;
   const supabase = createAdminClient();
@@ -36,6 +42,7 @@ export async function addFeed(formData: FormData) {
 }
 
 export async function deleteFeed(formData: FormData) {
+  await requireSession();
   const id = String(formData.get("id") ?? "");
   if (!id) return;
   const supabase = createAdminClient();
@@ -46,6 +53,7 @@ export async function deleteFeed(formData: FormData) {
 }
 
 export async function toggleRead(formData: FormData) {
+  await requireSession();
   const id = String(formData.get("id") ?? "");
   if (!id) return;
   const next = formData.get("is_read") !== "true"; // 現在値の反転
@@ -55,6 +63,7 @@ export async function toggleRead(formData: FormData) {
 }
 
 export async function toggleStar(formData: FormData) {
+  await requireSession();
   const id = String(formData.get("id") ?? "");
   if (!id) return;
   const next = formData.get("is_starred") !== "true";
@@ -68,6 +77,7 @@ export async function toggleStar(formData: FormData) {
 // 連打対策に cooldown guard を入れる。useActionState から呼ぶため結果を返す。
 // useActionState のアクション型は引数の少ない関数も受け入れる（prevState/formData は未使用）。
 export async function refreshNow(): Promise<RefreshState> {
+  await requireSession();
   const supabase = createAdminClient();
 
   // ── cooldown: 専用マーカーの更新時刻が COOLDOWN 内ならパイプラインを回さず案内だけ返す。
@@ -122,6 +132,7 @@ export async function refreshNow(): Promise<RefreshState> {
 
 // Tinder カードのフィードバック（開く/役立った/不要）。タグ嗜好を更新し、当日の一覧を再取得させる。
 export async function submitFeedback(formData: FormData) {
+  await requireSession();
   const id = String(formData.get("id") ?? "");
   const action = String(formData.get("action") ?? "");
   // 直 POST 防御: 既知の action 値のみ受け付ける。
