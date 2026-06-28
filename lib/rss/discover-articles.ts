@@ -209,7 +209,9 @@ export async function collectCandidatesFromArticles(
     .from("articles")
     .select("url, content_html")
     .not("content_html", "is", null)
-    .order("published_at", { ascending: false })
+    // published_at は nullable。Postgres は DESC で NULLS FIRST がデフォルトのため、
+    // 明示しないと日付欠落記事が先頭に滞留し lookback 枠を食う（enrich.ts / embed.ts と同作法）。
+    .order("published_at", { ascending: false, nullsFirst: false })
     .limit(lookback);
   if (error) throw error;
   const articles = (data ?? []) as ArticleRow[];
