@@ -3,6 +3,7 @@ import type { Summarizer } from "./types";
 import { createHaikuSummarizer } from "./haiku";
 import { htmlToInputText } from "./extract-text";
 import { recencyDecay } from "@/lib/ranking/score";
+import { enrichArticleBody, isThinBody } from "@/lib/rss/enrich";
 
 // 取得→保存の後に呼ぶバッチ要約。ingestAllFeeds と同じく SupabaseClient を注入して使う。
 // summary IS NULL の記事を拾って要約し、articles.summary を埋める。
@@ -106,6 +107,194 @@ export async function summarizeMissing(
   }
 
   return { picked: rows.length, succeeded, failed, skipped: false };
+}
+
+// YAT-13: 要約はあるがタグが空の記事を拾って再アノテートする保守用ロジック。
+// annotateMissing は summary IS NULL のみ拾うため、過去に annotate の JSON パース失敗で
+// 「要約のみ・タグ空」に落ちた記事（YAT-5 の取りこぼし）はそのまま残る。タグが無い記事は
+// 興味順スコアに乗らないので、ここでピンポイントに再アノテートしてタグを補う。
+export type UntaggedRow = {
+  id: string;
+  title: string | null;
+  url: string | null;
+  content_html: string | null;
+};
+
+const SCAN_PAGE = 1000; // 要約済み記事をページ走査する 1 ページのサイズ（PostgREST 既定上限）
+
+// 要約済み（summary IS NOT NULL）かつタグが 1 件も無い記事を返す。article_tags を埋め込み
+// select し JS 側で「子が空」の行に絞る。要約済みは数千件規模になりうるため .range() で全件を
+// ページ走査する（単一 limit だと古いタグ空記事を取り逃す）。
+export async function findUntaggedSummarized(
+  supabase: SupabaseClient,
+): Promise<UntaggedRow[]> {
+  const out: UntaggedRow[] = [];
+  for (let from = 0; ; from += SCAN_PAGE) {
+    const { data, error } = await supabase
+      .from("articles")
+      .select("id, title, url, content_html, article_tags(tag_slug)")
+      .not("summary", "is", null)
+      .order("published_at", { ascending: false, nullsFirst: false })
+      .order("id", { ascending: true }) // 同 published_at の全順序を確定しページ境界の取りこぼし/重複を防ぐ
+      .range(from, from + SCAN_PAGE - 1);
+    if (error) throw error;
+    const batch = (data ?? []) as (UntaggedRow & {
+      article_tags: { tag_slug: string }[] | null;
+    })[];
+    for (const r of batch) {
+      if ((r.article_tags ?? []).length === 0) {
+        out.push({
+          id: r.id,
+          title: r.title,
+          url: r.url,
+          content_html: r.content_html,
+        });
+      }
+    }
+    if (batch.length < SCAN_PAGE) break; // 最終ページ
+  }
+  return out;
+}
+
+export type RetagResult = {
+  targeted: number; // タグ空で再アノテート対象になった件数
+  enriched: number; // 本文補完できた件数
+  tagged: number; // 再アノテートでタグを付与できた件数
+  stillEmpty: number; // 再アノテートしてもタグ 0 のままだった件数
+  failed: number; // 例外で落ちた件数（fail-soft）
+  skipped: boolean; // API キー未設定でスキップした場合 true
+};
+
+export async function annotateUntagged(
+  supabase: SupabaseClient,
+  opts: {
+    concurrency?: number;
+    summarizer?: Summarizer | null;
+    enrich?: boolean; // 本文が薄い記事をリンク先から補完してからアノテートする（既定 true）
+  } = {},
+): Promise<RetagResult> {
+  const concurrency = opts.concurrency ?? DEFAULT_CONCURRENCY;
+  const enrich = opts.enrich ?? true;
+  const summarizer =
+    opts.summarizer !== undefined ? opts.summarizer : createHaikuSummarizer();
+
+  if (!summarizer) {
+    return {
+      targeted: 0,
+      enriched: 0,
+      tagged: 0,
+      stillEmpty: 0,
+      failed: 0,
+      skipped: true,
+    };
+  }
+
+  let targets: UntaggedRow[];
+  try {
+    targets = await findUntaggedSummarized(supabase);
+  } catch (e) {
+    console.warn("再アノテート対象の取得に失敗:", e);
+    return {
+      targeted: 0,
+      enriched: 0,
+      tagged: 0,
+      stillEmpty: 0,
+      failed: 0,
+      skipped: false,
+    };
+  }
+
+  let enriched = 0;
+  let tagged = 0;
+  let stillEmpty = 0;
+  let failed = 0;
+
+  // 1 度きりの単一パス（内部で対象を再取得しない）。タグ 0 のまま残る記事を再ピックすると
+  // 無限ループになるため、再アノテートしてもタグが付かなかった記事は stillEmpty として残置する。
+  for (let i = 0; i < targets.length; i += concurrency) {
+    const chunk = targets.slice(i, i + concurrency);
+    const results = await Promise.allSettled(
+      chunk.map(async (row) => {
+        let content = row.content_html;
+        // 本文が薄ければ先にリンク先から補完してタグ精度を上げる（fail-soft）。
+        // パターン1（本文がタイトルのみ）由来のタグ空は YAT-7 の本文 fetch で救える。
+        if (enrich && row.url && isThinBody(content)) {
+          try {
+            const c = await enrichArticleBody(supabase, {
+              id: row.id,
+              url: row.url,
+              content_html: content,
+            });
+            if (c) {
+              content = c;
+              enriched += 1;
+            }
+          } catch (e) {
+            console.warn(
+              `本文補完失敗 [${row.id}]:`,
+              e instanceof Error ? e.message : e,
+            );
+          }
+        }
+
+        const text = htmlToInputText(content);
+        if (!text && !row.title) throw new Error("本文・タイトルとも空");
+        const { summary, tags } = await summarizer.annotate({
+          title: row.title,
+          text,
+        });
+        if (!summary) throw new Error("要約が空");
+
+        // 本文を補完したときだけ要約も作り直す（薄い本文由来の古い要約を更新）。補完していなければ
+        // 既存要約は温存しタグだけ付ける（既読の要約を不用意に書き換えない）。
+        // 順序は要約 → タグ。findUntaggedSummarized は「タグ有り = 処理済み」とみなすため、
+        // タグ付与で部分失敗（要約だけ更新）しても未タグのまま残り、次回再収束する（自己回復）。
+        if (content !== row.content_html) {
+          const { error: upErr } = await supabase
+            .from("articles")
+            .update({ summary })
+            .eq("id", row.id);
+          if (upErr) throw upErr;
+        }
+        if (tags.length) {
+          const tagRows = tags.map((t) => ({
+            article_id: row.id,
+            tag_slug: t,
+            source: "llm",
+          }));
+          const { error: tagErr } = await supabase
+            .from("article_tags")
+            .upsert(tagRows, {
+              onConflict: "article_id,tag_slug",
+              ignoreDuplicates: true,
+            });
+          if (tagErr) throw tagErr;
+        }
+        return tags.length;
+      }),
+    );
+    results.forEach((r, idx) => {
+      if (r.status === "fulfilled") {
+        if (r.value > 0) tagged += 1;
+        else stillEmpty += 1;
+      } else {
+        failed += 1;
+        console.warn(
+          `再アノテート失敗 [${chunk[idx].id}] ${chunk[idx].url ?? ""}:`,
+          r.reason,
+        );
+      }
+    });
+  }
+
+  return {
+    targeted: targets.length,
+    enriched,
+    tagged,
+    stillEmpty,
+    failed,
+    skipped: false,
+  };
 }
 
 // Phase3: 取得→保存の後に呼ぶバッチ「アノテート」。要約とタグを同時生成して保存する。
