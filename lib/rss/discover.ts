@@ -261,7 +261,7 @@ export async function discoverFeedsForSite(
 }
 
 // feeds テーブルの既存ドメイン集合。url / site_url の両方から eTLD+1 を集めて重複排除の基準にする。
-async function loadExistingFeedDomains(
+export async function loadExistingFeedDomains(
   supabase: SupabaseClient,
 ): Promise<Set<string>> {
   const { data, error } = await supabase.from("feeds").select("url, site_url");
@@ -281,7 +281,7 @@ async function loadExistingFeedDomains(
 }
 
 // feed_candidates の既存ドメイン集合（status 不問）。承認待ち・却下済みを問わず再登録しない。
-async function loadCandidateDomains(
+export async function loadCandidateDomains(
   supabase: SupabaseClient,
 ): Promise<Set<string>> {
   const { data, error } = await supabase
