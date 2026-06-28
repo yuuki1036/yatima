@@ -52,6 +52,50 @@ export async function deleteFeed(formData: FormData) {
   revalidatePath("/list");
 }
 
+// 自動発見の承認待ち候補（feed_candidates）を feeds へ昇格する（YAT-16）。誤検出を本番取得に
+// 混ぜないための承認制の出口。候補の低い初期 credibility をそのまま引き継ぎ、運用で手当てする。
+export async function approveFeedCandidate(formData: FormData) {
+  await requireSession();
+  const id = String(formData.get("id") ?? "");
+  if (!id) return;
+  const supabase = createAdminClient();
+  const { data: cand } = await supabase
+    .from("feed_candidates")
+    .select("url, title, site_url, credibility")
+    .eq("id", id)
+    .maybeSingle();
+  if (!cand) return;
+  // url unique 衝突は無視（既に手動追加済みの URL を二重承認した場合の保険）。
+  await supabase.from("feeds").upsert(
+    {
+      url: cand.url,
+      title: cand.title,
+      site_url: cand.site_url,
+      credibility: cand.credibility,
+    },
+    { onConflict: "url", ignoreDuplicates: true },
+  );
+  await supabase
+    .from("feed_candidates")
+    .update({ status: "approved" })
+    .eq("id", id);
+  revalidatePath("/feeds");
+}
+
+// 候補を却下する。source_domain は status 不問で重複排除に使うため、行は消さず rejected に倒す
+// （同じドメインが次回発見で再び候補に挙がるのを防ぐ）。
+export async function rejectFeedCandidate(formData: FormData) {
+  await requireSession();
+  const id = String(formData.get("id") ?? "");
+  if (!id) return;
+  const supabase = createAdminClient();
+  await supabase
+    .from("feed_candidates")
+    .update({ status: "rejected" })
+    .eq("id", id);
+  revalidatePath("/feeds");
+}
+
 export async function toggleRead(formData: FormData) {
   await requireSession();
   const id = String(formData.get("id") ?? "");
