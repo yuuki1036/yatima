@@ -1,0 +1,30 @@
+name: discover
+
+# 情報源の自動発見 cron（YAT-16 方式①）。記事リンクから候補フィードを発掘し、検証ゲートを
+# 通して feed_candidates に承認待ち登録する。重く低頻度でよい処理なので、ingest（毎時）とは
+# 分離して週次で回す。承認は UI（/feeds の DISCOVERED 枠）で人手が行う。
+on:
+  schedule:
+    - cron: "0 3 * * 1" # 毎週月曜 03:00（UTC）
+  workflow_dispatch: {} # Actions タブから手動実行
+
+# ingest とは別グループ。発見ジョブ同士だけ直列化する。
+concurrency:
+  group: discover
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run discover
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}

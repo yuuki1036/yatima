@@ -10,6 +10,19 @@ export type Feed = {
   created_at: string;
 };
 
+// Phase4: 自動発見の承認待ち候補（YAT-16）。承認で feeds へ昇格する。
+export type FeedCandidate = {
+  id: string;
+  url: string;
+  title: string | null;
+  site_url: string | null;
+  source_domain: string;
+  discovered_from: string | null;
+  credibility: number;
+  status: "pending" | "approved" | "rejected";
+  created_at: string;
+};
+
 export type Article = {
   id: string;
   feed_id: string;
