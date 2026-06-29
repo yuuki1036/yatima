@@ -49,7 +49,7 @@ export async function deleteFeed(formData: FormData) {
   await supabase.from("feeds").delete().eq("id", id);
   revalidatePath("/feeds");
   revalidatePath("/");
-  revalidatePath("/list");
+  revalidatePath("/saved");
 }
 
 // 自動発見の承認待ち候補（feed_candidates）を feeds へ昇格する（YAT-16）。誤検出を本番取得に
@@ -132,7 +132,7 @@ export async function toggleRead(formData: FormData) {
   const next = formData.get("is_read") !== "true"; // 現在値の反転
   const supabase = createAdminClient();
   await supabase.from("articles").update({ is_read: next }).eq("id", id);
-  revalidatePath("/list");
+  revalidatePath("/saved");
 }
 
 export async function toggleStar(formData: FormData) {
@@ -142,7 +142,7 @@ export async function toggleStar(formData: FormData) {
   const next = formData.get("is_starred") !== "true";
   const supabase = createAdminClient();
   await supabase.from("articles").update({ is_starred: next }).eq("id", id);
-  revalidatePath("/list");
+  revalidatePath("/saved");
 }
 
 // 手動「更新」: 全 active フィードを取得→本文補完→未要約を要約+タグ→デッキを未判定 10 件へ補充。
@@ -194,7 +194,7 @@ export async function refreshNow(): Promise<RefreshState> {
     // ── デッキ補充は取得の有無に関わらず常に実行（クールダウン中でも既存プールから補充できる）。
     const c = await curateToday(supabase);
     revalidatePath("/");
-    revalidatePath("/list");
+    revalidatePath("/saved");
     revalidatePath("/feeds");
 
     const deck = c.skipped ? "デッキは充足（追加なし）" : `デッキに+${c.picked}`;
@@ -237,5 +237,5 @@ export async function submitFeedback(formData: FormData) {
   // "/" は revalidate しない: デッキはクライアント側で1枚ずつ進むため、ここで再取得して
   // 判定済みカードを配列から除外すると、楽観的に進めた index と二重にズレてカードが飛ぶ。
   // リロード時はサーバクエリが判定済みを除外し、続きから再開する。
-  revalidatePath("/list"); // 「開く」で立てた既読を /list に反映
+  revalidatePath("/saved"); // 「開く」で立てた既読を /saved に反映
 }

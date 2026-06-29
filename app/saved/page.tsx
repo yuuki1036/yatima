@@ -4,7 +4,7 @@ import type { ArticleWithFeed } from "@/lib/types";
 import { toggleRead, toggleStar } from "../actions";
 import { RefreshButton } from "../_components/refresh-button";
 
-// 全件ブラウズ用の密リスト（旧トップ）。Tinder（/）の取りこぼし確認・既読/スター操作の受け皿。
+// 「後で読む」お気に入り（is_starred）の一覧。デッキ（/）で★を付けた記事を貯める受け皿。
 export const dynamic = "force-dynamic";
 // 手動「更新」(refreshNow) が取得→要約→curate を同期実行するため、関数時間を延ばす。
 export const maxDuration = 60;
@@ -12,7 +12,7 @@ export const maxDuration = 60;
 const btn =
   "border border-border px-2.5 py-1 font-mono text-xs tracking-wide transition-colors hover:bg-foreground hover:text-background";
 
-export default async function ListPage() {
+export default async function SavedPage() {
   let articles: ArticleWithFeed[] = [];
   let errorMsg: string | null = null;
 
@@ -21,10 +21,12 @@ export default async function ListPage() {
     const { data, error } = await supabase
       .from("articles")
       // 一覧で使う列だけ明示取得する。`*` だと embedding vector(1024) や content_html まで
-      // 100 件ぶん載りペイロードが肥大するため除外する。
+      // 最大 100 件分のペイロードに載って肥大するため除外する。
       .select(
         "id, url, title, summary, is_read, is_starred, published_at, feeds(title, site_url)",
       )
+      // お気に入り（★）のみ。デッキ・この一覧の双方から付け外しできる。
+      .eq("is_starred", true)
       .order("published_at", { ascending: false, nullsFirst: false })
       .limit(100);
     if (error) throw error;
@@ -37,7 +39,7 @@ export default async function ListPage() {
     <div>
       <div className="mb-5 flex items-center justify-between">
         <span className="font-mono text-xs font-medium tracking-widest text-accent">
-          ALL ARTICLES
+          SAVED
         </span>
         <div className="flex items-center gap-4">
           <span className="font-mono text-xs tracking-widest text-faint tabular-nums">
@@ -59,9 +61,9 @@ export default async function ListPage() {
 
       {!errorMsg && articles.length === 0 && (
         <p className="border border-line py-12 text-center text-sm text-muted">
-          記事がありません。
+          お気に入りがありません。
           <br />
-          「FEEDS」からフィードを追加すると、定期実行で記事が取得されます。
+          デッキ（TODAY）で★を付けると、後で読む記事がここに貯まります。
         </p>
       )}
 

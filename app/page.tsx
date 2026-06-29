@@ -1,7 +1,7 @@
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { todayJst, errorMessage } from "@/lib/format";
 import type { CurationCard } from "@/lib/types";
-import { submitFeedback } from "./actions";
+import { submitFeedback, toggleStar } from "./actions";
 import { CurationDeck } from "./_components/curation-deck";
 import { RefreshButton } from "./_components/refresh-button";
 
@@ -17,6 +17,7 @@ type PickRow = {
   url: string | null;
   published_at: string | null;
   score: number | null;
+  is_starred: boolean;
   feeds: { title: string | null } | null;
   article_tags: { tag_slug: string }[] | null;
 };
@@ -33,7 +34,7 @@ export default async function Home() {
       supabase
         .from("articles")
         .select(
-          "id, title, summary, url, published_at, score, feeds(title), article_tags(tag_slug)",
+          "id, title, summary, url, published_at, score, is_starred, feeds(title), article_tags(tag_slug)",
         )
         .eq("picked_date", today)
         .order("score", { ascending: false, nullsFirst: false }),
@@ -57,6 +58,7 @@ export default async function Home() {
         published_at: a.published_at,
         feedTitle: a.feeds?.title ?? null,
         tags: (a.article_tags ?? []).map((t) => t.tag_slug),
+        is_starred: a.is_starred,
       }));
   } catch (e) {
     errorMsg = errorMessage(e);
@@ -88,6 +90,7 @@ export default async function Home() {
           cards={cards}
           pickedToday={pickedToday}
           submitFeedbackAction={submitFeedback}
+          toggleStarAction={toggleStar}
         />
       )}
     </div>

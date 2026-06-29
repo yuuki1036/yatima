@@ -15,6 +15,8 @@ type Props = {
   pickedToday: number;
   // Server Action を prop で受け取る（Next.js のクライアント連携パターン）。
   submitFeedbackAction: (formData: FormData) => void;
+  // 「後で読む」お気に入りの付け外し（is_starred トグル）。判定とは別系統で、カードを進めない。
+  toggleStarAction: (formData: FormData) => void;
 };
 
 // 今日のカードを1枚ずつ捌く Tinder UI。送り操作はクライアント state で楽観的に前進し、
@@ -23,6 +25,7 @@ export function CurationDeck({
   cards,
   pickedToday,
   submitFeedbackAction,
+  toggleStarAction,
 }: Props) {
   const [index, setIndex] = useState(0);
   const [, startTransition] = useTransition();
@@ -33,7 +36,35 @@ export function CurationDeck({
   // 続き（判定済みの除外）はリロード/再訪時にサーバクエリが行う。
   const [deck] = useState(cards);
 
+  // お気に入り状態はクライアントローカルで持つ。toggleStar は /saved のみ revalidate し "/" を
+  // 触らないため（デッキの楽観 index を壊さないため）、★の見た目はサーバ再取得に頼らず楽観表示する。
+  const [starredIds, setStarredIds] = useState<Set<string>>(
+    () => new Set(cards.filter((c) => c.is_starred).map((c) => c.id)),
+  );
+
   const current: CurationCard | undefined = deck[index];
+
+  // ★トグル: 判定（dismiss/useful）とは別系統。カードは進めず、現在値を送って反転させる。
+  // 反転前の値は setStarredIds の updater 内で確定する（クロージャの starredIds を読むと、
+  // 高速連打・キーリピート時に stale な値を掴んでサーバ送信と楽観表示が乖離するため）。
+  const toggleStar = useCallback(
+    (card: CurationCard) => {
+      let wasStarred = false;
+      setStarredIds((prev) => {
+        wasStarred = prev.has(card.id); // updater は直前の最新 state を受けるので連打でも正しい
+        const next = new Set(prev);
+        if (wasStarred) next.delete(card.id);
+        else next.add(card.id);
+        return next;
+      });
+      const fd = new FormData();
+      fd.set("id", card.id);
+      // toggleStar は現在値を反転する。楽観表示と一致させるため反転前の値を送る。
+      fd.set("is_starred", String(wasStarred));
+      startTransition(() => toggleStarAction(fd));
+    },
+    [toggleStarAction],
+  );
 
   const send = useCallback(
     (card: CurationCard, action: FeedbackAction) => {
@@ -50,7 +81,7 @@ export function CurationDeck({
     [submitFeedbackAction],
   );
 
-  // キーボード操作: ← 興味なし / → 興味あり / Enter 開く
+  // キーボード操作: ← 興味なし / → 興味あり / Enter 開く / S お気に入り
   useEffect(() => {
     if (!current) return;
     function onKey(e: KeyboardEvent) {
@@ -63,11 +94,15 @@ export function CurationDeck({
       } else if (e.key === "Enter") {
         e.preventDefault();
         send(current!, "open");
+      } else if (e.key === "s" || e.key === "S") {
+        if (e.repeat) return; // 長押しのオートリピートで多重トグルしない
+        e.preventDefault();
+        toggleStar(current!);
       }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [current, send]);
+  }, [current, send, toggleStar]);
 
   // ── フリック（スワイプ）対応: カードを左右にドラッグして送る ─────────────
   // ポインタ操作（タッチ + マウス兼用）。8px 動いて初めてドラッグ扱いにし、タイトルの
@@ -205,7 +240,12 @@ export function CurationDeck({
             opacity: flyOut ? 0 : 1,
           }}
         >
-          <SwipeCard card={current} index={index + 1} />
+          <SwipeCard
+            card={current}
+            index={index + 1}
+            isStarred={starredIds.has(current.id)}
+            onToggleStar={() => toggleStar(current)}
+          />
         </div>
 
         {/* スワイプ方向のヒント（指の移動量に応じてフェードイン） */}
@@ -253,7 +293,7 @@ export function CurationDeck({
       </div>
 
       <p className="mt-3 text-center font-mono text-xs tracking-widest text-faint">
-        ← SKIP　·　ENTER OPEN　·　KEEP →
+        ← SKIP　·　ENTER OPEN　·　KEEP →　·　S SAVE
       </p>
     </div>
   );

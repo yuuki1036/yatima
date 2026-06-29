@@ -46,7 +46,7 @@ export async function recordFeedback(
     if (error) throw error;
   }
 
-  // 「開く」は /list と意味整合させるため既読にする（不要/役立っただけでは既読化しない）。
+  // 「開く」は /saved と意味整合させるため既読にする（不要/役立っただけでは既読化しない）。
   if (action === "open") {
     await supabase
       .from("articles")

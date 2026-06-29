@@ -106,4 +106,5 @@ export type CurationCard = {
   published_at: string | null;
   feedTitle: string | null;
   tags: string[]; // tag_slug の配列
+  is_starred: boolean; // 「後で読む」お気に入り。デッキから★トグルで付け外しする
 };
