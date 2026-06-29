@@ -96,6 +96,35 @@ export async function rejectFeedCandidate(formData: FormData) {
   revalidatePath("/feeds");
 }
 
+// 学習カード候補（card_candidates）を承認する（YAT-17）。誤生成を本番に混ぜないための承認制の
+// 出口。YAT-17 スコープでは status を approved に倒すだけで、cards への昇格（FSRS createEmptyCard）
+// は YAT-18 で行う。承認済み行は永続するので YAT-18 で一括昇格できる。
+export async function approveCard(formData: FormData) {
+  await requireSession();
+  const id = String(formData.get("id") ?? "");
+  if (!id) return;
+  const supabase = createAdminClient();
+  await supabase
+    .from("card_candidates")
+    .update({ status: "approved" })
+    .eq("id", id);
+  revalidatePath("/learn");
+}
+
+// カード候補を却下する。embedding は status 不問で dedup 母集団に使うため、行は消さず rejected に
+// 倒す（同じ記事/概念が次回生成で再び候補に挙がるのを防ぐ。rejectFeedCandidate と同方針）。
+export async function rejectCard(formData: FormData) {
+  await requireSession();
+  const id = String(formData.get("id") ?? "");
+  if (!id) return;
+  const supabase = createAdminClient();
+  await supabase
+    .from("card_candidates")
+    .update({ status: "rejected" })
+    .eq("id", id);
+  revalidatePath("/learn");
+}
+
 export async function toggleRead(formData: FormData) {
   await requireSession();
   const id = String(formData.get("id") ?? "");

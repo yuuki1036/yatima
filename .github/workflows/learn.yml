@@ -1,0 +1,33 @@
+name: learn
+
+# 学習カード生成 cron（YAT-17）。read 済み・useful な記事から Q&A/cloze カード候補を生成し、
+# grounding 照合 + 形式検証 + dedup の機械フィルタを通して card_candidates に承認待ち登録する。
+# 重く低頻度でよい処理なので、ingest（毎時）/ discover（週次・月曜 03:00）とは分離して回す。
+# 承認は UI（/learn）で人手が行う。
+on:
+  schedule:
+    - cron: "0 4 * * 1" # 毎週月曜 04:00（UTC）。discover(03:00) とずらして同時実行を避ける
+  workflow_dispatch: {} # Actions タブから手動実行
+
+# ingest / discover とは別グループ。学習ジョブ同士だけ直列化する。
+concurrency:
+  group: learn
+  cancel-in-progress: false
+
+jobs:
+  learn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20 # 生成 + Voyage embed（16件/回・21s 間隔）のレート制限を見込む
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run generate-cards
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
