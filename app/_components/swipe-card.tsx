@@ -4,18 +4,38 @@ import { tagLabel, categoryLabel } from "@/lib/tags/vocabulary";
 
 // Tinder デッキ1枚分の見た目（presentational）。状態は持たない。
 // index は 1 始まりの通し番号（デッキ内の位置）。Archivo の特大番号として表示する。
+// ★トグル（お気に入り）だけは操作を受けるが、状態は親が持ち、ここはコールバックを呼ぶだけ。
 export function SwipeCard({
   card,
   index,
+  isStarred,
+  onToggleStar,
 }: {
   card: CurationCard;
   index: number;
+  isStarred: boolean;
+  onToggleStar: () => void;
 }) {
   // カテゴリ表記（TECH / AI）は先頭タグ slug から導出する。
   const category = card.tags[0] ? categoryLabel(card.tags[0]) : null;
 
   return (
-    <article className="border border-border bg-surface">
+    <article className="relative border border-border bg-surface">
+      {/* ★お気に入りトグル（カード右上）。pointerDown を止めてデッキのドラッグ誤発火を防ぐ。 */}
+      <button
+        type="button"
+        onPointerDown={(e) => e.stopPropagation()}
+        onClick={onToggleStar}
+        aria-label="お気に入り"
+        aria-pressed={isStarred}
+        title={isStarred ? "お気に入りから外す" : "後で読む（お気に入り）"}
+        className={`absolute right-3 top-3 z-10 px-2 py-1 font-mono text-lg leading-none transition-colors ${
+          isStarred ? "text-accent" : "text-faint hover:text-foreground"
+        }`}
+      >
+        {isStarred ? "★" : "☆"}
+      </button>
+
       <div className="flex gap-5 p-6">
         <div className="font-display text-4xl font-extrabold leading-none tabular-nums text-foreground">
           {String(index).padStart(2, "0")}
@@ -28,7 +48,7 @@ export function SwipeCard({
             </div>
           )}
 
-          <h2 className="mt-1.5 text-xl font-bold leading-snug">
+          <h2 className="mt-1.5 pr-8 text-xl font-bold leading-snug">
             {card.url ? (
               <a
                 href={card.url}

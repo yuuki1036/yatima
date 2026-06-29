@@ -6,7 +6,7 @@ import { usePathname } from "next/navigation";
 // ヘッダのグローバルナビ。現在パスに応じてアクティブ表示（赤＋下線）を切り替える。
 const ITEMS = [
   { href: "/", label: "TODAY" },
-  { href: "/list", label: "LIST" },
+  { href: "/saved", label: "SAVED" },
   { href: "/feeds", label: "FEEDS" },
   { href: "/learn", label: "LEARN" },
 ] as const;
