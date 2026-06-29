@@ -23,6 +23,25 @@ export type FeedCandidate = {
   created_at: string;
 };
 
+// YAT-17: 学習カードの承認待ち候補（feed_candidates と同型）。記事から LLM 生成 → grounding/
+// 形式/dedup の機械フィルタを通過した候補を pending で積む。承認で status=approved に倒す
+// （cards への昇格は YAT-18）。却下は行を残し rejected（dedup 母集団＝全 status を維持）。
+export type CardCandidate = {
+  id: string;
+  article_id: string | null; // on delete cascade（記事削除で候補も消える）
+  type: "qa" | "cloze";
+  front: string | null; // qa 用（設問）
+  back: string | null; // qa 用（解答）
+  cloze_text: string | null; // cloze 用（{{c1::...}}）
+  source_quote: string; // grounding 根拠（原文の逐語抜粋）
+  concept_tag: string | null;
+  // embedding 列は dedup 母集団用で UI/型には出さない（FeedCandidate と同様に内部列は型から省く）。
+  dup_flag: boolean;
+  dup_similarity: number | null;
+  status: "pending" | "approved" | "rejected";
+  created_at: string;
+};
+
 export type Article = {
   id: string;
   feed_id: string;
