@@ -8,6 +8,8 @@ export type Feed = {
   active: boolean;
   last_fetched_at: string | null;
   created_at: string;
+  credibility: number; // 静的なソース信頼度 prior（YAT-14, 0005）
+  near_dup_rate: number | null; // 他 feed との重複量産率（YAT-20, 0008。null=未算出）
 };
 
 // Phase4: 自動発見の承認待ち候補（YAT-16）。承認で feeds へ昇格する。
