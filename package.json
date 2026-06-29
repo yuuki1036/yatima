@@ -13,6 +13,7 @@
     "ingest": "tsx scripts/ingest.ts",
     "discover": "tsx scripts/discover.ts",
     "generate-cards": "tsx scripts/generate-cards.ts",
+    "compute-dedup-rate": "tsx scripts/compute-dedup-rate.ts",
     "migrate": "tsx scripts/migrate.ts",
     "resummarize": "tsx scripts/resummarize.ts",
     "retag": "tsx scripts/retag.ts"

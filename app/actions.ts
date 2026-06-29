@@ -52,6 +52,29 @@ export async function deleteFeed(formData: FormData) {
   revalidatePath("/saved");
 }
 
+// 削除推奨（YAT-20）の確定アクション: 物理削除せず active=false に倒して取得対象から外す。
+// 記事は残すので「後で読む」や既存デッキは保全され、reactivateFeed で復活できる。
+// ingestAllFeeds が .eq("active", true) で絞るため、次回 ingest 以降は取得が止まる。既存記事は
+// curate の 72h ウィンドウから自然に外れるので、デッキ側の追加フィルタは不要（/ は revalidate しない）。
+export async function deactivateFeed(formData: FormData) {
+  await requireSession();
+  const id = String(formData.get("id") ?? "");
+  if (!id) return;
+  const supabase = createAdminClient();
+  await supabase.from("feeds").update({ active: false }).eq("id", id);
+  revalidatePath("/feeds");
+}
+
+// 非活性化した feed を取得対象へ戻す（deactivateFeed の対称操作）。
+export async function reactivateFeed(formData: FormData) {
+  await requireSession();
+  const id = String(formData.get("id") ?? "");
+  if (!id) return;
+  const supabase = createAdminClient();
+  await supabase.from("feeds").update({ active: true }).eq("id", id);
+  revalidatePath("/feeds");
+}
+
 // 自動発見の承認待ち候補（feed_candidates）を feeds へ昇格する（YAT-16）。誤検出を本番取得に
 // 混ぜないための承認制の出口。候補の低い初期 credibility をそのまま引き継ぎ、運用で手当てする。
 export async function approveFeedCandidate(formData: FormData) {
