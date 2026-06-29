@@ -5,6 +5,11 @@
 // 良記事を誤って落とす方が惜しいので保守的に高め。実データで skip 件数を見て調整する（tunable）。
 export const DEDUP_THRESHOLD = 0.86;
 
+// YAT-17: カード候補専用の dedup 閾値。記事用 DEDUP_THRESHOLD(0.86) を起点に分離する。
+// カードは短文で偶発的な類似が出やすいため、後で別値に較正できるよう一意に定義しておく
+// （design doc open「dedup 閾値はカード専用定数で一意に定義」）。
+export const CARD_DEDUP_THRESHOLD = 0.86;
+
 // PostgREST が返す vector 列は文字列 "[v1,v2,...]"。number[] にパースする。
 // 不正値（null / パース不可 / 空）は null を返し、呼び出し側で「embedding 無し＝非重複」に倒す。
 export function parseEmbedding(raw: unknown): number[] | null {
