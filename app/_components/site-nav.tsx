@@ -8,6 +8,7 @@ const ITEMS = [
   { href: "/", label: "TODAY" },
   { href: "/list", label: "LIST" },
   { href: "/feeds", label: "FEEDS" },
+  { href: "/learn", label: "LEARN" },
 ] as const;
 
 export function SiteNav() {
