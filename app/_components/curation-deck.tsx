@@ -3,10 +3,39 @@
 import { useCallback, useEffect, useRef, useState, useTransition } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import type { CurationCard, FeedbackAction } from "@/lib/types";
+import { useReducedMotion } from "../_hooks/use-reduced-motion";
 import { SwipeCard } from "./swipe-card";
 
 // スワイプで送ると判定する閾値（px）。これを超えて指を離すと dismiss/useful を発火。
 const SWIPE_THRESHOLD = 90;
+
+// 送り出しアニメの所要時間（ms）。この後に index を進めてフィードバックを送る。
+const EXIT_MS = 150;
+
+// カードを送り出す方向。useful=右 / dismiss=左 / open=上 で「どう処理したか」を見せ分ける。
+type ExitDir = "left" | "right" | "up";
+
+// 判定アクションと送り出し方向の対応。両引きできるよう双方向で持つ。
+// satisfies Record<FeedbackAction, ExitDir> でキーの過不足を型に守らせる
+// （FeedbackAction が増減したらここがコンパイルエラーになり気づける）。
+const ACTION_DIR = {
+  dismiss: "left",
+  useful: "right",
+  open: "up",
+} as const satisfies Record<FeedbackAction, ExitDir>;
+
+const DIR_ACTION: Record<ExitDir, FeedbackAction> = {
+  left: "dismiss",
+  right: "useful",
+  up: "open",
+};
+
+// 送り出し中の transform。上抜け（open）は回転なしで真上へ、左右は回しながら飛ばす。
+function exitTransform(dir: ExitDir): string {
+  if (dir === "up") return "translateY(-900px)";
+  const sign = dir === "right" ? 1 : -1;
+  return `translateX(${sign * 1000}px) rotate(${sign * 18}deg)`;
+}
 
 type Props = {
   cards: CurationCard[];
@@ -29,6 +58,7 @@ export function CurationDeck({
 }: Props) {
   const [index, setIndex] = useState(0);
   const [, startTransition] = useTransition();
+  const reduced = useReducedMotion();
 
   // cards はマウント時に固定する。フィードバックの Server Action は（revalidate 有無に関わらず）
   // カレントルートを再レンダーし「判定済みを除外した cards」を渡してくる。これを使うと楽観的に
@@ -43,6 +73,8 @@ export function CurationDeck({
   );
 
   const current: CurationCard | undefined = deck[index];
+  // 背後に薄く重ねる次の1枚（スタックプレビュー）。最後の1枚では undefined。
+  const next: CurationCard | undefined = deck[index + 1];
 
   // ★トグル: 判定（dismiss/useful）とは別系統。カードは進めず、現在値を送って反転させる。
   // 反転前の値は setStarredIds の updater 内で確定する（クロージャの starredIds を読むと、
@@ -66,12 +98,20 @@ export function CurationDeck({
     [toggleStarAction],
   );
 
-  const send = useCallback(
+  // ── 送り出し（スワイプ）の状態 ───────────────────────────────
+  // ドラッグ量・ドラッグ中フラグ・送り出し方向。flyOut が立つと演出が走り、終端で advance する。
+  const [dx, setDx] = useState(0); // 現在のドラッグ量（px）
+  const [dragging, setDragging] = useState(false);
+  const [flyOut, setFlyOut] = useState<ExitDir | null>(null);
+  const dragStartX = useRef(0);
+  const pointerActive = useRef(false);
+  const draggingRef = useRef(false); // 判定は ref で行う（state クロージャの陳腐化を避ける）
+  const dxRef = useRef(0);
+
+  // 楽観前進: フィードバックを送って次の1枚へ。演出は扱わず index を進めるだけ。
+  // window.open はここでは呼ばない（ジェスチャー同期で commit 側が済ませている）。
+  const advance = useCallback(
     (card: CurationCard, action: FeedbackAction) => {
-      // 「開く」は別タブでリンクを開く（clicked シグナル）。
-      if (action === "open" && card.url) {
-        window.open(card.url, "_blank", "noopener,noreferrer");
-      }
       const fd = new FormData();
       fd.set("id", card.id);
       fd.set("action", action);
@@ -81,19 +121,40 @@ export function CurationDeck({
     [submitFeedbackAction],
   );
 
+  // 全入力経路（ボタン / キーボード / ドラッグ確定）の共通入口。送り出し演出を起こし、
+  // 終端で advance する。reduced-motion 時は演出もタイマーも張らず即 advance。
+  const commit = useCallback(
+    (card: CurationCard, action: FeedbackAction) => {
+      if (flyOut) return; // 演出中は多重発火させない
+      // 「開く」の別タブはユーザージェスチャー同期で呼ぶ。150ms の setTimeout 経由に
+      // 乗せるとポップアップブロックされうるため、演出の遅延からは切り離す。
+      if (action === "open" && card.url) {
+        window.open(card.url, "_blank", "noopener,noreferrer");
+      }
+      if (reduced) {
+        advance(card, action); // 演出なしで即前進（ドラッグ残量もここで戻す）
+        dxRef.current = 0;
+        setDx(0);
+        return;
+      }
+      setFlyOut(ACTION_DIR[action]);
+    },
+    [flyOut, reduced, advance],
+  );
+
   // キーボード操作: ← 興味なし / → 興味あり / Enter 開く / S お気に入り
   useEffect(() => {
     if (!current) return;
     function onKey(e: KeyboardEvent) {
       if (e.key === "ArrowLeft") {
         e.preventDefault();
-        send(current!, "dismiss");
+        commit(current!, "dismiss");
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
-        send(current!, "useful");
+        commit(current!, "useful");
       } else if (e.key === "Enter") {
         e.preventDefault();
-        send(current!, "open");
+        commit(current!, "open");
       } else if (e.key === "s" || e.key === "S") {
         if (e.repeat) return; // 長押しのオートリピートで多重トグルしない
         e.preventDefault();
@@ -102,18 +163,11 @@ export function CurationDeck({
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [current, send, toggleStar]);
+  }, [current, commit, toggleStar]);
 
   // ── フリック（スワイプ）対応: カードを左右にドラッグして送る ─────────────
   // ポインタ操作（タッチ + マウス兼用）。8px 動いて初めてドラッグ扱いにし、タイトルの
   // タップ（リンク）を温存する。閾値超えで dismiss/useful を発火。
-  const [dx, setDx] = useState(0); // 現在のドラッグ量（px）
-  const [dragging, setDragging] = useState(false);
-  const [flyOut, setFlyOut] = useState<null | "left" | "right">(null);
-  const dragStartX = useRef(0);
-  const pointerActive = useRef(false);
-  const draggingRef = useRef(false); // 判定は ref で行う（state クロージャの陳腐化を避ける）
-  const dxRef = useRef(0);
 
   const onPointerDown = useCallback(
     (e: ReactPointerEvent<HTMLDivElement>) => {
@@ -141,25 +195,27 @@ export function CurationDeck({
     draggingRef.current = false;
     setDragging(false);
     const d = dxRef.current;
-    if (d > SWIPE_THRESHOLD) setFlyOut("right");
-    else if (d < -SWIPE_THRESHOLD) setFlyOut("left");
+    // 閾値超えは commit に流して送り出し（reduced 時は即前進）。未満はスナップバック。
+    if (current && d > SWIPE_THRESHOLD) commit(current, "useful");
+    else if (current && d < -SWIPE_THRESHOLD) commit(current, "dismiss");
     else {
       dxRef.current = 0;
-      setDx(0); // 閾値未満はスナップバック
+      setDx(0);
     }
-  }, []);
+  }, [commit, current]);
 
-  // 飛ばし切ったらフィードバックを送って次の1枚へ（飛ぶアニメ後に発火）。
+  // 飛ばし切ったらフィードバックを送って次の1枚へ（送り出しアニメ後に発火）。
+  // reduced 時は commit が即 advance するため flyOut は立たず、この effect は走らない。
   useEffect(() => {
     if (!flyOut || !current) return;
     const t = setTimeout(() => {
-      send(current, flyOut === "right" ? "useful" : "dismiss");
+      advance(current, DIR_ACTION[flyOut]);
       dxRef.current = 0;
       setDx(0);
       setFlyOut(null);
-    }, 180);
+    }, EXIT_MS);
     return () => clearTimeout(t);
-  }, [flyOut, current, send]);
+  }, [flyOut, current, advance]);
 
   // セクションラベル（赤・mono）。完了/未生成の各状態でも共通して頭に出す。
   const sectionLabel = (counter?: string) => (
@@ -228,15 +284,54 @@ export function CurationDeck({
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
       >
+        {/* idle のスタック覚き（z0）: 背後にずらした「白いカード枠」だけを下に覗かせる。
+            本文を出さないので、カードの高さ・本文量が違ってもボタン側へはみ出さず常にクリーン。
+            次カードの実体は別レイヤ（z1）で送り出し時にライズさせる。 */}
+        {next && (
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-0 border border-border bg-surface"
+            style={{
+              zIndex: 0,
+              transformOrigin: "top",
+              transform: "translateY(6px) scale(0.985)",
+            }}
+          />
+        )}
+
+        {/* 次カードの実体（z1・非操作）。idle は opacity 0 で隠し（覗きは枠だけに任せる）、
+            送り出し中だけ flush へライズして「次が来た」感を出す。reduced 時は動かさない。 */}
+        {next && (
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-0 overflow-hidden"
+            style={{
+              zIndex: 1,
+              transformOrigin: "top",
+              transform: flyOut ? "translateY(0) scale(1)" : "translateY(6px) scale(0.985)",
+              opacity: flyOut ? 1 : 0,
+              transition: reduced
+                ? "none"
+                : `transform ${EXIT_MS}ms ease-out, opacity ${EXIT_MS}ms ease-out`,
+            }}
+          >
+            <SwipeCard
+              card={next}
+              index={index + 2}
+              isStarred={starredIds.has(next.id)}
+              onToggleStar={() => {}}
+            />
+          </div>
+        )}
+
         <div
-          className={dragging ? "cursor-grabbing" : "cursor-grab"}
+          className={`relative ${dragging ? "cursor-grabbing" : "cursor-grab"}`}
           style={{
+            zIndex: 2,
             transform: flyOut
-              ? `translateX(${flyOut === "right" ? 1000 : -1000}px) rotate(${
-                  flyOut === "right" ? 18 : -18
-                }deg)`
+              ? exitTransform(flyOut)
               : `translateX(${dx}px) rotate(${dx * 0.04}deg)`,
-            transition: dragging ? "none" : "transform 180ms ease-out",
+            transition: dragging || reduced ? "none" : `transform ${EXIT_MS}ms ease-out`,
             opacity: flyOut ? 0 : 1,
           }}
         >
@@ -253,7 +348,9 @@ export function CurationDeck({
           <span
             className="border-2 border-border px-3 py-1 font-mono text-base font-bold tracking-widest text-foreground"
             style={{
-              opacity: dx < 0 ? Math.min(1, -dx / SWIPE_THRESHOLD) : 0,
+              // 送り出し中（flyOut）はヒントを消す。dx を保持したままだとバッジが
+              // 飛んでいくカードに残って汚いため。
+              opacity: flyOut || dx >= 0 ? 0 : Math.min(1, -dx / SWIPE_THRESHOLD),
               transform: "rotate(-12deg)",
             }}
           >
@@ -262,7 +359,7 @@ export function CurationDeck({
           <span
             className="border-2 border-accent px-3 py-1 font-mono text-base font-bold tracking-widest text-accent"
             style={{
-              opacity: dx > 0 ? Math.min(1, dx / SWIPE_THRESHOLD) : 0,
+              opacity: flyOut || dx <= 0 ? 0 : Math.min(1, dx / SWIPE_THRESHOLD),
               transform: "rotate(12deg)",
             }}
           >
@@ -273,19 +370,19 @@ export function CurationDeck({
 
       <div className="mt-5 flex border border-border divide-x divide-border font-mono text-sm tracking-widest">
         <button
-          onClick={() => send(current, "dismiss")}
+          onClick={() => commit(current, "dismiss")}
           className="flex-1 px-4 py-3 transition-colors hover:bg-foreground hover:text-background"
         >
           ← SKIP
         </button>
         <button
-          onClick={() => send(current, "open")}
+          onClick={() => commit(current, "open")}
           className="flex-1 bg-accent px-4 py-3 font-semibold text-accent-foreground transition-opacity hover:opacity-90"
         >
           OPEN
         </button>
         <button
-          onClick={() => send(current, "useful")}
+          onClick={() => commit(current, "useful")}
           className="flex-1 px-4 py-3 transition-colors hover:bg-foreground hover:text-background"
         >
           KEEP →
