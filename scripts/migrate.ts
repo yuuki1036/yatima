@@ -55,6 +55,14 @@ async function main() {
       );
     `);
 
+    // _migrations は API から触らない内部テーブル。public スキーマにあると PostgREST 経由で
+    // anon に読まれる（Supabase Security Advisor の rls_disabled_in_public）ため RLS を有効化する。
+    // ポリシーは付けない＝anon/authenticated は全拒否。migrate 自身は直 Postgres 接続のオーナー
+    // 権限で動くので RLS をバイパスし影響を受けない。enable は冪等なので毎回流して既存 DB にも追従させる。
+    await client.query(
+      "alter table public._migrations enable row level security;",
+    );
+
     const files = listMigrations();
 
     if (baseline) {
