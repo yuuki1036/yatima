@@ -9,6 +9,7 @@ const ITEMS = [
   { href: "/saved", label: "SAVED" },
   { href: "/feeds", label: "FEEDS" },
   { href: "/learn", label: "LEARN" },
+  { href: "/ask", label: "ASK" },
 ] as const;
 
 export function SiteNav() {

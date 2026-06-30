@@ -155,4 +155,45 @@ export function createEmbedder(): Embedder | null {
   return new VoyageEmbedder(apiKey);
 }
 
+// RAG（YAT-22）の検索クエリ用に、1 本のテキストを input_type: "query" で埋め込む単発関数。
+// 保存側（embedMissing）は document で埋めているので、検索側は query を指定して Voyage の
+// 非対称最適化（保存=document / 検索=query で別 prefix）を効かせる。保存済みベクトルとは同一
+// モデル・同一次元なので再生成は不要。
+// バッチ用 Embedder と別口にするのは、Embedder が「document バッチ＋レート分割」前提の設計で、
+// 単発クエリには分割も 21s sleep も不要だから（3 RPM に 1 本は余裕で収まる）。
+// 失敗（キー未設定 / 429 / API エラー）は null を返す fail-soft。呼び出し側で abstain 判断する。
+export async function embedQuery(text: string): Promise<number[] | null> {
+  const apiKey = process.env.VOYAGE_API_KEY;
+  if (!apiKey) return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+
+  try {
+    const res = await fetch(ENDPOINT, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        input: [trimmed],
+        model: MODEL,
+        input_type: "query",
+        output_dimension: DIMENSION,
+      }),
+    });
+    if (!res.ok) {
+      console.warn(`embedQuery 失敗: Voyage ${res.status}`);
+      return null;
+    }
+    const json = (await res.json()) as VoyageResponse;
+    const vec = json.data[0]?.embedding;
+    if (!vec || vec.length !== DIMENSION) return null;
+    return vec;
+  } catch (e) {
+    console.warn("embedQuery 例外:", e instanceof Error ? e.message : e);
+    return null;
+  }
+}
+
 export const EMBEDDING_DIMENSION = DIMENSION;
