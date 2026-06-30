@@ -1,6 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { extract } from "@extractus/article-extractor";
 import { htmlToInputText } from "@/lib/llm/extract-text";
+import { isPubliclyRoutableHttpUrl } from "@/lib/net/ssrf";
 
 // 本文が薄い記事（HN 等、RSS の content_html がメタ情報だけ）について、リンク先 URL から
 // 本文を取得して content_html を差し替える。要約・タグの入力を実本文にし、憶測（ハルシ
@@ -29,15 +30,23 @@ export function isThinBody(content: string | null): boolean {
 }
 
 // 1 記事の本文をリンク先から取得して content_html を差し替える。差し替えたら新しい
-// content_html を、URL 無し・取得本文が元と同等以下なら null を返す（呼び出し側が成否を判定）。
+// content_html を、URL 無し・SSRF ガードで弾かれた・取得本文が元と同等以下なら null を返す
+// （呼び出し側が成否を判定）。
 // enrichMissingBodies（要約前バッチ）と再アノテート（YAT-13）の両方から再利用する。
 export async function enrichArticleBody(
   supabase: SupabaseClient,
   row: Row,
 ): Promise<string | null> {
   if (!row.url) return null;
+  // row.url は feed の記事リンク（第三者由来）なので fetch 前に SSRF ガードを通す。
+  // 弾かれたら fail-soft で本文取得を諦める（discover.ts と同じ一次防御を共有）。
+  const safeUrl = isPubliclyRoutableHttpUrl(row.url);
+  if (!safeUrl) {
+    console.warn(`本文取得を SSRF ガードでスキップ [${row.id}] ${row.url}`);
+    return null;
+  }
   const article = await extract(
-    row.url,
+    safeUrl.href,
     {},
     {
       headers: { "user-agent": UA },
@@ -92,7 +101,9 @@ export async function enrichMissingBodies(
     const results = await Promise.allSettled(
       chunk.map(async (row) => {
         const content = await enrichArticleBody(supabase, row);
-        if (!content) throw new Error("取得本文が元と同等以下");
+        // null は「本文が元と同等以下」のほか「SSRF ガードでスキップ」も含む（後者は
+        // enrichArticleBody 側で個別に warn 済み）。理由を断定しない文言にする。
+        if (!content) throw new Error("本文を差し替えなかった（薄い/スキップ）");
       }),
     );
     results.forEach((r, idx) => {
