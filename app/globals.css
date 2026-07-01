@@ -17,7 +17,7 @@
 
 /* ダークトークン。OS 追従ではなく属性ベース（:root[data-theme="dark"]）で適用する。
    System/Light/Dark の解決は layout のインラインスクリプトが行い、effective 値を
-   <html data-theme> に同期セットする（FOUC なし）。CSS 側は @media を持たず DRY。 */
+   <html data-theme> に同期セットする（FOUC なし）。テーマ解決に @media は使わず DRY。 */
 :root[data-theme="dark"] {
   --background: #0e0e10;
   --surface: #161619;
@@ -49,6 +49,32 @@
 body {
   background: var(--background);
   color: var(--foreground);
+}
+
+/* 新カード着地の entrance（YAT-19 改善）。カード送り出し後、次の1枚が current に
+   なった瞬間に一度だけ再生する。背後のスタック枠（translateY(6px) scale(0.985)）より
+   わずかに深い位置から浮き上がって着地させ、「下の1枚がせり上がって来た」感で"次きた"を伝える。 */
+@keyframes card-enter {
+  from {
+    opacity: 0.5;
+    transform: translateY(8px) scale(0.975);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+.animate-card-enter {
+  /* transform-origin を z0 枠（top）にそろえ、拡大基点を一致させてせり上がり軌道を通す。 */
+  transform-origin: top;
+  animation: card-enter 200ms ease-out both;
+}
+
+/* OS の視差効果オフ時は演出を無効化（JS 側の reduced 分岐と二重に保険をかける）。 */
+@media (prefers-reduced-motion: reduce) {
+  .animate-card-enter {
+    animation: none;
+  }
 }
 
 /* キーボード操作時のみフォーカスを明示（マウス操作では出さない）。
