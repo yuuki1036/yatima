@@ -50,17 +50,22 @@ export default function RootLayout({
       <body className="min-h-full flex flex-col bg-background font-sans text-foreground">
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT }} />
         <header className="border-b-2 border-border">
-          <div className="mx-auto flex max-w-3xl items-center justify-between gap-6 px-4 py-4">
+          <div className="mx-auto flex max-w-3xl flex-wrap items-center gap-x-6 gap-y-3 px-4 py-4">
             <Link
               href="/"
               className="font-display text-lg font-extrabold tracking-tight"
             >
               yatima
             </Link>
-            <div className="flex items-center gap-5">
-              <SiteNav />
+            {/* テーマ・ログアウト: 狭幅はロゴと同じ行の右端（ml-auto）、広幅は最右端（order-last）。 */}
+            <div className="order-2 ml-auto flex items-center gap-5 sm:order-3 sm:ml-0">
               <ThemeToggle />
               <LogoutButton />
+            </div>
+            {/* ナビ: 狭幅は w-full で2行目に単独で回り込ませ見切れを防ぐ。
+                広幅は sm:ml-auto で右クラスタに寄せ、従来どおり1行に収める。 */}
+            <div className="order-3 w-full sm:order-2 sm:ml-auto sm:w-auto">
+              <SiteNav />
             </div>
           </div>
         </header>

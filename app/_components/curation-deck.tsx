@@ -286,7 +286,7 @@ export function CurationDeck({
       >
         {/* idle のスタック覚き（z0）: 背後にずらした「白いカード枠」だけを下に覗かせる。
             本文を出さないので、カードの高さ・本文量が違ってもボタン側へはみ出さず常にクリーン。
-            次カードの実体は別レイヤ（z1）で送り出し時にライズさせる。 */}
+            送り出し中も残し、飛んだカードの下から次の1枚がせり上がる「土台」として見せる。 */}
         {next && (
           <div
             aria-hidden
@@ -299,31 +299,9 @@ export function CurationDeck({
           />
         )}
 
-        {/* 次カードの実体（z1・非操作）。idle は opacity 0 で隠し（覗きは枠だけに任せる）、
-            送り出し中だけ flush へライズして「次が来た」感を出す。reduced 時は動かさない。 */}
-        {next && (
-          <div
-            aria-hidden
-            className="pointer-events-none absolute inset-0 overflow-hidden"
-            style={{
-              zIndex: 1,
-              transformOrigin: "top",
-              transform: flyOut ? "translateY(0) scale(1)" : "translateY(6px) scale(0.985)",
-              opacity: flyOut ? 1 : 0,
-              transition: reduced
-                ? "none"
-                : `transform ${EXIT_MS}ms ease-out, opacity ${EXIT_MS}ms ease-out`,
-            }}
-          >
-            <SwipeCard
-              card={next}
-              index={index + 2}
-              isStarred={starredIds.has(next.id)}
-              onToggleStar={() => {}}
-            />
-          </div>
-        )}
-
+        {/* current（z2・操作対象）。送り出しは exitTransform で飛ばし、飛び切って index が
+            進むと inner が current.id で remount され、entrance が一度だけ再生される。
+            「次が来た」感は exit と同時の裏ライズではなく、本物の新カードの着地で見せる。 */}
         <div
           className={`relative ${dragging ? "cursor-grabbing" : "cursor-grab"}`}
           style={{
@@ -335,12 +313,16 @@ export function CurationDeck({
             opacity: flyOut ? 0 : 1,
           }}
         >
-          <SwipeCard
-            card={current}
-            index={index + 1}
-            isStarred={starredIds.has(current.id)}
-            onToggleStar={() => toggleStar(current)}
-          />
+          {/* key で current ごとに remount → entrance を一度だけ再生。ドラッグ transform は
+              外側 div が持つので、内側の着地アニメ（transform）とは合成され競合しない。 */}
+          <div key={current.id} className={reduced ? undefined : "animate-card-enter"}>
+            <SwipeCard
+              card={current}
+              index={index + 1}
+              isStarred={starredIds.has(current.id)}
+              onToggleStar={() => toggleStar(current)}
+            />
+          </div>
         </div>
 
         {/* スワイプ方向のヒント（指の移動量に応じてフェードイン） */}
@@ -388,10 +370,6 @@ export function CurationDeck({
           KEEP →
         </button>
       </div>
-
-      <p className="mt-3 text-center font-mono text-xs tracking-widest text-faint">
-        ← SKIP　·　ENTER OPEN　·　KEEP →　·　S SAVE
-      </p>
     </div>
   );
 }
