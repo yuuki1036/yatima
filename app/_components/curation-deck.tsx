@@ -370,10 +370,6 @@ export function CurationDeck({
           KEEP →
         </button>
       </div>
-
-      <p className="mt-3 text-center font-mono text-xs tracking-widest text-faint">
-        ← SKIP　·　ENTER OPEN　·　KEEP →　·　S SAVE
-      </p>
     </div>
   );
 }
