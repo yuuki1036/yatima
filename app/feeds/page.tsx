@@ -8,6 +8,12 @@ import {
 } from "@/lib/ranking/feed-health";
 import type { Feed, FeedCandidate } from "@/lib/types";
 import {
+  credibilityLevel,
+  CREDIBILITY_LABELS,
+  discoverySourceCount,
+  NOTABLE_SOURCE_COUNT,
+} from "@/lib/feeds/discovery-display";
+import {
   addFeed,
   approveFeedCandidate,
   deactivateFeed,
@@ -177,7 +183,40 @@ export default async function FeedsPage() {
                   </div>
                   <div className="mt-1 font-mono text-xs tracking-wide text-faint">
                     {c.source_domain}
-                    {c.discovered_from ? ` — ${c.discovered_from}` : ""}
+                  </div>
+                  {/* 承認/却下の判断材料（YAT-26）: 信頼度の段階と、何媒体が参照していたか。 */}
+                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                    {(() => {
+                      const level = credibilityLevel(c.credibility);
+                      // 低は控えめ(faint)、中は muted、高は accent で強調して段階を色でも示す。
+                      const tone =
+                        level === "high"
+                          ? "text-accent"
+                          : level === "mid"
+                            ? "text-muted"
+                            : "text-faint";
+                      return (
+                        <span
+                          className={`border border-border px-1.5 py-0.5 font-mono text-[10px] tracking-wide ${tone}`}
+                        >
+                          信頼度 {CREDIBILITY_LABELS[level]}
+                        </span>
+                      );
+                    })()}
+                    {(() => {
+                      const n = discoverySourceCount(c.discovered_from);
+                      if (n === null) return null;
+                      // 複数ソースからの参照は承認寄りの材料なので accent で強調する。
+                      const tone =
+                        n >= NOTABLE_SOURCE_COUNT ? "text-accent" : "text-faint";
+                      return (
+                        <span
+                          className={`border border-border px-1.5 py-0.5 font-mono text-[10px] tracking-wide tabular-nums ${tone}`}
+                        >
+                          {n} 媒体が参照
+                        </span>
+                      );
+                    })()}
                   </div>
                 </div>
                 <div className="flex shrink-0 gap-1.5">
