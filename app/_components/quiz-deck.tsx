@@ -13,6 +13,7 @@ type Props = {
   categories: Category[]; // tech/* leaf（おまかせは slug="" で末尾に添える）
   startAction: (categoryRaw: string) => Promise<QuizSessionResult>;
   answerAction: (questionId: string, chosenIndex: number) => void;
+  masterySlot?: React.ReactNode; // YAT-28: picker phase 下に差し込む弱点マップ（Server Component）
 };
 
 const DIFF_LABEL = {
@@ -21,7 +22,12 @@ const DIFF_LABEL = {
   hard: "HARD",
 } as const satisfies Record<QuizQuestion["difficulty"], string>;
 
-export function QuizDeck({ categories, startAction, answerAction }: Props) {
+export function QuizDeck({
+  categories,
+  startAction,
+  answerAction,
+  masterySlot,
+}: Props) {
   const [phase, setPhase] = useState<"picker" | "quiz" | "done">("picker");
   const [pending, startTransition] = useTransition();
   const [note, setNote] = useState<string | null>(null);
@@ -137,6 +143,8 @@ export function QuizDeck({ categories, startAction, answerAction }: Props) {
             生成中…（数秒かかります）
           </p>
         )}
+
+        {masterySlot}
       </div>
     );
   }

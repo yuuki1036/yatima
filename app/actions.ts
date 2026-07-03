@@ -10,7 +10,11 @@ import { enrichMissingBodies } from "@/lib/rss/enrich";
 import { annotateMissing } from "@/lib/llm/summarize-batch";
 import { curateToday } from "@/lib/ranking/curate";
 import { generateQuizForCategory } from "@/lib/learn/quiz-gate";
-import { recordQuizAttempt } from "@/lib/learn/mastery";
+import {
+  recordQuizAttempt,
+  selectSessionQuestions,
+  markConceptsServed,
+} from "@/lib/learn/mastery";
 import { isTagSlug, type TagSlug } from "@/lib/tags/vocabulary";
 import type { FeedbackAction, QuizQuestion, QuizSessionResult } from "@/lib/types";
 
@@ -271,9 +275,6 @@ export async function submitFeedback(formData: FormData) {
 // 1 セッションの出題数。オンデマンド生成を Vercel maxDuration(60s) 内に収める控えめな下限
 // （design doc の 5〜10 問の下限）。
 const QUIZ_SESSION_SIZE = 5;
-// serving 用に client へ渡す列（answer_index / explanation を含む＝即時採点のため）。
-const QUIZ_SELECT =
-  "id, concept_key, concept_label, category, difficulty, stem, choices, answer_index, explanation, source_quote, grounded, source_ref";
 
 // クイズ入力（category）を許可値のみに正規化する。picker は tech/* leaf のみ提示するため、それ以外は
 // 「おまかせ」(null) に倒す（直 POST の未知値も null 扱いで安全側）。
@@ -282,8 +283,9 @@ function parseQuizCategory(raw: string): TagSlug | null {
   return null; // "" / 未知値 = おまかせ
 }
 
-// クイズセッションを開始する: 既存 active プール（未回答）を優先し、不足分をオンデマンド生成で
-// トップアップして最大 QUIZ_SESSION_SIZE 問返す。client の picker から event handler で呼ぶ。
+// クイズセッションを開始する: 既存 active プールから適応選定（弱点度×間隔×レベル一致）で優先出題し、
+// 不足分をオンデマンド生成でトップアップして最大 QUIZ_SESSION_SIZE 問返す。出題確定後に
+// last_served_at を更新する（YAT-28）。client の picker から event handler で呼ぶ。
 export async function startQuizSession(
   categoryRaw: string,
 ): Promise<QuizSessionResult> {
@@ -292,32 +294,12 @@ export async function startQuizSession(
   const category = parseQuizCategory(categoryRaw);
 
   try {
-    // 回答済み問題は除外して再出題を避ける（単一ユーザーなので全件突き合わせで足りる）。
-    const { data: answered } = await supabase
-      .from("quiz_attempts")
-      .select("question_id");
-    const answeredIds = new Set(
-      (answered ?? []).map((r) => r.question_id as string),
-    );
-
-    // 既存プールから未回答を集める（category 指定時は絞る）。多めに取って回答済みを差し引く。
-    let poolQuery = supabase
-      .from("quiz_questions")
-      .select(QUIZ_SELECT)
-      .eq("status", "active")
-      .order("created_at", { ascending: false })
-      .limit(QUIZ_SESSION_SIZE * 4);
-    if (category) poolQuery = poolQuery.eq("category", category);
-    const { data: poolData } = await poolQuery;
-
-    const questions: QuizQuestion[] = [];
-    const seen = new Set<string>();
-    for (const q of (poolData ?? []) as unknown as QuizQuestion[]) {
-      if (answeredIds.has(q.id) || seen.has(q.id)) continue;
-      seen.add(q.id);
-      questions.push(q);
-      if (questions.length >= QUIZ_SESSION_SIZE) break;
-    }
+    // 適応選定（eligibility フィルタ＋スコアリング＋concept 重複回避）で既存プールから組む。
+    const questions = await selectSessionQuestions(supabase, {
+      category,
+      size: QUIZ_SESSION_SIZE,
+    });
+    const seen = new Set(questions.map((q) => q.id));
 
     // 不足分はオンデマンド生成でトップアップ。
     let note: string | null = null;
@@ -336,6 +318,18 @@ export async function startQuizSession(
         note = gen.skipped
           ? "問題を生成できません（ANTHROPIC_API_KEY 未設定）。"
           : "このカテゴリの出題を作れませんでした。記事の蓄積を待つか別カテゴリを試してください。";
+      }
+    }
+
+    // 出題した concept の last_served_at を更新（間隔ボーナス用）。失敗しても出題は成立させる。
+    if (questions.length > 0) {
+      try {
+        await markConceptsServed(
+          supabase,
+          questions.map((q) => q.concept_key),
+        );
+      } catch (e) {
+        console.warn("last_served_at の更新に失敗:", e);
       }
     }
 
