@@ -9,7 +9,10 @@ import { ingestAllFeeds } from "@/lib/rss/ingest";
 import { enrichMissingBodies } from "@/lib/rss/enrich";
 import { annotateMissing } from "@/lib/llm/summarize-batch";
 import { curateToday } from "@/lib/ranking/curate";
-import type { FeedbackAction } from "@/lib/types";
+import { generateQuizForCategory } from "@/lib/learn/quiz-gate";
+import { recordQuizAttempt } from "@/lib/learn/mastery";
+import { isTagSlug, type TagSlug } from "@/lib/tags/vocabulary";
+import type { FeedbackAction, QuizQuestion, QuizSessionResult } from "@/lib/types";
 
 // 書き込みはすべて service role（RLS バイパス）で行う。
 
@@ -261,4 +264,121 @@ export async function submitFeedback(formData: FormData) {
   // 判定済みカードを配列から除外すると、楽観的に進めた index と二重にズレてカードが飛ぶ。
   // リロード時はサーバクエリが判定済みを除外し、続きから再開する。
   revalidatePath("/saved"); // 「開く」で立てた既読を /saved に反映
+}
+
+// ── YAT-27: 適応クイズ ─────────────────────────────────────
+
+// 1 セッションの出題数。オンデマンド生成を Vercel maxDuration(60s) 内に収める控えめな下限
+// （design doc の 5〜10 問の下限）。
+const QUIZ_SESSION_SIZE = 5;
+// serving 用に client へ渡す列（answer_index / explanation を含む＝即時採点のため）。
+const QUIZ_SELECT =
+  "id, concept_key, concept_label, category, difficulty, stem, choices, answer_index, explanation, source_quote, grounded, source_ref";
+
+// クイズ入力（category）を許可値のみに正規化する。picker は tech/* leaf のみ提示するため、それ以外は
+// 「おまかせ」(null) に倒す（直 POST の未知値も null 扱いで安全側）。
+function parseQuizCategory(raw: string): TagSlug | null {
+  if (isTagSlug(raw) && raw.startsWith("tech/")) return raw;
+  return null; // "" / 未知値 = おまかせ
+}
+
+// クイズセッションを開始する: 既存 active プール（未回答）を優先し、不足分をオンデマンド生成で
+// トップアップして最大 QUIZ_SESSION_SIZE 問返す。client の picker から event handler で呼ぶ。
+export async function startQuizSession(
+  categoryRaw: string,
+): Promise<QuizSessionResult> {
+  await requireSession();
+  const supabase = createAdminClient();
+  const category = parseQuizCategory(categoryRaw);
+
+  try {
+    // 回答済み問題は除外して再出題を避ける（単一ユーザーなので全件突き合わせで足りる）。
+    const { data: answered } = await supabase
+      .from("quiz_attempts")
+      .select("question_id");
+    const answeredIds = new Set(
+      (answered ?? []).map((r) => r.question_id as string),
+    );
+
+    // 既存プールから未回答を集める（category 指定時は絞る）。多めに取って回答済みを差し引く。
+    let poolQuery = supabase
+      .from("quiz_questions")
+      .select(QUIZ_SELECT)
+      .eq("status", "active")
+      .order("created_at", { ascending: false })
+      .limit(QUIZ_SESSION_SIZE * 4);
+    if (category) poolQuery = poolQuery.eq("category", category);
+    const { data: poolData } = await poolQuery;
+
+    const questions: QuizQuestion[] = [];
+    const seen = new Set<string>();
+    for (const q of (poolData ?? []) as unknown as QuizQuestion[]) {
+      if (answeredIds.has(q.id) || seen.has(q.id)) continue;
+      seen.add(q.id);
+      questions.push(q);
+      if (questions.length >= QUIZ_SESSION_SIZE) break;
+    }
+
+    // 不足分はオンデマンド生成でトップアップ。
+    let note: string | null = null;
+    if (questions.length < QUIZ_SESSION_SIZE) {
+      const gen = await generateQuizForCategory(supabase, {
+        category,
+        count: QUIZ_SESSION_SIZE - questions.length,
+      });
+      for (const q of gen.inserted) {
+        if (seen.has(q.id)) continue;
+        seen.add(q.id);
+        questions.push(q);
+        if (questions.length >= QUIZ_SESSION_SIZE) break;
+      }
+      if (questions.length === 0) {
+        note = gen.skipped
+          ? "問題を生成できません（ANTHROPIC_API_KEY 未設定）。"
+          : "このカテゴリの出題を作れませんでした。記事の蓄積を待つか別カテゴリを試してください。";
+      }
+    }
+
+    return { questions, note };
+  } catch (e) {
+    console.warn("startQuizSession 失敗:", e);
+    return {
+      questions: [],
+      note: "クイズの準備に失敗しました。時間をおいて再試行してください。",
+    };
+  }
+}
+
+// クイズの回答を記録する（fire-and-forget）。正誤は DB の answer_index で確定し、client 値を信用
+// しない（幻覚正解の刷り込みとは別軸で、採点の真偽をサーバ側で担保する）。デッキは client で1枚ずつ
+// 進むため /learn は revalidate しない（submitFeedback と同じ index ズレ回避）。
+export async function answerQuizQuestion(
+  questionId: string,
+  chosenIndex: number,
+): Promise<void> {
+  await requireSession();
+  // chosenIndex は client 直送値。選択肢は4件なので 0..3 の範囲外は不正入力として弾く
+  // （chosen_index 列には DB chk が無く、範囲外がそのまま記録されるのを防ぐ）。
+  if (!questionId || !Number.isInteger(chosenIndex) || chosenIndex < 0 || chosenIndex > 3)
+    return;
+  const supabase = createAdminClient();
+  try {
+    const { data: q } = await supabase
+      .from("quiz_questions")
+      .select("answer_index, concept_key, concept_label, category, difficulty")
+      .eq("id", questionId)
+      .maybeSingle();
+    if (!q) return;
+    await recordQuizAttempt(supabase, {
+      questionId,
+      conceptKey: q.concept_key as string,
+      conceptLabel: q.concept_label as string,
+      category: q.category as string,
+      difficulty: q.difficulty as QuizQuestion["difficulty"],
+      isCorrect: chosenIndex === (q.answer_index as number),
+      chosenIndex,
+    });
+  } catch (e) {
+    console.warn(`answerQuizQuestion: 記録に失敗 id=${questionId}:`, e);
+  }
 }
