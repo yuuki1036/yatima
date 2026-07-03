@@ -3,6 +3,8 @@ import { createEmbedder, type Embedder } from "@/lib/llm/embed";
 import { vecToPg, cardCandidateEmbedText } from "@/lib/rss/embed";
 import { cosineSim, parseEmbedding, CARD_DEDUP_THRESHOLD } from "@/lib/ranking/dedup";
 import { htmlToInputText } from "@/lib/llm/extract-text";
+// grounding の決定的プリミティブ（norm / 逐語照合）は型非依存の共通モジュールへ抽出済み（YAT-27・F4）。
+import { norm, isQuoteGrounded, GROUND_BODY_MAX_CHARS } from "@/lib/learn/grounding";
 import {
   createCardGenerator,
   MAX_CARDS_PER_ARTICLE,
@@ -14,14 +16,7 @@ import {
 // 重複排除 → pending 登録の fail-soft 構造）を雛形に、LLM 生成カードを決定的に検証して
 // card_candidates(pending) に積む。LLM 出力は grounding + 形式検証を通った分のみ採用し、本文中の
 // 指示は信用しない（prompt injection 一次対処）。dedup 中核（cosineSim）は ranking 層を呼ぶだけ。
-
-// ── grounding 閾値（design doc open「grounding 強度下限」の起点値・PoC で較正前提）─────
-const MIN_QUOTE_CHARS = 24; // source_quote の最小文字数（日本語記事の主防御。短い断片を弾く）
-const MIN_QA_OVERLAP = 0.12; // source_quote と設問本体の最小語彙重なり（無関係な前書き抜粋を弾く）
-
-// 本文照合の母体テキストの上限。要約用の 2000 字では grounding 母体として短すぎ逐語照合が落ちる
-// ため、本文を厚めに取る（content_html 全体に近い長さ）。
-const GROUND_BODY_MAX_CHARS = 20_000;
+// grounding 閾値・逐語照合は lib/learn/grounding.ts に抽出済み（YAT-27・F4）。
 
 const DEFAULT_MAX_ARTICLES = 10; // 1 回の実行で処理する対象記事の上限（Voyage レート/cron 時間の制御）
 const SELECT_PAGE = 1000; // PostgREST 既定の 1 ページ上限。これを超える全件取得は .range() で回す
@@ -45,34 +40,10 @@ type ArticleRow = {
   published_at: string | null;
 };
 
-// 照合用に正規化（連続空白を1つに・前後 trim・小文字化）。HTML 起因の空白差で逐語照合が落ちるのを防ぐ。
-function norm(s: string): string {
-  return s.replace(/\s+/g, " ").trim().toLowerCase();
-}
-
 // cloze 文から穴埋めマーカーを外して素のテキストにする（語彙重なり計算の対象用）。
 function stripCloze(cloze: string): string {
   // {{c1::答え}} → 答え（ヒント付き {{c1::答え::ヒント}} は答えのみ残す）
   return cloze.replace(/\{\{c\d+::(.*?)(?:::.*?)?\}\}/g, "$1");
-}
-
-// 4 文字以上の英数字連なり、または 3 文字以上の漢字/カナ連なりを「固有寄りトークン」として拾う。
-// 汎用ひらがな短句だけの source_quote（「だと思います」等）を弾くための固有性チェックに使う。
-function specificTokens(s: string): Set<string> {
-  const tokens = new Set<string>();
-  for (const m of s.matchAll(/[a-z0-9]{4,}/gi)) tokens.add(m[0].toLowerCase());
-  for (const m of s.matchAll(/[一-鿿゠-ヿ]{3,}/g)) tokens.add(m[0]);
-  return tokens;
-}
-
-// 2 つのテキストの固有寄りトークン集合の Jaccard 類似（source_quote と設問の語彙重なり判定用）。
-function jaccardSpecific(a: string, b: string): number {
-  const sa = specificTokens(a);
-  const sb = specificTokens(b);
-  if (sa.size === 0 || sb.size === 0) return 0;
-  let inter = 0;
-  for (const t of sa) if (sb.has(t)) inter += 1;
-  return inter / (sa.size + sb.size - inter);
 }
 
 // 形式検証（最安・LLM 不要）。type ごとに必須フィールドの充足と cloze 構文を確認する。
@@ -87,29 +58,14 @@ function isValidFormat(card: GeneratedCard): boolean {
   return Boolean(m && m[1].trim());
 }
 
-// grounding 照合（決定的）。判定順序は安く効く制約から: ①長さ → ②逐語 → ③固有性 → ④設問関連。
-// 短い汎用語での素通り（骨抜き）を順序で防ぐ。
+// grounding 照合（決定的）。type ごとに target（設問本体）を組み、共通の逐語照合ゲート
+// （grounding.ts の isQuoteGrounded）へ委ねる。判定順序＝①長さ →②逐語 →③固有性 →④設問関連。
 function isGrounded(card: GeneratedCard, groundBody: string): boolean {
-  const q = norm(card.source_quote);
-
-  // ① 最小長（1 文未満の断片を弾く）
-  if (q.length < MIN_QUOTE_CHARS) return false;
-
-  // ② 逐語照合（原文の部分文字列であること＝幻覚抜粋を弾く中核）
-  if (!groundBody.includes(q)) return false;
-
-  // ③ 固有性（記事固有の語を含むこと。汎用句が偶然 includes を通すのを弾く）
-  if (specificTokens(q).size === 0) return false;
-
-  // ④ 設問本体との語彙重なり（quote が設問と無関係な箇所の抜粋なのを弾く）
-  const target = norm(
+  const target =
     card.type === "cloze"
       ? stripCloze(card.cloze_text ?? "")
-      : `${card.front ?? ""} ${card.back ?? ""}`,
-  );
-  if (jaccardSpecific(q, target) < MIN_QA_OVERLAP) return false;
-
-  return true;
+      : `${card.front ?? ""} ${card.back ?? ""}`;
+  return isQuoteGrounded(card.source_quote, groundBody, target);
 }
 
 // card_candidates の 1 列を .range() で全件ページ取得する。行は単調増加するため、PostgREST の
