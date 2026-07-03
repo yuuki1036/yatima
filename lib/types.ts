@@ -137,3 +137,22 @@ export type QuizSessionResult = {
   questions: QuizQuestion[];
   note: string | null;
 };
+
+// ── YAT-28: 弱点マップ ─────────────────────────────────────
+
+// concept 単位の習熟（弱点マップの最小要素）。topic_mastery の 1 行に対応する。
+export type ConceptMastery = {
+  concept_key: string;
+  concept_label: string;
+  mastery: number; // 0..1 の EWMA 推定値
+  attempts: number; // 累積回答数（信頼度の目安）
+};
+
+// tech/* カテゴリ単位の集約（弱点マップの 1 カテゴリ行）。mastery は所属 concept の単純平均。
+export type CategoryMastery = {
+  slug: string; // tech/* leaf
+  label: string; // tagLabel 済み表示名
+  mastery: number; // 所属 concept の mastery 平均（等重み）
+  conceptCount: number;
+  weakest: ConceptMastery[]; // mastery 昇順 上位数件（弱点 concept）
+};
