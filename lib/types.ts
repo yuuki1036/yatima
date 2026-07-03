@@ -110,3 +110,30 @@ export type CurationCard = {
   tags: string[]; // tag_slug の配列
   is_starred: boolean; // 「後で読む」お気に入り。デッキから★トグルで付け外しする
 };
+
+// ── YAT-27: 適応クイズ ─────────────────────────────────────
+
+export type QuizDifficulty = "easy" | "medium" | "hard";
+
+// 出題1問（quiz_questions の serving 形）。即時採点のため answer_index / explanation も client へ渡す
+// （自分専用アプリで正解を隠す必要はなく、往復なしで採点・解説を出せる利点を採る）。
+export type QuizQuestion = {
+  id: string;
+  concept_key: string;
+  concept_label: string;
+  category: string; // vocabulary の leaf（tech/* 等）
+  difficulty: QuizDifficulty;
+  stem: string;
+  choices: string[]; // 選択肢4件
+  answer_index: number; // 正解の 0-based index
+  explanation: string;
+  source_quote: string | null; // grounding 根拠（grounded=false なら null）
+  grounded: boolean;
+  source_ref: string | null; // 由来 article_id
+};
+
+// startQuizSession の戻り値（client の QuizDeck が消費）。空セッション/生成スキップは note に理由を載せる。
+export type QuizSessionResult = {
+  questions: QuizQuestion[];
+  note: string | null;
+};
