@@ -10,6 +10,11 @@ export const DEDUP_THRESHOLD = 0.86;
 // （design doc open「dedup 閾値はカード専用定数で一意に定義」）。
 export const CARD_DEDUP_THRESHOLD = 0.86;
 
+// YAT-29: 適応クイズ問題専用の dedup 閾値。CARD_DEDUP_THRESHOLD(0.86) と同じ起点だが、MCQ は
+// stem＋選択肢4件＋source_quote の合成テキストで類似の出方が異なりうるため別定数で分離する。
+// cron ログの dupSkipped 件数を見て独立に較正する（tunable）。
+export const QUIZ_DEDUP_THRESHOLD = 0.86;
+
 // PostgREST が返す vector 列は文字列 "[v1,v2,...]"。number[] にパースする。
 // 不正値（null / パース不可 / 空）は null を返し、呼び出し側で「embedding 無し＝非重複」に倒す。
 export function parseEmbedding(raw: unknown): number[] | null {
