@@ -1,9 +1,10 @@
 name: learn
 
-# 学習カード生成 cron（YAT-17）。read 済み・useful な記事から Q&A/cloze カード候補を生成し、
-# grounding 照合 + 形式検証 + dedup の機械フィルタを通して card_candidates に承認待ち登録する。
-# 重く低頻度でよい処理なので、ingest（毎時）/ discover（週次・月曜 03:00）とは分離して回す。
-# 承認は UI（/learn）で人手が行う。
+# 適応クイズのコアプール生成 cron（YAT-29。旧カード生成 generate-cards から差し替え）。
+# カテゴリ別 active プールの不足分を記事から生成し、grounding 照合 + 形式検証 + dedup の機械
+# フィルタを通して quiz_questions(active) に積む。オンデマンド（/learn のセッション開始）は
+# プール不足時のトップアップに縮退する。重く低頻度でよい処理なので、ingest（毎時）/ discover
+# （週次・月曜 03:00）とは分離して回す。旧カード系（generate-cards）は凍結し撤去していない。
 on:
   schedule:
     - cron: "0 4 * * 1" # 毎週月曜 04:00（UTC）。discover(03:00) とずらして同時実行を避ける
@@ -17,7 +18,7 @@ concurrency:
 jobs:
   learn:
     runs-on: ubuntu-latest
-    timeout-minutes: 20 # 生成 + Voyage embed（16件/回・21s 間隔）のレート制限を見込む
+    timeout-minutes: 20 # 生成 + Voyage embed（候補+補完・2問/チャンク・21s 間隔）のレート制限を見込む
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -25,14 +26,14 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm run generate-cards
+      - run: npm run generate-quiz
         env:
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
       # feed 削除推奨の near-dup シグナル（YAT-20）。既存 embedding の cosine 集計のみで
-      # 新規 API 呼び出しが無いため LLM/embed の secret は不要。カード生成の後に回す。
+      # 新規 API 呼び出しが無いため LLM/embed の secret は不要。クイズ生成の後に回す。
       - run: npm run compute-dedup-rate
         env:
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}

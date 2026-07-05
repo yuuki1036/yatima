@@ -9,7 +9,26 @@ import {
   type GeneratedMCQ,
 } from "@/lib/llm/generate-quiz";
 import { tagLabel, type TagSlug } from "@/lib/tags/vocabulary";
-import type { QuizQuestion } from "@/lib/types";
+import type { QuizDifficulty, QuizQuestion } from "@/lib/types";
+
+// quiz_questions への insert 行（gateMCQs が積み、cron/オンデマンドが insert する）。名前付き型に
+// することで、キー改名や欠落をコンパイルで検出する（card-gate が GeneratedCard を持ち回って得ていた
+// 型保証を、Record<string, unknown> の引き回しで手放さないため）。embedding は cron のみ付与する。
+export type QuizInsertRow = {
+  concept_key: string;
+  concept_label: string;
+  category: string;
+  difficulty: QuizDifficulty;
+  stem: string;
+  choices: string[];
+  answer_index: number;
+  explanation: string;
+  source_quote: string | null;
+  grounded: boolean;
+  source_ref: string | null;
+  status: "active";
+  embedding?: string | null; // vecToPg 済み文字列。オンデマンドは未設定（null 混入なし）
+};
 
 // YAT-27: 適応クイズのオンデマンド生成ゲート。カテゴリ選択→記事駆動で MCQ を生成し、決定的に
 // 検証（形式 → concept 正規化 → 逐語 grounding）してから quiz_questions(active) へ積む。card-gate.ts
@@ -88,8 +107,8 @@ function gateMCQs(
   articleId: string,
   fallbackCategory: TagSlug,
   limit: number,
-): Record<string, unknown>[] {
-  const rows: Record<string, unknown>[] = [];
+): QuizInsertRow[] {
+  const rows: QuizInsertRow[] = [];
   for (const q of mcqs) {
     if (rows.length >= limit) break;
 
@@ -121,22 +140,38 @@ function gateMCQs(
   return rows;
 }
 
-// カテゴリの記事から count 問を目標にオンデマンド生成し、通過分を quiz_questions へ積んで返す。
-export async function generateQuizForCategory(
+// insert 後に serving 形（QuizQuestion）へ返す列。cron・オンデマンド双方の insert で共有する。
+const QUIZ_INSERT_SELECT =
+  "id, concept_key, concept_label, category, difficulty, stem, choices, answer_index, explanation, source_quote, grounded, source_ref";
+
+// 生成コアの結果。insert 前の候補行（embedding 未設定）と集計を返す。
+export type QuizGenCoreResult = {
+  requested: number; // 目標生成数
+  generated: number; // LLM が返した候補総数
+  passed: number; // 形式＋grounding を通過した数
+  rows: QuizInsertRow[]; // quiz_questions へ insert 可能な行（embedding は未設定＝cron が付与）
+  skipped: boolean; // ANTHROPIC_API_KEY 未設定でスキップ
+};
+
+// 生成コア: 記事取得 → LLM 生成 → 形式検証 → concept 正規化 → grounding 逐語照合まで。DB 書き込みは
+// しない（候補行の生産に専念）。オンデマンド（generateQuizForCategory）と cron（quiz-pool）が共有し、
+// insert / embed / dedup の組み立ては呼び側に委ねる（両経路で embedding 付与の有無が非対称なため）。
+export async function generateGatedQuizRows(
   supabase: SupabaseClient,
   opts: {
     category: TagSlug | null; // null = おまかせ
-    count: number; // 目標生成数（不足分トップアップの必要数）
+    count: number; // 目標生成数
     generator?: QuizGenerator | null;
+    maxArticles?: number; // 素材記事の上限（cron は絞って LLM 呼び出し数を抑える）
   },
-): Promise<QuizGenResult> {
+): Promise<QuizGenCoreResult> {
   const generator =
     opts.generator !== undefined ? opts.generator : createQuizGenerator();
-  const result: QuizGenResult = {
+  const result: QuizGenCoreResult = {
     requested: opts.count,
     generated: 0,
     passed: 0,
-    inserted: [],
+    rows: [],
     skipped: false,
   };
   if (opts.count <= 0) return result;
@@ -149,11 +184,12 @@ export async function generateQuizForCategory(
 
   const fallbackCategory: TagSlug = opts.category ?? GROUND_BODY_FALLBACK;
   const categoryLabel = opts.category ? tagLabel(opts.category) : "エンジニア技術全般";
+  const maxArticles = opts.maxArticles ?? CANDIDATE_ARTICLES;
 
   let articles: ArticleRow[];
   let existingConcepts: string[];
   try {
-    articles = await loadCategoryArticles(supabase, opts.category, CANDIDATE_ARTICLES);
+    articles = await loadCategoryArticles(supabase, opts.category, maxArticles);
     existingConcepts = await loadExistingConcepts(supabase);
   } catch (e) {
     console.warn("クイズ生成の素材取得に失敗:", e);
@@ -161,16 +197,15 @@ export async function generateQuizForCategory(
   }
   if (articles.length === 0) return result;
 
-  const rows: Record<string, unknown>[] = [];
   // 記事単位の fail-soft ループ（直列）。必要数に達したら打ち切る。
   for (const article of articles) {
-    if (rows.length >= opts.count) break;
+    if (result.rows.length >= opts.count) break;
     try {
       const rawBody = htmlToInputText(article.content_html, GROUND_BODY_MAX_CHARS);
       if (!rawBody) continue;
       const groundBody = norm(rawBody);
 
-      const remaining = opts.count - rows.length;
+      const remaining = opts.count - result.rows.length;
       const mcqs = await generator.generate({
         title: article.title,
         articleText: rawBody,
@@ -182,24 +217,51 @@ export async function generateQuizForCategory(
 
       const passed = gateMCQs(mcqs, groundBody, article.id, fallbackCategory, remaining);
       result.passed += passed.length;
-      rows.push(...passed);
+      result.rows.push(...passed);
     } catch (e) {
       console.warn(`クイズ生成に失敗 [${article.id}]:`, e);
     }
   }
 
-  if (rows.length === 0) return result;
+  return result;
+}
 
+// 候補行を quiz_questions へ bulk insert し、serving 形で返す。失敗は fail-soft（warn して []）。
+// bulk insert は 1 行でも制約違反すると全体が rollback される（部分成功しない）。
+export async function insertQuizRows(
+  supabase: SupabaseClient,
+  rows: QuizInsertRow[],
+): Promise<QuizQuestion[]> {
+  if (rows.length === 0) return [];
   const { data, error } = await supabase
     .from("quiz_questions")
     .insert(rows)
-    .select(
-      "id, concept_key, concept_label, category, difficulty, stem, choices, answer_index, explanation, source_quote, grounded, source_ref",
-    );
+    .select(QUIZ_INSERT_SELECT);
   if (error) {
-    console.warn("quiz_questions への登録に失敗:", error);
-    return result;
+    // 件数を添えて「積む行が 0 だった」と「N 行あったが insert 失敗」を切り分け可能にする。
+    console.warn(`quiz_questions への登録に失敗（${rows.length} 件）:`, error);
+    return [];
   }
-  result.inserted = (data ?? []) as unknown as QuizQuestion[];
-  return result;
+  return (data ?? []) as unknown as QuizQuestion[];
+}
+
+// カテゴリの記事から count 問を目標にオンデマンド生成し、通過分を quiz_questions へ積んで返す。
+// 生成コアの薄いラッパ（embedding 付与・dedup はしない＝maxDuration=60 内に収める。YAT-27 の判断）。
+export async function generateQuizForCategory(
+  supabase: SupabaseClient,
+  opts: {
+    category: TagSlug | null; // null = おまかせ
+    count: number; // 目標生成数（不足分トップアップの必要数）
+    generator?: QuizGenerator | null;
+  },
+): Promise<QuizGenResult> {
+  const core = await generateGatedQuizRows(supabase, opts);
+  const inserted = await insertQuizRows(supabase, core.rows);
+  return {
+    requested: core.requested,
+    generated: core.generated,
+    passed: core.passed,
+    inserted,
+    skipped: core.skipped,
+  };
 }

@@ -33,6 +33,8 @@ type EmbedTableOpts = {
   embedTextOf: (row: Record<string, unknown>) => string;
   // 必須でない行を除外する列（articles は要約済みのみ対象＝"summary"。カード候補は指定なし）。
   requireColumn?: string;
+  // 特定の列値だけに絞る等値フィルタ（quiz は active のみ補完＝retired に embed 予算を使わない）。
+  eqFilter?: { column: string; value: string };
   orderBy: { column: string; ascending: boolean; nullsFirst?: boolean };
   limit?: number;
   embedder?: Embedder | null;
@@ -59,6 +61,9 @@ async function embedMissingFromTable(
       .is("embedding", null);
     if (opts.requireColumn) {
       query = query.not(opts.requireColumn, "is", null);
+    }
+    if (opts.eqFilter) {
+      query = query.eq(opts.eqFilter.column, opts.eqFilter.value);
     }
     const { data, error } = await query
       .order(opts.orderBy.column, {
@@ -155,6 +160,24 @@ export async function embedMissingCardCandidates(
   });
 }
 
+// クイズ問題の embedding 補完（YAT-29）。quiz-pool のその場 embed が embedder 無し/失敗で取り
+// こぼした問題、およびオンデマンド生成（embedding=null）分を後追いで埋める。active のみ対象＝
+// retired に embed 予算を使わない。dedup テキストは quizQuestionEmbedText と同一（母集団と一貫）。
+export async function embedMissingQuizQuestions(
+  supabase: SupabaseClient,
+  opts: { limit?: number; embedder?: Embedder | null } = {},
+): Promise<EmbedBatchResult> {
+  return embedMissingFromTable(supabase, {
+    table: "quiz_questions",
+    selectColumns: "id, stem, choices, source_quote",
+    embedTextOf: (r) => quizQuestionEmbedText(r as unknown as QuizEmbedFields),
+    eqFilter: { column: "status", value: "active" },
+    orderBy: { column: "created_at", ascending: false },
+    limit: opts.limit,
+    embedder: opts.embedder,
+  });
+}
+
 // dedup 用埋め込みテキストの素材。生成カード（GeneratedCard）と DB 行（card_candidates）の共通部分を
 // 構造的型で受けることで、card-gate からはキャストなしで GeneratedCard を渡せ、フィールド改名は
 // コンパイルエラーで検出される（DB 行経路だけが境界キャストを要する）。
@@ -165,6 +188,28 @@ export type CardEmbedFields = {
   cloze_text?: string | null;
   source_quote: string;
 };
+
+// クイズ問題の dedup 用埋め込みテキストの素材。choices は DB 由来だと jsonb 配列で返るため
+// Array.isArray でガードする。quiz-pool のその場 embed と補完バッチで同一テキストを使う。
+export type QuizEmbedFields = {
+  stem: string;
+  choices: unknown;
+  source_quote?: string | null;
+};
+
+// dedup テキストの source_quote 上限。長い記事引用がそのまま入ると 1 問の embed トークンが膨らみ、
+// Voyage のチャンク詰めが 2 問/req から 1 問/req に落ちて cron 時間が伸びる。設問の識別には冒頭で
+// 足りるため truncate して 2 問/チャンクを担保する（dedup 判定の安定にも効く）。
+const QUIZ_EMBED_QUOTE_MAX = 200;
+
+// クイズ問題の dedup 用埋め込みテキスト。設問＋選択肢＋出典抜粋（truncate 済み）を連結する。
+export function quizQuestionEmbedText(row: QuizEmbedFields): string {
+  const choices = Array.isArray(row.choices) ? row.choices.join(" ") : "";
+  const quote = row.source_quote
+    ? row.source_quote.slice(0, QUIZ_EMBED_QUOTE_MAX)
+    : null;
+  return [`${row.stem} ${choices}`.trim(), quote].filter(Boolean).join("\n");
+}
 
 // カード候補の dedup 用埋め込みテキスト。type に応じ設問本体を取り、source_quote を添える。
 // card-gate のその場 embed と同一テキストを使うため共有 export する（補完と母集団で一貫させる）。
