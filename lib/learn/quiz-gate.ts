@@ -252,14 +252,16 @@ export async function insertQuizRows(
   return (data ?? []) as unknown as QuizQuestion[];
 }
 
-// カテゴリの記事から count 問を目標にオンデマンド生成し、通過分を quiz_questions へ積んで返す。
-// 生成コアの薄いラッパ（embedding 付与・dedup はしない＝maxDuration=60 内に収める。YAT-27 の判断）。
+// カテゴリの記事から count 問を目標に生成し、通過分を quiz_questions へ積んで返す。生成コアの薄い
+// ラッパ（embedding 付与・dedup はしない＝embed/dedup は cron が backfill。YAT-27 の判断）。
+// セッション開始の裏補充（after）から呼ぶため maxArticles で LLM 呼び出し数を絞れる（YAT-31）。
 export async function generateQuizForCategory(
   supabase: SupabaseClient,
   opts: {
     category: TagSlug | null; // null = おまかせ
-    count: number; // 目標生成数（不足分トップアップの必要数）
+    count: number; // 目標生成数（不足分の必要数）
     generator?: QuizGenerator | null;
+    maxArticles?: number; // 素材記事の上限（裏補充は絞って maxDuration 内に確実に収める）
   },
 ): Promise<QuizGenResult> {
   const core = await generateGatedQuizRows(supabase, opts);

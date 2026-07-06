@@ -1,6 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { after } from "next/server";
 import { requireSession } from "@/lib/auth/session";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { recordFeedback } from "@/lib/ranking/feedback";
@@ -10,6 +11,7 @@ import { enrichMissingBodies } from "@/lib/rss/enrich";
 import { annotateMissing } from "@/lib/llm/summarize-batch";
 import { curateToday } from "@/lib/ranking/curate";
 import { generateQuizForCategory } from "@/lib/learn/quiz-gate";
+import { quizPoolDeficit } from "@/lib/learn/quiz-pool";
 import {
   recordQuizAttempt,
   selectSessionQuestions,
@@ -272,9 +274,13 @@ export async function submitFeedback(formData: FormData) {
 
 // ── YAT-27: 適応クイズ ─────────────────────────────────────
 
-// 1 セッションの出題数。オンデマンド生成を Vercel maxDuration(60s) 内に収める控えめな下限
-// （design doc の 5〜10 問の下限）。
+// 1 セッションの出題数（design doc の 5〜10 問の下限）。
 const QUIZ_SESSION_SIZE = 5;
+
+// 裏補充（after）で 1 回に使う素材記事の上限。同期生成を撤去した代わりに、プールで満たせなかった
+// セッションの後で軽く生成してプールを温める。after は route の maxDuration(60s) を共有するため
+// 記事数を絞って確実に収める（1 記事あたり LLM 1 呼び出し・直列）。YAT-31。
+const QUIZ_REFILL_MAX_ARTICLES = 3;
 
 // クイズ入力（category）を許可値のみに正規化する。picker は tech/* leaf のみ提示するため、それ以外は
 // 「おまかせ」(null) に倒す（直 POST の未知値も null 扱いで安全側）。
@@ -283,9 +289,11 @@ function parseQuizCategory(raw: string): TagSlug | null {
   return null; // "" / 未知値 = おまかせ
 }
 
-// クイズセッションを開始する: 既存 active プールから適応選定（弱点度×間隔×レベル一致）で優先出題し、
-// 不足分をオンデマンド生成でトップアップして最大 QUIZ_SESSION_SIZE 問返す。出題確定後に
-// last_served_at を更新する（YAT-28）。client の picker から event handler で呼ぶ。
+// クイズセッションを開始する: 既存 active プールから適応選定（弱点度×間隔×レベル一致）で最大
+// QUIZ_SESSION_SIZE 問を出題する。同期 LLM 生成はしない（＝ユーザーの待ち時間から生成を外し、
+// Vercel maxDuration 超過によるタイムアウトを断つ。YAT-31）。プールで満たせない分はレスポンス送出
+// 後の裏補充（after）に回し、次回以降のセッションに効かせる。出題確定後に last_served_at を更新
+// する（YAT-28）。client の picker から event handler で呼ぶ。
 export async function startQuizSession(
   categoryRaw: string,
 ): Promise<QuizSessionResult> {
@@ -299,27 +307,6 @@ export async function startQuizSession(
       category,
       size: QUIZ_SESSION_SIZE,
     });
-    const seen = new Set(questions.map((q) => q.id));
-
-    // 不足分はオンデマンド生成でトップアップ。
-    let note: string | null = null;
-    if (questions.length < QUIZ_SESSION_SIZE) {
-      const gen = await generateQuizForCategory(supabase, {
-        category,
-        count: QUIZ_SESSION_SIZE - questions.length,
-      });
-      for (const q of gen.inserted) {
-        if (seen.has(q.id)) continue;
-        seen.add(q.id);
-        questions.push(q);
-        if (questions.length >= QUIZ_SESSION_SIZE) break;
-      }
-      if (questions.length === 0) {
-        note = gen.skipped
-          ? "問題を生成できません（ANTHROPIC_API_KEY 未設定）。"
-          : "このカテゴリの出題を作れませんでした。記事の蓄積を待つか別カテゴリを試してください。";
-      }
-    }
 
     // 出題した concept の last_served_at を更新（間隔ボーナス用）。失敗しても出題は成立させる。
     if (questions.length > 0) {
@@ -330,6 +317,38 @@ export async function startQuizSession(
         );
       } catch (e) {
         console.warn("last_served_at の更新に失敗:", e);
+      }
+    }
+
+    // セッションをプールで満たせなかったとき、その場生成ではなくレスポンス送出後の裏補充に回す
+    // （after）。ユーザーは待たされず、生成分は次回以降のセッションに効く。ただし「短いセッション」の
+    // 原因は SRS クールダウン（正解済みが eligible から外れる）とプール枯渇の両方があり、前者では
+    // 生成すべきでない。そこで発火判定はセッションの不足数ではなくプール目標に対する deficit で行い、
+    // cron と同じ「target 未満なら補充」に揃える（目標超えの青天井増殖を防ぐ。YAT-31）。deficit は
+    // 軽量 count なので同期で先に測り、note の出し分け（枯渇=準備中／クールダウン=間隔案内）にも使う。
+    let note: string | null = null;
+    if (questions.length < QUIZ_SESSION_SIZE) {
+      const deficit = await quizPoolDeficit(supabase, category);
+      if (deficit > 0) {
+        // after は maxDuration を共有するため記事数と 1 回の生成数を絞る。失敗は握りつぶす。
+        const count = Math.min(deficit, QUIZ_SESSION_SIZE);
+        after(async () => {
+          try {
+            await generateQuizForCategory(supabase, {
+              category,
+              count,
+              maxArticles: QUIZ_REFILL_MAX_ARTICLES,
+            });
+          } catch (e) {
+            console.warn("クイズの裏補充に失敗:", e);
+          }
+        });
+      }
+      if (questions.length === 0) {
+        note =
+          deficit > 0
+            ? "このカテゴリの出題を準備中です。少し時間をおいてから、もう一度お試しください。"
+            : "このカテゴリは最近解いた問題が続いています。少し間隔をあけると再出題されます。別カテゴリもどうぞ。";
       }
     }
 

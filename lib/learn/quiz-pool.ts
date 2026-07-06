@@ -89,22 +89,40 @@ async function loadQuizDedupPopulation(
   return vecs;
 }
 
-// カテゴリの active 件数を数える（head:true で行本体は取らない軽量 count）。失敗は 0 扱い＝
-// deficit を大きく見積もって生成側に倒す（プールが空に見えても生成上限で頭打ちになるため安全）。
+// active 件数を数える（head:true で行本体は取らない軽量 count）。category=null は全カテゴリ合算。
+// 失敗は 0 扱い＝deficit を大きく見積もって生成側に倒す（プールが空に見えても生成上限で頭打ちに
+// なるため安全）。
 async function countActive(
   supabase: SupabaseClient,
-  category: TagSlug,
+  category: TagSlug | null,
 ): Promise<number> {
-  const { count, error } = await supabase
+  let query = supabase
     .from("quiz_questions")
     .select("id", { count: "exact", head: true })
-    .eq("status", "active")
-    .eq("category", category);
+    .eq("status", "active");
+  if (category) query = query.eq("category", category);
+  const { count, error } = await query;
   if (error) {
-    console.warn(`active 件数の取得に失敗 [${category}]:`, error);
+    console.warn(`active 件数の取得に失敗 [${category ?? "all"}]:`, error);
     return 0;
   }
   return count ?? 0;
+}
+
+// プール目標に対する不足数を返す（0 以上）。セッション開始の裏補充（after）が目標を超えて生成しない
+// よう gate する用途（YAT-31）。カテゴリ指定はそのカテゴリの目標、おまかせ(null)は cron 対象カテゴリ
+// 合算の目標で測る。cron の deficit と同義（active < target なら補充）。これにより「短いセッション」の
+// 原因が SRS クールダウン（正解済みが eligible から外れる）のときは deficit=0 で補充が発火せず、
+// プールが POOL_TARGET を超えて青天井に増殖するのを防ぐ。
+export async function quizPoolDeficit(
+  supabase: SupabaseClient,
+  category: TagSlug | null,
+): Promise<number> {
+  const target = category
+    ? POOL_TARGET_PER_CATEGORY
+    : POOL_TARGET_PER_CATEGORY * CRON_CATEGORIES.length;
+  const active = await countActive(supabase, category);
+  return Math.max(0, target - active);
 }
 
 // コアプール生成の本体。
