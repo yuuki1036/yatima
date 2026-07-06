@@ -11,7 +11,8 @@ import { MasteryMap } from "../_components/mastery-map";
 // generate-cards・approveCard/rejectCard）は撤去せず凍結（データ保全）。
 // YAT-28: picker 下に弱点マップ（tech/* 集約の習熟バー）を表示する。
 export const dynamic = "force-dynamic";
-// startQuizSession がオンデマンドで LLM 生成を同期実行するため関数時間を延ばす（"/" と同方針）。
+// startQuizSession はプール供給のみで即返すが、不足時にレスポンス送出後の裏補充（after）で LLM
+// 生成を回す。after はこの maxDuration を共有するため、裏補充が収まるよう延ばしておく（YAT-31）。
 export const maxDuration = 60;
 
 // カテゴリピッカーの選択肢: tech/* leaf（学習は技術知識に寄せる）＋末尾に「おまかせ」。
