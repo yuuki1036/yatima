@@ -38,6 +38,13 @@ export type QuizInsertRow = {
 
 const CANDIDATE_ARTICLES = 8; // 1 セッションで素材にする候補記事の上限（LLM 呼び出し数の上限に効く）
 const GROUND_BODY_FALLBACK = "other" satisfies TagSlug; // おまかせ時などの category 矯正の最終フォールバック
+// ④語彙重なりを無効化する（YAT-30）。英語記事の逐語引用×日本語設問で固有トークンが言語違いにより
+// ほぼ重ならず④が通過率の支配的な棄却要因になっていた（計測: low_overlap が棄却の 7 割超）。②逐語＋
+// ③固有性が「引用は実在の記事固有テキスト」を担保するため、MCQ は④に依拠しない。
+// 副作用: ④が担っていた「quote と設問の関連性」チェックが外れ、実在だが設問と無関係な文が quote に
+// 選ばれる余地が残る（design doc F2 の担保集合が「設問と語彙が重なる」を失う方向に一段狭まる）。ただし
+// 正誤の真偽は元々④では検証しておらず（F2 は別軸）、quote は出典表示の補足なので許容する。
+const QUIZ_MIN_OVERLAP = 0;
 
 type ArticleRow = {
   id: string;
@@ -116,9 +123,9 @@ function gateMCQs(
     const conceptKey = conceptSlug(q.concept_label);
     if (!conceptKey) continue;
 
-    // ② grounding 逐語照合（設問本体＝stem＋選択肢との関連も見る）。失敗は捨てる。
+    // ② grounding 逐語照合。④語彙重なりは MCQ では無効化（QUIZ_MIN_OVERLAP=0）し、②逐語＋③固有性で担保する。
     const target = `${q.stem} ${q.choices.join(" ")}`;
-    if (!isQuoteGrounded(q.source_quote, groundBodyNorm, target)) continue;
+    if (!isQuoteGrounded(q.source_quote, groundBodyNorm, target, QUIZ_MIN_OVERLAP)) continue;
 
     const category = coerceCategory(q.category, fallbackCategory);
     rows.push({
