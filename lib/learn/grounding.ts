@@ -35,29 +35,52 @@ export function jaccardSpecific(a: string, b: string): number {
   return inter / (sa.size + sb.size - inter);
 }
 
+// grounding 照合の判定結果。pass 以外はどの段で落ちたかを示す（診断・較正用。YAT-30）。
+export type GroundingReason =
+  | "pass"
+  | "too_short" // ①最小長 未満
+  | "not_verbatim" // ②逐語照合 失敗（原文の部分文字列でない）
+  | "not_specific" // ③固有性 なし（固有寄りトークンを含まない）
+  | "low_overlap"; // ④設問本体との語彙重なり 不足
+
 // 逐語 grounding 照合（決定的・型非依存）。判定順序は安く効く制約から: ①長さ → ②逐語 → ③固有性
-// → ④設問関連。短い汎用語での素通り（骨抜き）を順序で防ぐ。
+// → ④設問関連。短い汎用語での素通り（骨抜き）を順序で防ぐ。どの段で落ちたかを返す（診断用）。
 // - quoteRaw: LLM が付けた原文抜粋（生。呼び出し側で norm しない）
 // - groundBodyNorm: norm() 済みの照合母体（本文）。呼び出し側で一度だけ norm して使い回す想定
 // - targetRaw: 設問本体（MCQ なら stem + choices、qa なら front+back 等）。抜粋が設問と無関係でないか照合
+// minOverlap: ④の語彙重なり閾値。既定は MIN_OVERLAP（qa/cloze カード経路の従来挙動を保つ）。
+// 0 を渡すと④は無効化される。MCQ は英語記事の逐語引用×日本語設問で quote と設問の固有トークンが
+// 言語違いでほぼ重ならず④が支配的な棄却要因になる（YAT-30 の計測）ため、quiz-gate は 0 を渡して
+// ②逐語＋③固有性に依拠する（正誤の真偽は元々④では検証しておらず F2 の別軸）。
+export function groundingReason(
+  quoteRaw: string,
+  groundBodyNorm: string,
+  targetRaw: string,
+  minOverlap: number = MIN_OVERLAP,
+): GroundingReason {
+  const q = norm(quoteRaw);
+
+  // ① 最小長（1 文未満の断片を弾く）
+  if (q.length < MIN_QUOTE_CHARS) return "too_short";
+
+  // ② 逐語照合（原文の部分文字列であること＝幻覚抜粋を弾く中核）
+  if (!groundBodyNorm.includes(q)) return "not_verbatim";
+
+  // ③ 固有性（記事固有の語を含むこと。汎用句が偶然 includes を通すのを弾く）
+  if (specificTokens(q).size === 0) return "not_specific";
+
+  // ④ 設問本体との語彙重なり（quote が設問と無関係な箇所の抜粋なのを弾く）。minOverlap=0 で無効。
+  if (jaccardSpecific(q, norm(targetRaw)) < minOverlap) return "low_overlap";
+
+  return "pass";
+}
+
+// 逐語 grounding 照合（bool 版）。挙動は groundingReason(...) === "pass" と同一。
 export function isQuoteGrounded(
   quoteRaw: string,
   groundBodyNorm: string,
   targetRaw: string,
+  minOverlap: number = MIN_OVERLAP,
 ): boolean {
-  const q = norm(quoteRaw);
-
-  // ① 最小長（1 文未満の断片を弾く）
-  if (q.length < MIN_QUOTE_CHARS) return false;
-
-  // ② 逐語照合（原文の部分文字列であること＝幻覚抜粋を弾く中核）
-  if (!groundBodyNorm.includes(q)) return false;
-
-  // ③ 固有性（記事固有の語を含むこと。汎用句が偶然 includes を通すのを弾く）
-  if (specificTokens(q).size === 0) return false;
-
-  // ④ 設問本体との語彙重なり（quote が設問と無関係な箇所の抜粋なのを弾く）
-  if (jaccardSpecific(q, norm(targetRaw)) < MIN_OVERLAP) return false;
-
-  return true;
+  return groundingReason(quoteRaw, groundBodyNorm, targetRaw, minOverlap) === "pass";
 }

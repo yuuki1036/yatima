@@ -14,6 +14,7 @@
     "discover": "tsx scripts/discover.ts",
     "generate-cards": "tsx scripts/generate-cards.ts",
     "generate-quiz": "tsx scripts/generate-quiz.ts",
+    "diagnose-grounding": "tsx scripts/diagnose-grounding.ts",
     "compute-dedup-rate": "tsx scripts/compute-dedup-rate.ts",
     "migrate": "tsx scripts/migrate.ts",
     "resummarize": "tsx scripts/resummarize.ts",
