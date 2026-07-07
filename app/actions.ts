@@ -421,9 +421,11 @@ export async function proposeLearnSources(
   if (!category) {
     return { ok: false, message: "カテゴリを選んでください（おまかせは不可）。" };
   }
+  // 任意の絞り込みヒント（粗いカテゴリを sub-topic へ steer）。自分専用だが LLM 入力なので長さは抑える。
+  const hint = String(formData.get("hint") ?? "").trim().slice(0, 100) || undefined;
   const supabase = createAdminClient();
   try {
-    const r = await discoverLearnSources(supabase, { category });
+    const r = await discoverLearnSources(supabase, { category, hint });
     revalidatePath("/learn");
     if (r.skipped) {
       return { ok: false, message: "提案できません（ANTHROPIC_API_KEY 未設定）。" };

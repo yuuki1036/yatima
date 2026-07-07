@@ -21,6 +21,7 @@ export type ProposeSourcesInput = {
   categoryLabel: string; // 提案テーマ（tech/* の表示名）
   existingUrls: string[]; // 既存 learn_sources の URL（重複提案を避けさせる）
   count: number;
+  hint?: string; // 任意の絞り込みヒント（例「TypeScript, React, Next.js」）。カテゴリが粗いときに sub-topic へ steer する
 };
 
 export interface SourceProposer {
@@ -32,9 +33,13 @@ function buildSystemPrompt(input: ProposeSourcesInput): string {
     input.existingUrls.length > 0
       ? `次の URL は既に登録済みなので提案しないこと:\n${input.existingUrls.join("\n")}`
       : "";
+  const hint = input.hint
+    ? `特に次のトピックを優先して絞り込むこと: ${input.hint}。`
+    : "";
   return [
     "あなたはエンジニアの学習教材キュレーターです。",
     `テーマ「${input.categoryLabel}」について、腰を据えた学習に向く「息の長い（evergreen）」情報源の URL を提案してください。`,
+    hint,
     "優先するもの: 公式ドキュメント、公式ガイド/チュートリアル、定番の解説記事・仕様。",
     "避けるもの: ニュース記事、リリース告知、○○が発表した系の時事、まとめ・ランキング、SNS 投稿、動画。",
     `候補は ${input.count} 件。実在が確実で安定した URL（トップページでなく該当解説の具体ページが望ましい）にすること。`,

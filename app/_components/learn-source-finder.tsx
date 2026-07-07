@@ -34,6 +34,14 @@ export function LearnSourceFinder({ categories, action }: Props) {
           </option>
         ))}
       </select>
+      <input
+        type="text"
+        name="hint"
+        maxLength={100}
+        placeholder="絞り込み（任意・例: TypeScript, React）"
+        disabled={pending}
+        className="min-w-0 flex-1 border border-border bg-background px-2 py-1.5 font-mono text-xs tracking-wide text-foreground placeholder:text-faint disabled:opacity-50"
+      />
       <button
         disabled={pending}
         className="border border-border px-3 py-1.5 font-mono text-xs tracking-wide text-accent transition-colors hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50"

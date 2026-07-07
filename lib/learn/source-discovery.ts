@@ -41,7 +41,12 @@ type PendingRow = {
 // pending までを作る（承認 UI が approved に倒す）。
 export async function discoverLearnSources(
   supabase: SupabaseClient,
-  opts: { category: TagSlug; count?: number; proposer?: SourceProposer | null },
+  opts: {
+    category: TagSlug;
+    count?: number;
+    hint?: string; // 任意の sub-topic 絞り込み（例「TypeScript, React」）。粗いカテゴリを steer する
+    proposer?: SourceProposer | null;
+  },
 ): Promise<DiscoverLearnSourcesResult> {
   const result: DiscoverLearnSourcesResult = {
     proposed: 0,
@@ -76,6 +81,7 @@ export async function discoverLearnSources(
       categoryLabel: tagLabel(opts.category),
       existingUrls,
       count: opts.count ?? PROPOSE_COUNT,
+      hint: opts.hint,
     });
   } catch (e) {
     console.warn("学習ソースの LLM 提案に失敗:", e);
