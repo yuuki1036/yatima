@@ -21,6 +21,12 @@ export async function proxy(req: NextRequest) {
     return NextResponse.next();
   }
 
+  // /login/* は Google OAuth の開始・コールバック経路（未認証で通す。YAT-34）。
+  // 認証成立はコールバックが担うので、ここでは素通しする。
+  if (pathname.startsWith(`${LOGIN_PATH}/`)) {
+    return NextResponse.next();
+  }
+
   // 未認証は /login へ。リダイレクトは Server Action の POST も含めて遮断する。
   if (!session) {
     return NextResponse.redirect(new URL(LOGIN_PATH, req.nextUrl));
