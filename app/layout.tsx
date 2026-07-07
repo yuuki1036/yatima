@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Archivo, Inter, IBM_Plex_Mono } from "next/font/google";
 import Link from "next/link";
 import "./globals.css";
+import { getSession } from "@/lib/auth/session";
 import { SiteNav } from "./_components/site-nav";
 import { ThemeToggle } from "./_components/theme-toggle";
 import { LogoutButton } from "./_components/logout-button";
@@ -36,11 +37,16 @@ export const metadata: Metadata = {
   description: "自分専用 AI 情報収集 RSS リーダー",
 };
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  // ヘッダ（ロゴ・ナビ・ログアウト）は認証済みのときだけ出す。未認証で見えるのは /login だけなので、
+  // ログイン画面にアプリの chrome が透けるのを防ぐ（YAT-34）。proxy が /login 以外を未認証で弾くため、
+  // 実質「/login では非表示・それ以外では表示」になる。
+  const session = await getSession();
+
   return (
     <html
       lang="ja"
@@ -49,26 +55,28 @@ export default function RootLayout({
     >
       <body className="min-h-full flex flex-col bg-background font-sans text-foreground">
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT }} />
-        <header className="border-b-2 border-border">
-          <div className="mx-auto flex max-w-3xl flex-wrap items-center gap-x-6 gap-y-3 px-4 py-4">
-            <Link
-              href="/"
-              className="font-display text-lg font-extrabold tracking-tight"
-            >
-              yatima
-            </Link>
-            {/* テーマ・ログアウト: 狭幅はロゴと同じ行の右端（ml-auto）、広幅は最右端（order-last）。 */}
-            <div className="order-2 ml-auto flex items-center gap-5 sm:order-3 sm:ml-0">
-              <ThemeToggle />
-              <LogoutButton />
+        {session && (
+          <header className="border-b-2 border-border">
+            <div className="mx-auto flex max-w-3xl flex-wrap items-center gap-x-6 gap-y-3 px-4 py-4">
+              <Link
+                href="/"
+                className="font-display text-lg font-extrabold tracking-tight"
+              >
+                yatima
+              </Link>
+              {/* テーマ・ログアウト: 狭幅はロゴと同じ行の右端（ml-auto）、広幅は最右端（order-last）。 */}
+              <div className="order-2 ml-auto flex items-center gap-5 sm:order-3 sm:ml-0">
+                <ThemeToggle />
+                <LogoutButton />
+              </div>
+              {/* ナビ: 狭幅は w-full で2行目に単独で回り込ませ見切れを防ぐ。
+                  広幅は sm:ml-auto で右クラスタに寄せ、従来どおり1行に収める。 */}
+              <div className="order-3 w-full sm:order-2 sm:ml-auto sm:w-auto">
+                <SiteNav />
+              </div>
             </div>
-            {/* ナビ: 狭幅は w-full で2行目に単独で回り込ませ見切れを防ぐ。
-                広幅は sm:ml-auto で右クラスタに寄せ、従来どおり1行に収める。 */}
-            <div className="order-3 w-full sm:order-2 sm:ml-auto sm:w-auto">
-              <SiteNav />
-            </div>
-          </div>
-        </header>
+          </header>
+        )}
         <main className="mx-auto w-full max-w-3xl flex-1 px-4 py-8">
           {children}
         </main>
