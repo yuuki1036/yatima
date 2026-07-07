@@ -1,1 +1,1 @@
-# yatima: Second Brain
+# yatima
