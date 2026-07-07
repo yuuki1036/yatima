@@ -129,7 +129,24 @@ export type QuizQuestion = {
   explanation: string;
   source_quote: string | null; // grounding 根拠（grounded=false なら null）
   grounded: boolean;
-  source_ref: string | null; // 由来 article_id
+  source_ref: string | null; // 由来 id（article_id または learn_sources.id。YAT-32 で後者が主）
+};
+
+// YAT-32: 学習クイズの知識ソース（承認制 evergreen）。LLM 提案 → 検証ゲート → 人が承認した
+// 公式 docs / 定番解説を生成素材にする。content_html は本文抽出済み（生成・grounding の母体）。
+// embedding 列は将来の RAG 編入用に予約せず、まず学習用途に限定する（design 20260707）。
+export type LearnSource = {
+  id: string;
+  url: string; // 正規化済み URL（重複排除キー）
+  title: string | null;
+  content_html: string | null; // 本文抽出済み HTML
+  category: string; // tech/* leaf
+  status: "pending" | "approved" | "rejected";
+  proposed_by: "llm" | "manual";
+  rationale: string | null; // LLM の提案理由（承認の判断材料）
+  last_generated_at: string | null; // 生成 LRU ローテーション用
+  created_at: string;
+  reviewed_at: string | null;
 };
 
 // startQuizSession の戻り値（client の QuizDeck が消費）。空セッション/生成スキップは note に理由を載せる。
