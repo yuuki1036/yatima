@@ -1,7 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { extract } from "@extractus/article-extractor";
 import { htmlToInputText } from "@/lib/llm/extract-text";
-import { isPubliclyRoutableHttpUrl } from "@/lib/net/ssrf";
+import { fetchAndExtractArticle } from "@/lib/net/fetch-article";
 
 // 本文が薄い記事（HN 等、RSS の content_html がメタ情報だけ）について、リンク先 URL から
 // 本文を取得して content_html を差し替える。要約・タグの入力を実本文にし、憶測（ハルシ
@@ -13,8 +12,6 @@ import { isPubliclyRoutableHttpUrl } from "@/lib/net/ssrf";
 export const THIN_BODY_CHARS = 300; // htmlToInputText 後がこれ未満なら「薄い」= 本文取得を試みる
 const DEFAULT_LIMIT = 20; // 1 実行で取得する上限（cron の負荷とコストを抑える）
 const DEFAULT_CONCURRENCY = 4;
-const FETCH_TIMEOUT_MS = 12_000;
-const UA = "Mozilla/5.0 (compatible; yatima/1.0; +personal use)";
 
 export type EnrichResult = {
   thin: number; // 本文が薄く取得対象になった件数
@@ -38,22 +35,11 @@ export async function enrichArticleBody(
   row: Row,
 ): Promise<string | null> {
   if (!row.url) return null;
-  // row.url は feed の記事リンク（第三者由来）なので fetch 前に SSRF ガードを通す。
-  // 弾かれたら fail-soft で本文取得を諦める（discover.ts と同じ一次防御を共有）。
-  const safeUrl = isPubliclyRoutableHttpUrl(row.url);
-  if (!safeUrl) {
-    console.warn(`本文取得を SSRF ガードでスキップ [${row.id}] ${row.url}`);
-    return null;
-  }
-  const article = await extract(
-    safeUrl.href,
-    {},
-    {
-      headers: { "user-agent": UA },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    },
-  );
-  const content = article?.content ?? "";
+  // row.url は feed の記事リンク（第三者由来）。SSRF ガード＋fetch＋本文抽出は共通処理に委譲する
+  // （弾かれた／取得失敗は null。source-discovery と同じ一次防御・抽出を共有）。
+  const fetched = await fetchAndExtractArticle(row.url);
+  if (!fetched) return null;
+  const content = fetched.contentHtml;
   // 取得本文が元より十分長いときだけ差し替える（薄い→薄いは無意味）。
   if (
     htmlToInputText(content).length <= htmlToInputText(row.content_html).length
@@ -101,8 +87,8 @@ export async function enrichMissingBodies(
     const results = await Promise.allSettled(
       chunk.map(async (row) => {
         const content = await enrichArticleBody(supabase, row);
-        // null は「本文が元と同等以下」のほか「SSRF ガードでスキップ」も含む（後者は
-        // enrichArticleBody 側で個別に warn 済み）。理由を断定しない文言にする。
+        // null は「本文が元と同等以下」「SSRF ガードでスキップ」「取得失敗」を含む。
+        // 理由を断定しない文言にする。
         if (!content) throw new Error("本文を差し替えなかった（薄い/スキップ）");
       }),
     );

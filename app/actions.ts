@@ -12,6 +12,8 @@ import { annotateMissing } from "@/lib/llm/summarize-batch";
 import { curateToday } from "@/lib/ranking/curate";
 import { generateQuizForCategory } from "@/lib/learn/quiz-gate";
 import { quizPoolDeficit } from "@/lib/learn/quiz-pool";
+import { hasApprovedLearnSources } from "@/lib/learn/learn-sources";
+import { discoverLearnSources } from "@/lib/learn/source-discovery";
 import {
   recordQuizAttempt,
   selectSessionQuestions,
@@ -277,10 +279,10 @@ export async function submitFeedback(formData: FormData) {
 // 1 セッションの出題数（design doc の 5〜10 問の下限）。
 const QUIZ_SESSION_SIZE = 5;
 
-// 裏補充（after）で 1 回に使う素材記事の上限。同期生成を撤去した代わりに、プールで満たせなかった
+// 裏補充（after）で 1 回に使う素材ソースの上限。同期生成を撤去した代わりに、プールで満たせなかった
 // セッションの後で軽く生成してプールを温める。after は route の maxDuration(60s) を共有するため
-// 記事数を絞って確実に収める（1 記事あたり LLM 1 呼び出し・直列）。YAT-31。
-const QUIZ_REFILL_MAX_ARTICLES = 3;
+// ソース数を絞って確実に収める（1 ソースあたり LLM 1 呼び出し・直列）。YAT-31。
+const QUIZ_REFILL_MAX_SOURCES = 3;
 
 // クイズ入力（category）を許可値のみに正規化する。picker は tech/* leaf のみ提示するため、それ以外は
 // 「おまかせ」(null) に倒す（直 POST の未知値も null 扱いで安全側）。
@@ -329,15 +331,19 @@ export async function startQuizSession(
     let note: string | null = null;
     if (questions.length < QUIZ_SESSION_SIZE) {
       const deficit = await quizPoolDeficit(supabase, category);
-      if (deficit > 0) {
-        // after は maxDuration を共有するため記事数と 1 回の生成数を絞る。失敗は握りつぶす。
+      // プール目標に未達なら補充候補。ただし承認済み learn_sources が無いカテゴリは生成しても素材が
+      // 無いので after を発火させない（毎セッション空振り＋過疎ソースの反復生成を防ぐ。YAT-32 F-G）。
+      const canRefill =
+        deficit > 0 && (await hasApprovedLearnSources(supabase, category));
+      if (canRefill) {
+        // after は maxDuration を共有するためソース数と 1 回の生成数を絞る。失敗は握りつぶす。
         const count = Math.min(deficit, QUIZ_SESSION_SIZE);
         after(async () => {
           try {
             await generateQuizForCategory(supabase, {
               category,
               count,
-              maxArticles: QUIZ_REFILL_MAX_ARTICLES,
+              maxSources: QUIZ_REFILL_MAX_SOURCES,
             });
           } catch (e) {
             console.warn("クイズの裏補充に失敗:", e);
@@ -345,9 +351,12 @@ export async function startQuizSession(
         });
       }
       if (questions.length === 0) {
-        note =
-          deficit > 0
-            ? "このカテゴリの出題を準備中です。少し時間をおいてから、もう一度お試しください。"
+        // 0 問の理由で案内を出し分ける: 準備中（補充が走る）／ソース未登録（探す導線へ）／
+        // クールダウン（プールは足りるが最近解いた問題ばかり eligible から外れた）。
+        note = canRefill
+          ? "このカテゴリの出題を準備中です。少し時間をおいてから、もう一度お試しください。"
+          : deficit > 0
+            ? "このカテゴリはまだ学習ソースが未登録です。「ソースを探す」から追加してください。"
             : "このカテゴリは最近解いた問題が続いています。少し間隔をあけると再出題されます。別カテゴリもどうぞ。";
       }
     }
@@ -393,5 +402,61 @@ export async function answerQuizQuestion(
     });
   } catch (e) {
     console.warn(`answerQuizQuestion: 記録に失敗 id=${questionId}:`, e);
+  }
+}
+
+// ── YAT-32: 学習ソースの発見・承認 ─────────────────────────────
+
+// 提案結果を UI に返す（useActionState 用）。承認待ちの新規件数を伝える。
+export type ProposeSourcesState = { ok: boolean; message: string } | null;
+
+// カテゴリを指定して学習ソースを発見する（LLM 提案 → 検証ゲート → learn_sources(pending)）。
+// /learn の「ソースを探す」フォームから呼ぶ。おまかせ(null)は提案テーマが曖昧なので不可＝tech/* 必須。
+export async function proposeLearnSources(
+  _prev: ProposeSourcesState,
+  formData: FormData,
+): Promise<ProposeSourcesState> {
+  await requireSession();
+  const category = parseQuizCategory(String(formData.get("category") ?? ""));
+  if (!category) {
+    return { ok: false, message: "カテゴリを選んでください（おまかせは不可）。" };
+  }
+  const supabase = createAdminClient();
+  try {
+    const r = await discoverLearnSources(supabase, { category });
+    revalidatePath("/learn");
+    if (r.skipped) {
+      return { ok: false, message: "提案できません（ANTHROPIC_API_KEY 未設定）。" };
+    }
+    return {
+      ok: true,
+      message: `候補 ${r.proposed} 件・検証通過 ${r.validated} 件・承認待ちに ${r.inserted} 件追加しました。`,
+    };
+  } catch (e) {
+    console.warn("proposeLearnSources 失敗:", e);
+    return { ok: false, message: "ソースの発見に失敗しました。時間をおいて再試行してください。" };
+  }
+}
+
+// 承認待ちソースを承認/却下する（learn_sources.status を倒す）。承認で生成素材になる。
+// form の hidden id ＋ formAction で「承認」「却下」ボタンを分ける（feeds の候補承認と同作法）。
+export async function reviewLearnSource(formData: FormData): Promise<void> {
+  await requireSession();
+  const id = String(formData.get("id") ?? "");
+  const decision = String(formData.get("decision") ?? "");
+  if (!id || (decision !== "approve" && decision !== "reject")) return;
+  const supabase = createAdminClient();
+  try {
+    const { error } = await supabase
+      .from("learn_sources")
+      .update({
+        status: decision === "approve" ? "approved" : "rejected",
+        reviewed_at: new Date().toISOString(),
+      })
+      .eq("id", id);
+    if (error) throw error;
+    revalidatePath("/learn");
+  } catch (e) {
+    console.warn(`reviewLearnSource 失敗 id=${id}:`, e);
   }
 }

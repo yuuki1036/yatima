@@ -5,6 +5,7 @@ import type { CategoryMastery } from "@/lib/types";
 import { startQuizSession, answerQuizQuestion } from "../actions";
 import { QuizDeck } from "../_components/quiz-deck";
 import { MasteryMap } from "../_components/mastery-map";
+import { LearnSources } from "../_components/learn-sources";
 
 // YAT-27: 学習 Module 再起動。旧カード承認キューを廃し、エンジニア知識の適応クイズ（選択式）へ
 // 入口を差し替える（design doc 20260702-adaptive-quiz-learn-mode）。旧 card_candidates 系（0007・
@@ -40,6 +41,7 @@ export default async function LearnPage() {
       startAction={startQuizSession}
       answerAction={answerQuizQuestion}
       masterySlot={<MasteryMap categories={mastery} />}
+      sourcesSlot={<LearnSources />}
     />
   );
 }

@@ -13,6 +13,7 @@ import {
   insertQuizRows,
   type QuizInsertRow,
 } from "@/lib/learn/quiz-gate";
+import { hasApprovedLearnSources } from "@/lib/learn/learn-sources";
 
 // YAT-29: 適応クイズのコアプール生成 cron。カテゴリ別の active プール深度を目標値まで満たすよう
 // 不足分（deficit）だけ生成し、その場 embed → 既存 active プール＋バッチ内既採用との cosine dedup
@@ -27,7 +28,7 @@ import {
 const POOL_TARGET_PER_CATEGORY = 12; // カテゴリ別 active プールの目標深度（QUIZ_SESSION_SIZE×約2.4セッション分）
 const MAX_NEW_PER_CATEGORY = 6; // 1 run のカテゴリ別生成上限（LLM 呼び出し数を抑える）
 const MAX_NEW_PER_RUN = 24; // 1 run の総候補上限（Voyage の embed 量と timeout に効く）
-const CRON_CANDIDATE_ARTICLES = 4; // cron の素材記事上限（オンデマンドの 8 より絞る＝呼び出し数上限）
+const CRON_CANDIDATE_SOURCES = 4; // cron の素材ソース上限（オンデマンドの 8 より絞る＝呼び出し数上限）
 const BACKFILL_EMBED_LIMIT = 12; // オンデマンド由来の embedding=null 行の後追い補完件数
 // バックフィルが実際に Voyage を叩いた回のみ、候補 embed との間に挟む保険（embed() 呼び出し"間"は
 // レート制御外のため）。succeeded ではなく「叩いたか」で判定する（全チャンク失敗でもリクエストは飛ぶ）。
@@ -175,6 +176,9 @@ export async function runQuizPool(
     const active = await countActive(supabase, category);
     const deficit = POOL_TARGET_PER_CATEGORY - active;
     if (deficit <= 0) continue;
+    // 在庫ゲート（YAT-32）: 承認済みソースが無いカテゴリは生成しても素材が無く空振りなので skip。
+    // deficit にも数えない（埋めようがない不足なので cron ログを汚さない。/learn がソース登録を促す）。
+    if (!(await hasApprovedLearnSources(supabase, category))) continue;
     result.deficitCategories += 1;
 
     const count = Math.min(
@@ -186,7 +190,7 @@ export async function runQuizPool(
       category,
       count,
       generator,
-      maxArticles: CRON_CANDIDATE_ARTICLES,
+      maxSources: CRON_CANDIDATE_SOURCES,
     });
     result.generated += core.generated;
     result.passed += core.passed;

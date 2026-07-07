@@ -14,6 +14,7 @@ type Props = {
   startAction: (categoryRaw: string) => Promise<QuizSessionResult>;
   answerAction: (questionId: string, chosenIndex: number) => void;
   masterySlot?: React.ReactNode; // YAT-28: picker phase 下に差し込む弱点マップ（Server Component）
+  sourcesSlot?: React.ReactNode; // YAT-32: picker phase 下に差し込む学習ソース管理（Server Component）
 };
 
 const DIFF_LABEL = {
@@ -27,6 +28,7 @@ export function QuizDeck({
   startAction,
   answerAction,
   masterySlot,
+  sourcesSlot,
 }: Props) {
   const [phase, setPhase] = useState<"picker" | "quiz" | "done">("picker");
   const [pending, startTransition] = useTransition();
@@ -116,7 +118,7 @@ export function QuizDeck({
       <div>
         {sectionLabel()}
         <p className="mb-6 text-xs text-muted">
-          カテゴリを選ぶと、蓄積した技術記事から4択クイズを出題します。選択式で気軽に。
+          カテゴリを選ぶと、承認した学習ソース（公式 docs・定番解説）から4択クイズを出題します。選択式で気軽に。
         </p>
 
         {note && (
@@ -145,6 +147,7 @@ export function QuizDeck({
         )}
 
         {masterySlot}
+        {sourcesSlot}
       </div>
     );
   }

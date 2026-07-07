@@ -18,7 +18,8 @@
     "compute-dedup-rate": "tsx scripts/compute-dedup-rate.ts",
     "migrate": "tsx scripts/migrate.ts",
     "resummarize": "tsx scripts/resummarize.ts",
-    "retag": "tsx scripts/retag.ts"
+    "retag": "tsx scripts/retag.ts",
+    "retire-news-quiz": "tsx scripts/retire-news-quiz.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.102.0",
