@@ -13,3 +13,23 @@ export function sanitizeSummary(raw: string): string {
   s = s.replace(/^(記事の?要約|要約)\s*[:：]?\s*/, "").trim();
   return s;
 }
+
+// 外部由来（RSS フィード）の記事タイトルを LLM の document に渡す前に無害化する。
+// プロンプトインジェクションの本命防御は system prompt 側（記事内の指示に従わない旨の明示）で、
+// これは制御文字・不可視文字・双方向テキスト制御による細工を潰す保険層。
+// null / 実質空文字は "" を返す（呼び出し側でフォールバックや filter(Boolean) に載せる）。
+export function sanitizeTitle(raw: string | null | undefined): string {
+  if (!raw) return "";
+  let s = raw;
+  // C0 / C1 制御文字（タブ・改行含む）と DEL をスペース化
+  s = s.replace(/[\u0000-\u001F\u007F-\u009F]/g, " ");
+  // ゼロ幅・不可視文字（ZWSP / ZWNJ / ZWJ / word joiner / BOM / soft hyphen）を除去
+  s = s.replace(/[\u00AD\u200B-\u200D\u2060\uFEFF]/g, "");
+  // 双方向テキスト制御を除去: bidi マーク（LRM/RLM/ALM）＋ override/embedding（U+202A-202E）＋ isolate（U+2066-2069）
+  s = s.replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, "");
+  // タグ文字（U+E0000-E007F。不可視 ASCII 密輸ベクタ）を除去。u フラグでコードポイント単位に扱う
+  s = s.replace(/[\u{E0000}-\u{E007F}]/gu, "");
+  // 改行・連続空白を単一スペースへ畳む
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
+}
