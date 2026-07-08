@@ -28,9 +28,15 @@ export type ScoreInput = {
   now?: number;
 };
 
-export function score(input: ScoreInput): number {
-  const now = input.now ?? Date.now();
-  const recency = recencyDecay(input.publishedAt, now);
+// 嗜好成分だけを取り出す純関数（学習値 = Σ タグ嗜好 + ソース嗜好）。recency・credibility は含まない。
+// 「嗜好の押し上げ／押し下げがどれだけ効いているか」を score から分離して見るために使う
+// （YAT-37 探索枠: 嗜好が中立（≈0）な未知トピックを選ぶ判定に必要）。
+export function preferenceScore(input: {
+  tags: string[];
+  tagPrefs: Map<string, number>;
+  sourceId?: string | null;
+  sourcePrefs?: Map<string, number>;
+}): number {
   const tagScore = input.tags.reduce(
     (s, t) => s + (input.tagPrefs.get(t) ?? 0),
     0,
@@ -39,8 +45,15 @@ export function score(input: ScoreInput): number {
     input.sourceId && input.sourcePrefs
       ? (input.sourcePrefs.get(input.sourceId) ?? 0)
       : 0;
+  return tagScore + sourceScore;
+}
+
+export function score(input: ScoreInput): number {
+  const now = input.now ?? Date.now();
+  const recency = recencyDecay(input.publishedAt, now);
+  const pref = preferenceScore(input);
   const credibility = input.credibility ?? 0;
-  // コールドスタート（pref 全 0）時は tagScore=sourceScore=0 に縮退し、score = recency + credibility。
+  // コールドスタート（pref 全 0）時は pref=0 に縮退し、score = recency + credibility。
   // 信頼ソースが上に、汎用アグリゲータが下に来る「厳選された新着順」になる。
-  return recency + tagScore + sourceScore + credibility;
+  return recency + pref + credibility;
 }
