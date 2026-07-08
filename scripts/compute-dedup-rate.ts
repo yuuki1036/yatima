@@ -12,12 +12,15 @@ import { parseEmbedding, cosineSim, DEDUP_THRESHOLD } from "../lib/ranking/dedup
 //
 // 算出: active feed A について「A の直近30日記事（最大100件）」の各記事が、
 // 「他 feed の直近30日記事（最大1000件）」のいずれかと cosine >= 0.86 で近重複になる割合。
-// 母数（embedding を持つ A の記事）が 0 件なら null（未算出）に倒す。
+// 母数（embedding を持つ A の直近記事）が MIN_OWN_ARTICLES 件未満なら null（未算出）に倒す
+// — 小サンプルでは 1 件のマッチだけで率が 1.0 に振れ、良質だが低頻度の feed を誤って
+// 推奨へ上げてしまうため（YAT-36）。
 
 const WINDOW_DAYS = 30;
 const PER_FEED_LIMIT = 100; // 自 feed 側の評価対象（直近）
 const COMPARE_LIMIT = 1000; // 他 feed 側の比較プール（直近）
 const FETCH_LIMIT = 5000; // 取得する直近記事の上限（安全弁）
+const MIN_OWN_ARTICLES = 5; // 近重複率を算出する最小母数（未満は小サンプル膨張を避け未算出）
 
 type Art = { feedId: string; vec: number[] };
 
@@ -66,8 +69,8 @@ async function main() {
   for (const feedId of feedIds) {
     const own = (byFeed.get(feedId) ?? []).slice(0, PER_FEED_LIMIT);
     let rate: number | null;
-    if (own.length === 0) {
-      rate = null; // embedding を持つ記事が無い → 未算出
+    if (own.length < MIN_OWN_ARTICLES) {
+      rate = null; // embedding を持つ記事が母数未満 → 小サンプル膨張を避けて未算出
     } else {
       // 比較プールは「他 feed 横断の新着 COMPARE_LIMIT 件」。高頻度 feed が新着上位を占めると
       // 低頻度 feed の重複が過小評価される方向に偏る（安全側＝推奨を出しすぎない）。feed が

@@ -7,6 +7,7 @@ import {
   type DiscoveryGateResult,
   type DiscoveryInput,
 } from "./discover";
+import { formatArticleLinksProvenance } from "../feeds/discovered-from";
 
 // 情報源の自動発見（YAT-16）の発見フロント・方式①「記事リンク発掘」。
 // 既に購読しているフィードの記事本文に張られた外部リンクを集め、ドメイン単位で畳んで
@@ -279,7 +280,7 @@ export async function collectCandidatesFromArticles(
 
   const inputs: DiscoveryInput[] = ranked.map(({ c }) => ({
     siteUrl: representativeOrigin(c),
-    discoveredFrom: `article-links:${c.sourceDomains.size}src`,
+    discoveredFrom: formatArticleLinksProvenance(c.sourceDomains.size),
   }));
 
   return { inputs, scannedArticles: articles.length };
