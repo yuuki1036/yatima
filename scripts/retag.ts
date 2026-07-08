@@ -95,7 +95,7 @@ async function main() {
       console.log(
         c.skipped
           ? "キュレーション: デッキ充足のため補充なし"
-          : `キュレーション: デッキに ${c.picked}件 を補充${c.deduped ? `（近重複 ${c.deduped}件を除外）` : ""}`,
+          : `キュレーション: デッキに ${c.picked}件 を補充${c.explored ? `（探索枠 ${c.explored}件）` : ""}${c.deduped ? `（近重複 ${c.deduped}件を除外）` : ""}`,
       );
     } catch (e) {
       console.error(
