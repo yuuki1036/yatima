@@ -256,7 +256,7 @@ export function CurationDeck({
           <p className="border border-line py-16 text-center text-sm text-muted">
             ここまで完了です 🎉
             <br />
-            今日は{pickedToday}件を判定済み。「更新」で次の候補を出せます。
+            今日は{pickedToday}件を判定済み。また明日、新しい候補が届きます。
           </p>
         </div>
       );
@@ -280,7 +280,7 @@ export function CurationDeck({
         <p className="border border-line py-16 text-center text-sm text-muted">
           ここまで完了です 🎉
           <br />
-          全{deck.length}件を見終わりました。「更新」で次の候補を出せます。
+          全{deck.length}件を見終わりました。また明日、新しい候補が届きます。
         </p>
       </div>
     );

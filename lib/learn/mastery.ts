@@ -23,14 +23,18 @@ const MASTERY_ALPHA = {
   hard: { correct: 0.4, wrong: 0.15 },
 } as const satisfies Record<QuizDifficulty, { correct: number; wrong: number }>;
 
-// 再出題の間隔（日）。最終回答が正解の問題は長く伏せ、不正解は短く戻す。
+// 再出題の間隔（日）。最終回答が正解の問題は長く伏せ、不正解は短く戻す（ただし 2 日は短すぎて
+// 「間違えた問題がすぐ戻る」体感になるため 4 日に延長。YAT-43）。
 const RETRY_CORRECT_DAYS = 14;
-const RETRY_WRONG_DAYS = 2;
+const RETRY_WRONG_DAYS = 4;
 
 // 選定スコアの係数。
 const WEAKNESS_FLOOR = 0.1; // 習熟済み concept も細く候補に残す（弱点度の下駄）
-const SERVE_BONUS_FLOOR = 0.25; // 直近出題でも 0 にせず候補に残す（間隔ボーナスの下駄）
-const SERVE_SATURATION_DAYS = 7; // 経過日数がこの値で間隔ボーナスが最大化
+// concept 単位のハード除外は無く、間隔抑止はこのソフト減衰のみ。下駄を小さくして直近出題 concept を
+// 実質最下位まで沈め、同一 concept の翌セッション再登場を抑える（YAT-43）。弱点度は温存するので
+// クールダウン明け後は弱点 concept が正しく優先される（適応性は壊さない）。
+const SERVE_BONUS_FLOOR = 0.05; // 直近出題でも 0 にはせず細く候補に残す（間隔ボーナスの下駄）
+const SERVE_SATURATION_DAYS = 14; // 経過日数がこの値で間隔ボーナスが最大化（上位に戻るまでの日数）
 const LEVEL_MATCH = [1.0, 0.5, 0.15] as const; // 難易度帯の段差 0 / ±1 / ±2 の重み
 const SCORE_JITTER = 0.1; // 同点の決定的固着を崩す揺らぎ幅
 const POOL_FETCH_LIMIT = 500; // JS スコアリングの母集団安全弁（超過分は古い順に候補外。YAT-29 で再検討）
