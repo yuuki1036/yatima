@@ -2,7 +2,7 @@ import { NextResponse, type NextRequest } from "next/server";
 import { SESSION_COOKIE, verifyToken } from "@/lib/auth/session";
 
 // Next.js 16 で middleware は proxy に改称（機能は同じ）。
-// 自分専用アプリの共有パスワード認証: /login と静的アセット以外の全ルートをゲートする。
+// 自分専用アプリの認証ゲート（ログインは Google OAuth）: /login と静的アセット以外の全ルートをゲートする。
 // Cookie の JWT 検証のみの楽観チェック（DB アクセスなし）。本筋の遮断は各 Server Action の
 // requireSession も担う二段防御（公式: proxy だけを防御線にするな）。
 
