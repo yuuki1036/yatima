@@ -16,7 +16,7 @@ const STATE_MAX_AGE_SEC = 600; // 10 分（同意〜コールバックの猶予�
 export async function GET(req: NextRequest) {
   const cfg = googleConfig();
   if (!cfg) {
-    // env 未設定＝Google ログイン無効。パスワードで入ってもらう。
+    // env 未設定＝Google ログイン無効。唯一の手段なので /login に設定エラーとして表示する。
     return NextResponse.redirect(
       new URL("/login?error=google_unconfigured", req.nextUrl.origin),
     );

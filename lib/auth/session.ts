@@ -1,11 +1,11 @@
 import "server-only";
-import { createHash, timingSafeEqual } from "node:crypto";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { SignJWT, jwtVerify, type JWTPayload } from "jose";
 
-// 自分専用アプリの共有パスワード認証。ユーザーは1人なので payload は所有者マーカーのみ持つ。
-// 照合パスワード(APP_PASSWORD)と JWT 署名鍵(SESSION_SECRET)は環境変数（サーバー専用・NEXT_PUBLIC_ は付けない）。
+// 自分専用アプリの所有者セッション。ログインは Google OAuth（lib/auth/google.ts）が担い、
+// 認証成立後にここで JWT Cookie を発行する。ユーザーは1人なので payload は所有者マーカーのみ持つ。
+// JWT 署名鍵(SESSION_SECRET)は環境変数（サーバー専用・NEXT_PUBLIC_ は付けない）。
 
 export const SESSION_COOKIE = "yatima_session";
 const SESSION_SUBJECT = "owner";
@@ -16,17 +16,6 @@ const SESSION_MAX_AGE_SEC = 60 * 60 * 24 * 30;
 // バイパスされるため、未設定だけでなく最小長（32 文字 = openssl rand -base64 32 相当）も強制する。
 const MIN_SECRET_LENGTH = 32;
 
-// 共有パスワードはこのアプリ唯一の認証要素。レート制限を置かない代わりに、設定時に最低限の
-// 強度（8 文字以上・英字と数字の両方を含む）を要求して弱いパスワードを弾く。
-const MIN_PASSWORD_LENGTH = 8;
-
-// APP_PASSWORD がポリシー（最小長・英数字混在）を満たすか。設定値の検証用。
-function meetsPasswordPolicy(pw: string): boolean {
-  return (
-    pw.length >= MIN_PASSWORD_LENGTH && /[a-zA-Z]/.test(pw) && /[0-9]/.test(pw)
-  );
-}
-
 function encodedSecret(): Uint8Array {
   const secret = process.env.SESSION_SECRET;
   if (!secret || secret.length < MIN_SECRET_LENGTH) {
@@ -35,22 +24,6 @@ function encodedSecret(): Uint8Array {
     );
   }
   return new TextEncoder().encode(secret);
-}
-
-// 入力パスワードを APP_PASSWORD と比較する。
-// 両者を固定長(SHA-256)ダイジェスト化してから timingSafeEqual で比べることで、
-// 比較時間が入力長・一致進捗に依存せず（正解長のリークもなく）定数時間になる。
-// 自前のバイト比較ループは JIT 最適化で定数時間が保証されないため node:crypto に委ねる。
-export function verifyPassword(input: string): boolean {
-  const expected = process.env.APP_PASSWORD;
-  if (!expected || !meetsPasswordPolicy(expected)) {
-    throw new Error(
-      `APP_PASSWORD が未設定またはポリシー違反です（${MIN_PASSWORD_LENGTH} 文字以上・英字と数字の両方を含む）`,
-    );
-  }
-  const a = createHash("sha256").update(input).digest();
-  const b = createHash("sha256").update(expected).digest();
-  return timingSafeEqual(a, b);
 }
 
 // JWT 文字列を検証して payload を返す（不正・期限切れ・署名不一致なら null）。
