@@ -1,8 +1,8 @@
 name: discover
 
-# 情報源の自動発見 cron（YAT-16 方式①）。記事リンクから候補フィードを発掘し、検証ゲートを
-# 通して feed_candidates に承認待ち登録する。重く低頻度でよい処理なので、ingest（毎時）とは
-# 分離して週次で回す。承認は UI（/feeds の DISCOVERED 枠）で人手が行う。
+# 情報源の自動発見 cron。方式①（記事リンク発掘・YAT-16）＋方式②（嗜好ベース提案・YAT-38）で
+# 候補フィードを発掘し、検証ゲートを通して feed_candidates に承認待ち登録する。重く低頻度でよい
+# 処理なので、ingest（毎時）とは分離して週次で回す。承認は UI（/feeds の DISCOVERED 枠）で人手が行う。
 on:
   schedule:
     - cron: "0 3 * * 1" # 毎週月曜 03:00（UTC）
@@ -28,3 +28,6 @@ jobs:
         env:
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # 方式②（嗜好ベース提案）用。未設定なら方式② は fail-soft でスキップされ、方式① だけ走る。
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
