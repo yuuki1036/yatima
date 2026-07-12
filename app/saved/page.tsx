@@ -1,16 +1,13 @@
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { formatDateShort, errorMessage } from "@/lib/format";
 import type { ArticleWithFeed } from "@/lib/types";
-import { toggleRead, toggleStar } from "../actions";
 import { RefreshButton } from "../_components/refresh-button";
+import { SaveActions } from "./_components/save-actions";
 
 // 「後で読む」お気に入り（is_starred）の一覧。デッキ（/）で★を付けた記事を貯める受け皿。
 export const dynamic = "force-dynamic";
 // 手動「更新」(refreshNow) が取得→要約→curate を同期実行するため、関数時間を延ばす。
 export const maxDuration = 60;
-
-const btn =
-  "border border-border px-2.5 py-1 font-mono text-xs tracking-wide transition-colors hover:bg-foreground hover:text-background";
 
 export default async function SavedPage() {
   let articles: ArticleWithFeed[] = [];
@@ -102,33 +99,11 @@ export default async function SavedPage() {
                   )}
                 </div>
               </div>
-              <div className="flex shrink-0 gap-1.5">
-                <form action={toggleStar}>
-                  <input type="hidden" name="id" value={a.id} />
-                  <input
-                    type="hidden"
-                    name="is_starred"
-                    value={String(a.is_starred)}
-                  />
-                  <button
-                    className={`${btn} ${a.is_starred ? "text-accent" : ""}`}
-                    title="スター"
-                  >
-                    {a.is_starred ? "★" : "☆"}
-                  </button>
-                </form>
-                <form action={toggleRead}>
-                  <input type="hidden" name="id" value={a.id} />
-                  <input
-                    type="hidden"
-                    name="is_read"
-                    value={String(a.is_read)}
-                  />
-                  <button className={btn}>
-                    {a.is_read ? "未読に戻す" : "既読にする"}
-                  </button>
-                </form>
-              </div>
+              <SaveActions
+                id={a.id}
+                isStarred={a.is_starred}
+                isRead={a.is_read}
+              />
             </li>
           ))}
         </ul>

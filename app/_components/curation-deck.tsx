@@ -2,7 +2,9 @@
 
 import { useCallback, useEffect, useRef, useState, useTransition } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
+import { toast } from "sonner";
 import type { CurationCard, FeedbackAction } from "@/lib/types";
+import type { MutationResult } from "../actions";
 import { useReducedMotion } from "../_hooks/use-reduced-motion";
 import { SwipeCard } from "./swipe-card";
 
@@ -43,9 +45,10 @@ type Props = {
   // 「ピック未生成」と「全件判定済み（完了）」を区別して表示し分けるために使う。
   pickedToday: number;
   // Server Action を prop で受け取る（Next.js のクライアント連携パターン）。
-  submitFeedbackAction: (formData: FormData) => void;
+  // fire-and-forget だが失敗を toast で伝えるため戻り値 { ok } を受ける（YAT-41）。
+  submitFeedbackAction: (formData: FormData) => Promise<MutationResult>;
   // 「後で読む」お気に入りの付け外し（is_starred トグル）。判定とは別系統で、カードを進めない。
-  toggleStarAction: (formData: FormData) => void;
+  toggleStarAction: (formData: FormData) => Promise<MutationResult>;
 };
 
 // 今日のカードを1枚ずつ捌く Tinder UI。送り操作はクライアント state で楽観的に前進し、
@@ -93,7 +96,12 @@ export function CurationDeck({
       fd.set("id", card.id);
       // toggleStar は現在値を反転する。楽観表示と一致させるため反転前の値を送る。
       fd.set("is_starred", String(wasStarred));
-      startTransition(() => toggleStarAction(fd));
+      // 楽観表示は戻さず（★の集計影響はなくリロードで真実に収束する）、失敗のみ toast で伝える。
+      startTransition(async () => {
+        const r = await toggleStarAction(fd);
+        if (!r?.ok)
+          toast.error("スターの更新に失敗しました", { id: "star-fail" });
+      });
     },
     [toggleStarAction],
   );
@@ -115,7 +123,14 @@ export function CurationDeck({
       const fd = new FormData();
       fd.set("id", card.id);
       fd.set("action", action);
-      startTransition(() => submitFeedbackAction(fd));
+      // 楽観前進は維持（先に index を進める）。記録失敗は巻き戻さず toast のみ（doc open 参照）。
+      startTransition(async () => {
+        const r = await submitFeedbackAction(fd);
+        if (!r?.ok)
+          toast.error("フィードバックの記録に失敗しました", {
+            id: "feedback-fail",
+          });
+      });
       setIndex((i) => i + 1); // 楽観的に次の1枚へ
     },
     [submitFeedbackAction],

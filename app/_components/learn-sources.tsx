@@ -1,8 +1,9 @@
 import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { TAG_LEAVES, tagLabel } from "@/lib/tags/vocabulary";
 import type { LearnSource } from "@/lib/types";
-import { proposeLearnSources, reviewLearnSource } from "../actions";
+import { proposeLearnSources } from "../actions";
 import { LearnSourceFinder } from "./learn-source-finder";
+import { ReviewButtons } from "./review-buttons";
 
 // YAT-32: 学習ソースの管理パネル（picker 画面の下部に差し込む）。承認済み learn_sources だけが
 // クイズ生成の素材になるため、ここで「探す（LLM 提案→検証）」→「承認待ちを承認/却下」を回す。
@@ -67,22 +68,7 @@ export async function LearnSources() {
                   <p className="mt-1 line-clamp-2 text-xs text-muted">{s.rationale}</p>
                 )}
               </div>
-              <div className="flex shrink-0 gap-1.5">
-                <form action={reviewLearnSource}>
-                  <input type="hidden" name="id" value={s.id} />
-                  <input type="hidden" name="decision" value="approve" />
-                  <button className="border border-border px-2.5 py-1 font-mono text-xs tracking-wide text-accent transition-colors hover:bg-accent hover:text-accent-foreground">
-                    承認
-                  </button>
-                </form>
-                <form action={reviewLearnSource}>
-                  <input type="hidden" name="id" value={s.id} />
-                  <input type="hidden" name="decision" value="reject" />
-                  <button className="border border-border px-2.5 py-1 font-mono text-xs tracking-wide text-muted transition-colors hover:bg-surface">
-                    却下
-                  </button>
-                </form>
-              </div>
+              <ReviewButtons id={s.id} />
             </li>
           ))}
         </ul>

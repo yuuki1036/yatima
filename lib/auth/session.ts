@@ -26,11 +26,22 @@ function encodedSecret(): Uint8Array {
   return new TextEncoder().encode(secret);
 }
 
+// dev 環境（NODE_ENV !== production）ではローカル動作確認のため認証を常にバイパスする。
+// Vercel 本番は常に NODE_ENV=production なので本番は従来どおり Google OAuth で守られる。
+// ローカルの `npm run dev` でのみ認証を素通しする（`npm run build && start` は production 扱いで無効）。
+// ⚠️ dev では認証が完全に無効になるため、dev server を外部公開しないこと。
+function devAuthBypass(): boolean {
+  return process.env.NODE_ENV !== "production";
+}
+
 // JWT 文字列を検証して payload を返す（不正・期限切れ・署名不一致なら null）。
-// next/headers に依存しない純関数なので proxy からも使える。
+// next/headers に依存しない純関数なので proxy からも使える。認証判定はここに一元化されているため、
+// dev バイパスもこの choke point に置けば proxy / getSession / requireSession の全経路に効く。
 export async function verifyToken(
   token: string | undefined,
 ): Promise<JWTPayload | null> {
+  // dev バイパス時は token を検証せず所有者セッションを返す（本番は NODE_ENV=production で無効）。
+  if (devAuthBypass()) return { sub: SESSION_SUBJECT };
   if (!token) return null;
   try {
     const { payload } = await jwtVerify(token, encodedSecret(), {
