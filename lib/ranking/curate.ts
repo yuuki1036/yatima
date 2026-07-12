@@ -4,16 +4,16 @@ import { score, preferenceScore, recencyDecay } from "./score";
 import { loadTagPrefs, loadSourcePrefs } from "./preferences";
 import { parseEmbedding, isNearDuplicate } from "./dedup";
 
-// 「今日のデッキ」を未判定 size 件に保つキュレーション。ingest パイプライン末尾（cron）と
+// 「今日のデッキ」を1日 size 件までに保つキュレーション。ingest パイプライン末尾（cron）と
 // 手動「更新」から呼ぶ。
 //
-// 連続トップアップ方式: かつての「1日1回だけ確定」する日次ガードは廃止し、未判定の手持ちが
-// size 件を下回っていれば不足分だけ補充する。これで「更新を押せば必ず最大 size 件が並ぶ」
-// 「1日 size 件で打ち止めにならない（判定し切ったら更新で次が出る）」を両立する。冪等性は
-// 「未判定が size 件あれば何もしない」ことで担保する（毎時 cron が走っても無駄に増えない）。
+// 日次上限方式（YAT-42）: 当日すでにピックした総数（判定済み含む）が size 件に達したら、その日は
+// cron でも更新でも補充しない。判定を進めても新規カードは増えず「1日 size 件で打ち止め」になる
+// （判定済み除外は page 側が担うので、未判定は続きから／全判定で完了、往復しても増えない・復活しない）。
+// size 件未満なら不足分だけ補充する。冪等性は「当日ピックが size 件あれば何もしない」ことで担保する。
 // 既出（判定済み含む）の記事は picked_date が立っているので候補から自然に外れ、二重提示しない。
 
-const DAILY_COUNT = 10; // 並べる未判定デッキの目標サイズ
+const DAILY_COUNT = 10; // 1日にピックするデッキの上限サイズ（判定済み込みの当日総数で打ち止め）
 const CANDIDATE_WINDOW_HOURS = 72; // 採点候補は直近 72h（鮮度と母数のバランス）
 const CANDIDATE_LIMIT = 200;
 const MAX_PER_SOURCE = 3; // デッキ内で同一ソースの最大数（多様性キャップ。当日累積で数える）
@@ -23,7 +23,7 @@ const EXPLORE_NEUTRAL_BAND = 0.5; // 「嗜好中立」とみなす preferenceSc
 export type CurateResult = {
   date: string; // JST の YYYY-MM-DD
   picked: number; // 今回新たに補充した件数
-  skipped: boolean; // 既に未判定が size 件あり何もしなかった場合 true
+  skipped: boolean; // 既に当日ピックが size 件あり何もしなかった場合 true
   deduped: number; // embedding 類似で近重複として弾いた候補数（観測・閾値調整用）
   explored: number; // 今回の補充で探索枠として採った件数（観測・filter bubble 効果測定用）
 };
@@ -67,7 +67,7 @@ export type PickDeckResult = {
 export function pickDeck(params: {
   candidates: DeckCandidate[];
   seeds: DeckSeed[];
-  need: number; // 補充する目標件数（size - 未判定数、> 0 前提）
+  need: number; // 補充する目標件数（size - 当日総ピック数、> 0 前提）
   hasPrefSignal: boolean; // 嗜好が学習済みか（false=コールドスタート → 探索枠を畳む）
   exploreCount?: number;
   neutralBand?: number;
@@ -192,9 +192,10 @@ export async function curateToday(
     if (fErr) throw fErr;
     judged = new Set((fb ?? []).map((x) => x.article_id as string));
   }
-  const unjudged = pickedToday.filter((r) => !judged.has(r.id as string)).length;
-  const need = size - unjudged;
-  // ── 冪等ガード: 未判定が既に size 件あれば補充不要。
+  // 1日 size 件で打ち止め: 当日の総ピック数（判定済み込み）で上限を測る。size 件出したら判定が
+  // 進んでも cron/更新で補充しない（往復で増えない・復活しない）。judged は seed の探索枠カウントに使う。
+  const need = size - pickedToday.length;
+  // ── 冪等ガード: 当日ピックが既に size 件あれば補充不要。
   if (need <= 0)
     return { date: today, picked: 0, skipped: true, deduped: 0, explored: 0 };
 
