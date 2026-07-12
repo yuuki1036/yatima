@@ -1,7 +1,9 @@
 "use client";
 
 import { useCallback, useEffect, useState, useTransition } from "react";
+import { toast } from "sonner";
 import type { QuizQuestion, QuizSessionResult } from "@/lib/types";
+import type { MutationResult } from "../actions";
 
 // YAT-27: 適応クイズの選択式デッキ（MVP）。カテゴリ選択 → オンデマンド生成 → 1問1画面で
 // 即時採点＋解説 → 回答記録（fire-and-forget）。curation-deck.tsx の「client state で楽観前進・
@@ -12,7 +14,11 @@ type Category = { slug: string; label: string };
 type Props = {
   categories: Category[]; // tech/* leaf（おまかせは slug="" で末尾に添える）
   startAction: (categoryRaw: string) => Promise<QuizSessionResult>;
-  answerAction: (questionId: string, chosenIndex: number) => void;
+  // fire-and-forget だが失敗を toast で伝えるため戻り値 { ok } を受ける（YAT-41）。
+  answerAction: (
+    questionId: string,
+    chosenIndex: number,
+  ) => Promise<MutationResult>;
   masterySlot?: React.ReactNode; // YAT-28: picker phase 下に差し込む弱点マップ（Server Component）
   sourcesSlot?: React.ReactNode; // YAT-32: picker phase 下に差し込む学習ソース管理（Server Component）
 };
@@ -67,7 +73,12 @@ export function QuizDeck({
       if (!current || selected !== null) return;
       setSelected(choiceIndex);
       if (choiceIndex === current.answer_index) setCorrectCount((n) => n + 1);
-      startTransition(() => answerAction(current.id, choiceIndex));
+      // 採点は client 表示済み。記録失敗は巻き戻さず toast のみ（楽観前進を維持）。
+      startTransition(async () => {
+        const r = await answerAction(current.id, choiceIndex);
+        if (!r?.ok)
+          toast.error("回答の記録に失敗しました", { id: "quiz-answer-fail" });
+      });
     },
     [current, selected, answerAction],
   );
@@ -133,6 +144,7 @@ export function QuizDeck({
               key={c.slug || "any"}
               onClick={() => start(c.slug)}
               disabled={pending}
+              aria-busy={pending}
               className="border border-border px-3 py-3 text-left font-mono text-xs tracking-wide transition-colors hover:bg-foreground hover:text-background disabled:cursor-not-allowed disabled:opacity-50"
             >
               {c.label}

@@ -27,6 +27,10 @@ import type { FeedbackAction, QuizQuestion, QuizSessionResult } from "@/lib/type
 // 手動「更新」の結果（useActionState で UI に返す）。
 export type RefreshState = { ok: boolean; message: string } | null;
 
+// 各種 mutation（fire-and-forget な楽観 UI 系＋破壊的操作）の結果。client は成否で toast を出す
+// （YAT-41）。throw は error boundary 行きで楽観 UI を壊すため、失敗は戻り値で伝える。
+export type MutationResult = { ok: boolean };
+
 // 直近実行からこの時間内は再実行しない（無認証公開のため連打での API 課金を抑える緩和策。
 // 本筋の対策は認証 = follow-up 20260608-server-action-auth）。
 // cron が毎時取得するので、それより短い手動取得は実質重複。cron と同じ 60 分に揃える。
@@ -41,66 +45,104 @@ const REFRESH_MARKER = { kind: "meta", key: "last_manual_refresh" } as const;
 // 防御線にするな・Server Action でも検証せよ」と明記しているため、直 POST 対策の
 // 二段目として冒頭で requireSession() を呼ぶ（YAT-12 / [[20260608-server-action-auth]]）。
 
-export async function addFeed(formData: FormData) {
+// フィード追加の結果（useActionState で UI に返す）。url 入力があるため message 付き。
+export type AddFeedState = { ok: boolean; message: string } | null;
+
+export async function addFeed(
+  _prev: AddFeedState,
+  formData: FormData,
+): Promise<AddFeedState> {
   await requireSession();
   const url = String(formData.get("url") ?? "").trim();
-  if (!url) return;
+  if (!url) return { ok: false, message: "URL を入力してください。" };
   const supabase = createAdminClient();
-  await supabase
+  const { error } = await supabase
     .from("feeds")
     .upsert({ url }, { onConflict: "url", ignoreDuplicates: true });
+  if (error) {
+    console.warn("addFeed 失敗:", error);
+    return { ok: false, message: "追加に失敗しました。" };
+  }
   revalidatePath("/feeds");
+  return { ok: true, message: "フィードを追加しました。" };
 }
 
-export async function deleteFeed(formData: FormData) {
+export async function deleteFeed(formData: FormData): Promise<MutationResult> {
   await requireSession();
   const id = String(formData.get("id") ?? "");
-  if (!id) return;
+  if (!id) return { ok: false };
   const supabase = createAdminClient();
-  await supabase.from("feeds").delete().eq("id", id);
+  const { error } = await supabase.from("feeds").delete().eq("id", id);
+  if (error) {
+    console.warn(`deleteFeed 失敗 id=${id}:`, error);
+    return { ok: false };
+  }
   revalidatePath("/feeds");
   revalidatePath("/");
   revalidatePath("/saved");
+  return { ok: true };
 }
 
 // 削除推奨（YAT-20）の確定アクション: 物理削除せず active=false に倒して取得対象から外す。
 // 記事は残すので「後で読む」や既存デッキは保全され、reactivateFeed で復活できる。
 // ingestAllFeeds が .eq("active", true) で絞るため、次回 ingest 以降は取得が止まる。既存記事は
 // curate の 72h ウィンドウから自然に外れるので、デッキ側の追加フィルタは不要（/ は revalidate しない）。
-export async function deactivateFeed(formData: FormData) {
+export async function deactivateFeed(
+  formData: FormData,
+): Promise<MutationResult> {
   await requireSession();
   const id = String(formData.get("id") ?? "");
-  if (!id) return;
+  if (!id) return { ok: false };
   const supabase = createAdminClient();
-  await supabase.from("feeds").update({ active: false }).eq("id", id);
+  const { error } = await supabase
+    .from("feeds")
+    .update({ active: false })
+    .eq("id", id);
+  if (error) {
+    console.warn(`deactivateFeed 失敗 id=${id}:`, error);
+    return { ok: false };
+  }
   revalidatePath("/feeds");
+  return { ok: true };
 }
 
 // 非活性化した feed を取得対象へ戻す（deactivateFeed の対称操作）。
-export async function reactivateFeed(formData: FormData) {
+export async function reactivateFeed(
+  formData: FormData,
+): Promise<MutationResult> {
   await requireSession();
   const id = String(formData.get("id") ?? "");
-  if (!id) return;
+  if (!id) return { ok: false };
   const supabase = createAdminClient();
-  await supabase.from("feeds").update({ active: true }).eq("id", id);
+  const { error } = await supabase
+    .from("feeds")
+    .update({ active: true })
+    .eq("id", id);
+  if (error) {
+    console.warn(`reactivateFeed 失敗 id=${id}:`, error);
+    return { ok: false };
+  }
   revalidatePath("/feeds");
+  return { ok: true };
 }
 
 // 自動発見の承認待ち候補（feed_candidates）を feeds へ昇格する（YAT-16）。誤検出を本番取得に
 // 混ぜないための承認制の出口。候補の低い初期 credibility をそのまま引き継ぎ、運用で手当てする。
-export async function approveFeedCandidate(formData: FormData) {
+export async function approveFeedCandidate(
+  formData: FormData,
+): Promise<MutationResult> {
   await requireSession();
   const id = String(formData.get("id") ?? "");
-  if (!id) return;
+  if (!id) return { ok: false };
   const supabase = createAdminClient();
   const { data: cand } = await supabase
     .from("feed_candidates")
     .select("url, title, site_url, credibility")
     .eq("id", id)
     .maybeSingle();
-  if (!cand) return;
+  if (!cand) return { ok: false };
   // url unique 衝突は無視（既に手動追加済みの URL を二重承認した場合の保険）。
-  await supabase.from("feeds").upsert(
+  const { error: upsertErr } = await supabase.from("feeds").upsert(
     {
       url: cand.url,
       title: cand.title,
@@ -109,25 +151,37 @@ export async function approveFeedCandidate(formData: FormData) {
     },
     { onConflict: "url", ignoreDuplicates: true },
   );
+  if (upsertErr) {
+    console.warn(`approveFeedCandidate 昇格に失敗 id=${id}:`, upsertErr);
+    return { ok: false };
+  }
   await supabase
     .from("feed_candidates")
     .update({ status: "approved" })
     .eq("id", id);
   revalidatePath("/feeds");
+  return { ok: true };
 }
 
 // 候補を却下する。source_domain は status 不問で重複排除に使うため、行は消さず rejected に倒す
 // （同じドメインが次回発見で再び候補に挙がるのを防ぐ）。
-export async function rejectFeedCandidate(formData: FormData) {
+export async function rejectFeedCandidate(
+  formData: FormData,
+): Promise<MutationResult> {
   await requireSession();
   const id = String(formData.get("id") ?? "");
-  if (!id) return;
+  if (!id) return { ok: false };
   const supabase = createAdminClient();
-  await supabase
+  const { error } = await supabase
     .from("feed_candidates")
     .update({ status: "rejected" })
     .eq("id", id);
+  if (error) {
+    console.warn(`rejectFeedCandidate 失敗 id=${id}:`, error);
+    return { ok: false };
+  }
   revalidatePath("/feeds");
+  return { ok: true };
 }
 
 // 学習カード候補（card_candidates）を承認する（YAT-17）。誤生成を本番に混ぜないための承認制の
@@ -159,24 +213,40 @@ export async function rejectCard(formData: FormData) {
   revalidatePath("/learn");
 }
 
-export async function toggleRead(formData: FormData) {
+export async function toggleRead(formData: FormData): Promise<MutationResult> {
   await requireSession();
   const id = String(formData.get("id") ?? "");
-  if (!id) return;
+  if (!id) return { ok: false };
   const next = formData.get("is_read") !== "true"; // 現在値の反転
   const supabase = createAdminClient();
-  await supabase.from("articles").update({ is_read: next }).eq("id", id);
+  const { error } = await supabase
+    .from("articles")
+    .update({ is_read: next })
+    .eq("id", id);
+  if (error) {
+    console.warn(`toggleRead: 更新に失敗 id=${id}:`, error);
+    return { ok: false };
+  }
   revalidatePath("/saved");
+  return { ok: true };
 }
 
-export async function toggleStar(formData: FormData) {
+export async function toggleStar(formData: FormData): Promise<MutationResult> {
   await requireSession();
   const id = String(formData.get("id") ?? "");
-  if (!id) return;
+  if (!id) return { ok: false };
   const next = formData.get("is_starred") !== "true";
   const supabase = createAdminClient();
-  await supabase.from("articles").update({ is_starred: next }).eq("id", id);
+  const { error } = await supabase
+    .from("articles")
+    .update({ is_starred: next })
+    .eq("id", id);
+  if (error) {
+    console.warn(`toggleStar: 更新に失敗 id=${id}:`, error);
+    return { ok: false };
+  }
   revalidatePath("/saved");
+  return { ok: true };
 }
 
 // 手動「更新」: 全 active フィードを取得→本文補完→未要約を要約+タグ→デッキを未判定 10 件へ補充。
@@ -247,7 +317,9 @@ export async function refreshNow(): Promise<RefreshState> {
 }
 
 // Tinder カードのフィードバック（開く/役立った/不要）。タグ嗜好を更新し、当日の一覧を再取得させる。
-export async function submitFeedback(formData: FormData) {
+export async function submitFeedback(
+  formData: FormData,
+): Promise<MutationResult> {
   await requireSession();
   const id = String(formData.get("id") ?? "");
   const action = String(formData.get("action") ?? "");
@@ -257,21 +329,22 @@ export async function submitFeedback(formData: FormData) {
   if (!id || !Object.hasOwn(FEEDBACK_WEIGHT, action)) {
     // 楽観 UI は結果を見ず進むため、無痕跡だと不正 POST に気づけない。痕跡だけ残す。
     console.warn(`submitFeedback: 不正な入力を棄却 id=${id} action=${action}`);
-    return;
+    return { ok: false };
   }
   const supabase = createAdminClient();
   // クライアントは結果を await せず楽観的にカードを進める（fire-and-forget）。
-  // ここで throw しても UI に伝わらないため、失敗理由をログに残して握り潰す。
+  // throw は error boundary 行きで楽観 UI を壊すため、失敗は戻り値で返し client の toast に繋ぐ。
   try {
     await recordFeedback(supabase, id, action as FeedbackAction);
   } catch (e) {
     console.warn(`submitFeedback: 記録に失敗 id=${id} action=${action}:`, e);
-    return;
+    return { ok: false };
   }
   // "/" は revalidate しない: デッキはクライアント側で1枚ずつ進むため、ここで再取得して
   // 判定済みカードを配列から除外すると、楽観的に進めた index と二重にズレてカードが飛ぶ。
   // リロード時はサーバクエリが判定済みを除外し、続きから再開する。
   revalidatePath("/saved"); // 「開く」で立てた既読を /saved に反映
+  return { ok: true };
 }
 
 // ── YAT-27: 適応クイズ ─────────────────────────────────────
@@ -377,12 +450,12 @@ export async function startQuizSession(
 export async function answerQuizQuestion(
   questionId: string,
   chosenIndex: number,
-): Promise<void> {
+): Promise<MutationResult> {
   await requireSession();
   // chosenIndex は client 直送値。選択肢は4件なので 0..3 の範囲外は不正入力として弾く
   // （chosen_index 列には DB chk が無く、範囲外がそのまま記録されるのを防ぐ）。
   if (!questionId || !Number.isInteger(chosenIndex) || chosenIndex < 0 || chosenIndex > 3)
-    return;
+    return { ok: false };
   const supabase = createAdminClient();
   try {
     const { data: q } = await supabase
@@ -390,7 +463,7 @@ export async function answerQuizQuestion(
       .select("answer_index, concept_key, concept_label, category, difficulty")
       .eq("id", questionId)
       .maybeSingle();
-    if (!q) return;
+    if (!q) return { ok: false };
     await recordQuizAttempt(supabase, {
       questionId,
       conceptKey: q.concept_key as string,
@@ -400,8 +473,10 @@ export async function answerQuizQuestion(
       isCorrect: chosenIndex === (q.answer_index as number),
       chosenIndex,
     });
+    return { ok: true };
   } catch (e) {
     console.warn(`answerQuizQuestion: 記録に失敗 id=${questionId}:`, e);
+    return { ok: false };
   }
 }
 
@@ -442,11 +517,14 @@ export async function proposeLearnSources(
 
 // 承認待ちソースを承認/却下する（learn_sources.status を倒す）。承認で生成素材になる。
 // form の hidden id ＋ formAction で「承認」「却下」ボタンを分ける（feeds の候補承認と同作法）。
-export async function reviewLearnSource(formData: FormData): Promise<void> {
+export async function reviewLearnSource(
+  formData: FormData,
+): Promise<MutationResult> {
   await requireSession();
   const id = String(formData.get("id") ?? "");
   const decision = String(formData.get("decision") ?? "");
-  if (!id || (decision !== "approve" && decision !== "reject")) return;
+  if (!id || (decision !== "approve" && decision !== "reject"))
+    return { ok: false };
   const supabase = createAdminClient();
   try {
     const { error } = await supabase
@@ -458,7 +536,9 @@ export async function reviewLearnSource(formData: FormData): Promise<void> {
       .eq("id", id);
     if (error) throw error;
     revalidatePath("/learn");
+    return { ok: true };
   } catch (e) {
     console.warn(`reviewLearnSource 失敗 id=${id}:`, e);
+    return { ok: false };
   }
 }

@@ -1,89 +1,26 @@
 "use client";
 
-import { useEffect, useSyncExternalStore } from "react";
+import {
+  useThemePreference,
+  setThemePreference,
+  type ThemePreference,
+} from "../_hooks/use-theme";
 
-type Preference = "system" | "light" | "dark";
+// テーマ切替ボタン。preference ストアは use-theme に切り出し、sonner Toaster と共有する（YAT-41）。
 
-const ORDER: Preference[] = ["system", "light", "dark"];
-const STORAGE_KEY = "theme";
+const ORDER: ThemePreference[] = ["system", "light", "dark"];
 
-// ── preference の外部ストア（localStorage）。useSyncExternalStore で購読する。
-// effect 内 setState を避けつつ SSR/CSR のスナップショットを React に正しく解決させる。
-const listeners = new Set<() => void>();
-
-function subscribe(cb: () => void) {
-  listeners.add(cb);
-  window.addEventListener("storage", cb); // 別タブでの変更に追従
-  return () => {
-    listeners.delete(cb);
-    window.removeEventListener("storage", cb);
-  };
-}
-
-function getSnapshot(): Preference {
-  // useSyncExternalStore は render 中に同期で呼ぶため、ストレージが完全にブロックされた
-  // 環境（SecurityError）でも throw させない。THEME_INIT と同じく fail-soft で system に倒す。
-  try {
-    const s = localStorage.getItem(STORAGE_KEY);
-    return s === "light" || s === "dark" || s === "system" ? s : "system";
-  } catch {
-    return "system";
-  }
-}
-
-// サーバ／hydration 時は localStorage を読めないため system を返す（実際の見た目は
-// layout のインラインスクリプトが data-theme を先に確定させているのでズレない）。
-function getServerSnapshot(): Preference {
-  return "system";
-}
-
-// preference を実際の light/dark に解決する（system のみ OS 設定を見る）。
-function resolveEffective(pref: Preference): "light" | "dark" {
-  if (pref === "dark") return "dark";
-  if (pref === "light") return "light";
-  return window.matchMedia("(prefers-color-scheme: dark)").matches
-    ? "dark"
-    : "light";
-}
-
-// effective を <html data-theme> に反映し、購読側へ通知する。
-function setPreference(pref: Preference) {
-  // 永続化できない環境でも見た目の切替は止めない（setItem は throw しうる）。
-  try {
-    localStorage.setItem(STORAGE_KEY, pref);
-  } catch {
-    // ignore: persistence は best-effort
-  }
-  document.documentElement.dataset.theme = resolveEffective(pref);
-  listeners.forEach((l) => l());
-}
-
-const LABEL: Record<Preference, string> = {
+const LABEL: Record<ThemePreference, string> = {
   system: "システム設定に追従",
   light: "ライトモード",
   dark: "ダークモード",
 };
 
 export function ThemeToggle() {
-  const pref = useSyncExternalStore(
-    subscribe,
-    getSnapshot,
-    getServerSnapshot,
-  );
-
-  // system 選択中は OS 設定の変化に追従する（昼夜の自動切替など）。setState は行わない。
-  useEffect(() => {
-    if (pref !== "system") return;
-    const mq = window.matchMedia("(prefers-color-scheme: dark)");
-    const onChange = () => {
-      document.documentElement.dataset.theme = mq.matches ? "dark" : "light";
-    };
-    mq.addEventListener("change", onChange);
-    return () => mq.removeEventListener("change", onChange);
-  }, [pref]);
+  const pref = useThemePreference();
 
   function cycle() {
-    setPreference(ORDER[(ORDER.indexOf(pref) + 1) % ORDER.length]);
+    setThemePreference(ORDER[(ORDER.indexOf(pref) + 1) % ORDER.length]);
   }
 
   return (
@@ -99,7 +36,7 @@ export function ThemeToggle() {
   );
 }
 
-function ThemeIcon({ kind }: { kind: Preference }) {
+function ThemeIcon({ kind }: { kind: ThemePreference }) {
   const common = {
     width: 16,
     height: 16,

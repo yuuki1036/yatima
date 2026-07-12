@@ -6,6 +6,7 @@ import { getSession } from "@/lib/auth/session";
 import { SiteNav } from "./_components/site-nav";
 import { ThemeToggle } from "./_components/theme-toggle";
 import { LogoutButton } from "./_components/logout-button";
+import { Toaster } from "./_components/toaster";
 
 // 描画前に preference を effective(light/dark) に解決して <html data-theme> をセットする。
 // React hydration より前に同期実行され、FOUC（一瞬のライト→ダークのちらつき）を防ぐ。
@@ -80,6 +81,7 @@ export default async function RootLayout({
         <main className="mx-auto w-full max-w-3xl flex-1 px-4 py-8">
           {children}
         </main>
+        <Toaster />
       </body>
     </html>
   );

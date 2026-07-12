@@ -15,13 +15,14 @@ import {
   NOTABLE_SOURCE_COUNT,
 } from "@/lib/feeds/discovery-display";
 import {
-  addFeed,
   approveFeedCandidate,
   deactivateFeed,
   deleteFeed,
   reactivateFeed,
   rejectFeedCandidate,
 } from "../actions";
+import { AddFeedForm } from "./_components/add-feed-form";
+import { FeedActionButton } from "./_components/feed-action-button";
 
 export const dynamic = "force-dynamic";
 
@@ -87,18 +88,7 @@ export default async function FeedsPage() {
         </span>
       </div>
 
-      <form action={addFeed} className="mb-6 flex">
-        <input
-          type="url"
-          name="url"
-          required
-          placeholder="https://example.com/feed.xml"
-          className="flex-1 border border-border bg-surface px-3 py-2 font-mono text-sm outline-none focus:border-accent"
-        />
-        <button className="border border-l-0 border-border bg-accent px-5 py-2 font-mono text-sm font-semibold tracking-widest text-accent-foreground transition-opacity hover:opacity-90">
-          ADD
-        </button>
-      </form>
+      <AddFeedForm />
 
       {errorMsg && (
         <div className="mb-4 border-l-2 border-accent bg-surface px-4 py-3 text-sm text-foreground">
@@ -145,13 +135,15 @@ export default async function FeedsPage() {
                     ))}
                   </div>
                 </div>
-                <form action={deactivateFeed} className="shrink-0">
-                  <input type="hidden" name="id" value={s.id} />
-                  {/* 非活性化は可逆操作なので muted。赤(accent)は破壊的な「削除」に予約し一覧側と様式を揃える。 */}
-                  <button className="border border-border px-2.5 py-1 font-mono text-xs tracking-wide text-muted transition-colors hover:bg-surface">
-                    非活性化
-                  </button>
-                </form>
+                {/* 非活性化は可逆操作なので muted。赤(accent)は破壊的な「削除」に予約し一覧側と様式を揃える。 */}
+                <FeedActionButton
+                  id={s.id}
+                  action={deactivateFeed}
+                  successMsg="非活性化しました"
+                  className="shrink-0 border border-border px-2.5 py-1 font-mono text-xs tracking-wide text-muted transition-colors hover:bg-surface disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  非活性化
+                </FeedActionButton>
               </li>
             ))}
           </ul>
@@ -231,18 +223,22 @@ export default async function FeedsPage() {
                   </div>
                 </div>
                 <div className="flex shrink-0 gap-1.5">
-                  <form action={approveFeedCandidate}>
-                    <input type="hidden" name="id" value={c.id} />
-                    <button className="border border-border px-2.5 py-1 font-mono text-xs tracking-wide text-accent transition-colors hover:bg-accent hover:text-accent-foreground">
-                      承認
-                    </button>
-                  </form>
-                  <form action={rejectFeedCandidate}>
-                    <input type="hidden" name="id" value={c.id} />
-                    <button className="border border-border px-2.5 py-1 font-mono text-xs tracking-wide text-muted transition-colors hover:bg-surface">
-                      却下
-                    </button>
-                  </form>
+                  <FeedActionButton
+                    id={c.id}
+                    action={approveFeedCandidate}
+                    successMsg="承認しました"
+                    className="border border-border px-2.5 py-1 font-mono text-xs tracking-wide text-accent transition-colors hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    承認
+                  </FeedActionButton>
+                  <FeedActionButton
+                    id={c.id}
+                    action={rejectFeedCandidate}
+                    successMsg="却下しました"
+                    className="border border-border px-2.5 py-1 font-mono text-xs tracking-wide text-muted transition-colors hover:bg-surface disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    却下
+                  </FeedActionButton>
                 </div>
               </li>
             ))}
@@ -282,18 +278,22 @@ export default async function FeedsPage() {
                 </div>
               </div>
               <div className="flex shrink-0 gap-1.5">
-                <form action={f.active ? deactivateFeed : reactivateFeed}>
-                  <input type="hidden" name="id" value={f.id} />
-                  <button className="border border-border px-2.5 py-1 font-mono text-xs tracking-wide text-muted transition-colors hover:bg-surface">
-                    {f.active ? "非活性化" : "復活"}
-                  </button>
-                </form>
-                <form action={deleteFeed}>
-                  <input type="hidden" name="id" value={f.id} />
-                  <button className="border border-border px-2.5 py-1 font-mono text-xs tracking-wide text-accent transition-colors hover:bg-accent hover:text-accent-foreground">
-                    削除
-                  </button>
-                </form>
+                <FeedActionButton
+                  id={f.id}
+                  action={f.active ? deactivateFeed : reactivateFeed}
+                  successMsg={f.active ? "非活性化しました" : "復活しました"}
+                  className="border border-border px-2.5 py-1 font-mono text-xs tracking-wide text-muted transition-colors hover:bg-surface disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {f.active ? "非活性化" : "復活"}
+                </FeedActionButton>
+                <FeedActionButton
+                  id={f.id}
+                  action={deleteFeed}
+                  successMsg="削除しました"
+                  className="border border-border px-2.5 py-1 font-mono text-xs tracking-wide text-accent transition-colors hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  削除
+                </FeedActionButton>
               </div>
             </li>
           ))}
