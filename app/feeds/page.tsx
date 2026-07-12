@@ -11,6 +11,7 @@ import {
   credibilityLevel,
   CREDIBILITY_LABELS,
   discoverySourceCount,
+  discoveryPreferenceLabel,
   NOTABLE_SOURCE_COUNT,
 } from "@/lib/feeds/discovery-display";
 import {
@@ -168,7 +169,7 @@ export default async function FeedsPage() {
             </span>
           </div>
           <p className="mb-3 text-xs text-muted">
-            記事リンクから自動発見した候補。承認すると購読フィードに加わります（信頼度は低めの初期値で開始）。
+            記事リンクや興味のあるテーマから自動発見した候補。承認すると購読フィードに加わります（信頼度は低めの初期値で開始）。
           </p>
           <ul className="border-t border-line">
             {candidates.map((c) => (
@@ -214,6 +215,16 @@ export default async function FeedsPage() {
                           className={`border border-border px-1.5 py-0.5 font-mono text-[10px] tracking-wide tabular-nums ${tone}`}
                         >
                           {n} 媒体が参照
+                        </span>
+                      );
+                    })()}
+                    {(() => {
+                      // 方式②（嗜好ベース提案）候補は発見経路（起点テーマ）を出す。
+                      const label = discoveryPreferenceLabel(c.discovered_from);
+                      if (label === null) return null;
+                      return (
+                        <span className="border border-border px-1.5 py-0.5 font-mono text-[10px] tracking-wide text-faint">
+                          {label} から発見
                         </span>
                       );
                     })()}

@@ -1,7 +1,11 @@
 // 情報源の自動発見（YAT-16）の承認 UI 向け表示ヘルパー（YAT-26）。
 // 承認/却下の判断材料を候補行に出すための純粋関数。ランキング計算には使わない。
 
-import { parseArticleLinksSourceCount } from "./discovered-from";
+import {
+  parseArticleLinksSourceCount,
+  parsePreferenceTagSlug,
+} from "./discovered-from";
+import { tagLabel } from "@/lib/tags/vocabulary";
 
 export type CredibilityLevel = "high" | "mid" | "low";
 
@@ -29,3 +33,14 @@ export const discoverySourceCount = parseArticleLinksSourceCount;
 
 // 参照元ソース数が 2 以上なら「複数の独立ソースが参照」＝相対的に強いシグナルとして強調する。
 export const NOTABLE_SOURCE_COUNT = 2;
+
+// 方式②（嗜好ベース提案・YAT-38）候補の発見経路ラベルを返す。discovered_from が方式②の
+// フォーマットなら起点タグの日本語ラベル（例「AI・機械学習」）を、そうでなければ null を返す。
+// 承認 UI で「{ラベル} から発見」バッジを出し、方式①（媒体参照数）と発見経路を出し分ける。
+// tagLabel は未知 slug をそのまま返すため、語彙外でも表示は壊れない。
+export function discoveryPreferenceLabel(
+  discoveredFrom: string | null,
+): string | null {
+  const slug = parsePreferenceTagSlug(discoveredFrom);
+  return slug === null ? null : tagLabel(slug);
+}

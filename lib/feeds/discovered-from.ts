@@ -27,3 +27,27 @@ export function parseArticleLinksSourceCount(
   const n = Number(m[1]);
   return Number.isFinite(n) && n > 0 ? n : null;
 }
+
+// 方式②（嗜好ベース提案・YAT-38）の provenance プレフィックス。方式①と同じ discovered_from 列を
+// 共有するため、パース側は接頭辞で方式を判別する。方式②の値は「どのタグ嗜好テーマを起点に
+// 検索したか」を表し、承認 UI に「{テーマ} から発見」と出す判断材料になる。
+const PREFERENCE_PREFIX = "preference:";
+
+// 方式②の discovered_from 文字列を組み立てる。
+// tagSlug = 検索起点にしたタグ嗜好の leaf slug（例: "tech/ai"）。
+export function formatPreferenceProvenance(tagSlug: string): string {
+  return `${PREFERENCE_PREFIX}${tagSlug}`;
+}
+
+// discovered_from から方式②の起点タグ slug を取り出す。方式②のプレフィックスに合致し、
+// 続きが非空のときだけ slug 文字列を返す。想定外フォーマット・欠損は null。
+// slug の語彙妥当性（isTagSlug）は表示層に委ね、ここは文字列契約の判定だけに絞る。
+export function parsePreferenceTagSlug(
+  discoveredFrom: string | null,
+): string | null {
+  if (!discoveredFrom || !discoveredFrom.startsWith(PREFERENCE_PREFIX)) {
+    return null;
+  }
+  const slug = discoveredFrom.slice(PREFERENCE_PREFIX.length).trim();
+  return slug.length > 0 ? slug : null;
+}
