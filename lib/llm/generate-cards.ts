@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { extractJsonArray } from "./extract-json-array";
 
 // YAT-17: read 済み・useful な記事から学習カード候補を生成する（Module① 前半）。
 // 責務は「生成」のみ。grounding 照合・形式検証・dedup は lib/learn/card-gate.ts が決定的に行う
@@ -46,23 +47,11 @@ export interface CardGenerator {
   generate(input: GenerateCardsInput): Promise<GeneratedCard[]>;
 }
 
-// LLM 出力（JSON 配列）を頑健にパースして GeneratedCard[] に正規化する。
-// parse-annotation.ts と同方針: コードフェンス除去 → 最初の [ から最後の ] を抽出 → JSON.parse。
-// 必須欠落（source_quote 空・type 不正）の要素は捨てる（fail-soft）。
+// LLM 出力（JSON 配列）を頑健にパースして GeneratedCard[] に正規化する。配列抽出は extractJsonArray
+// に委譲し、必須欠落（source_quote 空・type 不正）の要素は捨てる（fail-soft）。
 export function parseGeneratedCards(raw: string): GeneratedCard[] {
-  if (!raw) return [];
-  const cleaned = raw.replace(/```(?:json)?/gi, "").trim();
-  const start = cleaned.indexOf("[");
-  const end = cleaned.lastIndexOf("]");
-  if (start === -1 || end === -1 || end <= start) return [];
-
-  let arr: unknown;
-  try {
-    arr = JSON.parse(cleaned.slice(start, end + 1));
-  } catch {
-    return [];
-  }
-  if (!Array.isArray(arr)) return [];
+  const arr = extractJsonArray(raw);
+  if (!arr) return [];
 
   const out: GeneratedCard[] = [];
   for (const item of arr) {

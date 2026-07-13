@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { extractJsonArray } from "./extract-json-array";
 
 // YAT-32: 学習クイズの知識ソース（公式 docs・定番解説）の URL を LLM に提案させる。
 // 責務は「候補 URL を出す」だけ。出力は一切信頼せず、URL は必ず fetch＋本文抽出の検証ゲート
@@ -53,23 +54,12 @@ function buildSystemPrompt(input: ProposeSourcesInput): string {
     .join("\n");
 }
 
-// LLM 出力（JSON 配列）を頑健にパースする。フェンス除去 → [ から ] を抽出 → JSON.parse →
-// 要素ごとに url/title/rationale を検証。url が http(s) でない・空要素は捨てる（fail-soft）。
+// LLM 出力（JSON 配列）から要素ごとに url/title/rationale を検証する。配列抽出は extractJsonArray に
+// 委譲し、url が http(s) でない・空要素は捨てる（fail-soft）。
 // ※ ここは形式チェックのみ。URL の実在性は検証ゲート（fetch）が担う。
 export function parseProposedSources(raw: string): ProposedSource[] {
-  if (!raw) return [];
-  const cleaned = raw.replace(/```(?:json)?/gi, "").trim();
-  const start = cleaned.indexOf("[");
-  const end = cleaned.lastIndexOf("]");
-  if (start === -1 || end === -1 || end <= start) return [];
-
-  let arr: unknown;
-  try {
-    arr = JSON.parse(cleaned.slice(start, end + 1));
-  } catch {
-    return [];
-  }
-  if (!Array.isArray(arr)) return [];
+  const arr = extractJsonArray(raw);
+  if (!arr) return [];
 
   const out: ProposedSource[] = [];
   for (const item of arr) {

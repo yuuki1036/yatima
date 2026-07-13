@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { TAG_VOCAB_PROMPT } from "@/lib/tags/vocabulary";
+import { extractJsonArray } from "./extract-json-array";
 
 // YAT-27: 記事本文から選択式（MCQ）の学習クイズ候補を生成する（適応クイズ MVP）。
 // 責務は「生成」のみ。形式検証・concept 正規化・grounding 逐語照合・insert は lib/learn/quiz-gate.ts
@@ -69,23 +70,11 @@ function buildSystemPrompt(input: GenerateQuizInput): string {
   ].join("\n");
 }
 
-// LLM 出力（JSON 配列）を頑健にパースして GeneratedMCQ[] に正規化する。
-// generate-cards.parseGeneratedCards と同方針: フェンス除去 → [ から ] を抽出 → JSON.parse →
-// 要素ごとに必須フィールドを個別バリデーションし、不正要素は捨てる（fail-soft）。
+// LLM 出力（JSON 配列）を頑健にパースして GeneratedMCQ[] に正規化する。配列抽出は extractJsonArray に
+// 委譲し、要素ごとに必須フィールドを個別バリデーションして不正要素は捨てる（fail-soft）。
 export function parseGeneratedMCQs(raw: string): GeneratedMCQ[] {
-  if (!raw) return [];
-  const cleaned = raw.replace(/```(?:json)?/gi, "").trim();
-  const start = cleaned.indexOf("[");
-  const end = cleaned.lastIndexOf("]");
-  if (start === -1 || end === -1 || end <= start) return [];
-
-  let arr: unknown;
-  try {
-    arr = JSON.parse(cleaned.slice(start, end + 1));
-  } catch {
-    return [];
-  }
-  if (!Array.isArray(arr)) return [];
+  const arr = extractJsonArray(raw);
+  if (!arr) return [];
 
   const out: GeneratedMCQ[] = [];
   for (const item of arr) {
