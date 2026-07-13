@@ -1,25 +1,22 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import Parser from "rss-parser";
 import { isPubliclyRoutableHttpUrl } from "@/lib/net/ssrf";
+import { safeFetchText } from "@/lib/net/safe-fetch";
 
 // 情報源の自動発見（YAT-16）の検証ゲート。方式①（記事リンク発掘）/ 方式②（嗜好ベース提案）
 // のどのフロントも、最終的に「候補サイト → autodiscovery → RSS パース成功で feed 実在確認 →
 // eTLD+1 で既存 feeds と重複排除 → 承認待ちで feed_candidates に登録」の同一ゲートに収束する。
 // LLM に feed URL を直接生成させず、実在する feed だけを通すのがこのゲートの役割。
 // フロントは差し替え可能にし、本ファイルは候補サイト URL を受け取る形に保つ。
+// 外部 URL の取得はすべて safeFetchText（manual redirect + 各ホップ SSRF 再検証）に寄せる。
 
-const UA = "Mozilla/5.0 (compatible; yatima/1.0; +personal use)";
 const FETCH_TIMEOUT_MS = 12_000; // root HTML 取得
 const PROBE_TIMEOUT_MS = 6_000; // 探索の RSS 検証。本番取得(parser.ts 15s)より短くし dead サイトの滞留を防ぐ
 const DISCOVER_CONCURRENCY = 4;
 
-// 探索専用の rss-parser。UA とタイムアウトを root 取得（fetch）と揃える。
-// parser.ts（fetchAndParse）を共有すると UA が rss-reader/0.1・timeout が 15s へ化け、
-// 同一発見フロー内で UA/timeout が二系統に割れる不整合があったため自前インスタンスにする。
-const feedParser = new Parser({
-  timeout: PROBE_TIMEOUT_MS,
-  headers: { "User-Agent": UA },
-});
+// 探索専用の rss-parser。ネットワーク取得は safeFetchText が担い、この parser は取得済み XML の
+// parseString だけに使う（parseURL は内部でリダイレクトを再検証せず追従するため使わない）。
+const feedParser = new Parser();
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
@@ -135,13 +132,16 @@ function extractFeedLinks(html: string, baseUrl: string): string[] {
   return links;
 }
 
-// 候補 URL を RSS としてパースできれば「実在する feed」と判定する。
-// 404・非フィード HTML・タイムアウトは rss-parser が throw するので catch で null に倒す。
+// 候補 URL を RSS としてパースできれば「実在する feed」と判定する。取得は safeFetchText で
+// manual redirect + SSRF 再検証を通し、取れた XML だけを parseString に渡す。
+// 404・非フィード HTML・タイムアウトは fetch/parse が throw するので catch で null に倒す。
 async function validateFeed(
   url: string,
 ): Promise<{ title: string | null; siteUrl: string | null } | null> {
   try {
-    const parsed = await feedParser.parseURL(url);
+    const fetched = await safeFetchText(url, { timeoutMs: PROBE_TIMEOUT_MS });
+    if (!fetched) return null;
+    const parsed = await feedParser.parseString(fetched.text);
     const hasItems = (parsed.items?.length ?? 0) > 0;
     // title も items も無いものは feed の体を成さないので不採用。
     if (!parsed.title && !hasItems) return null;
@@ -165,16 +165,12 @@ export async function discoverFeedsForSite(
   const origin = safe.origin;
   const sourceDomain = eTLDPlusOne(safe.hostname);
 
-  // ① root HTML から宣言された feed リンク（fail-soft: 取得失敗時はサブパス探索へ）
+  // ① root HTML から宣言された feed リンク（fail-soft: 取得失敗時はサブパス探索へ）。
+  // 取得は safeFetchText 経由で manual redirect + 各ホップ SSRF 再検証を通す。
   let headLinks: string[] = [];
   try {
-    const res = await fetch(origin, {
-      headers: { "user-agent": UA },
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-    });
-    if (res.ok) {
-      headLinks = extractFeedLinks(await res.text(), origin);
-    }
+    const fetched = await safeFetchText(origin, { timeoutMs: FETCH_TIMEOUT_MS });
+    if (fetched) headLinks = extractFeedLinks(fetched.text, origin);
   } catch (e) {
     // root が落ちていてもサブパスが生きていることがあるので探索は続ける（理由は残す）
     console.warn(`[discover] root 取得失敗: ${origin}: ${errMsg(e)}`);
