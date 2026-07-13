@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import type { TavilyResult } from "@/lib/rss/tavily";
+import { extractJsonArray } from "./extract-json-array";
 import { sanitizeTitle } from "./sanitize";
 
 // 情報源の自動発見（YAT-38）方式②の LLM 選別層。Tavily の検索結果から「継続購読する価値の
@@ -54,22 +55,11 @@ function buildUserText(candidates: TavilyResult[]): string {
     .join("\n\n");
 }
 
-// LLM 出力（URL 文字列の JSON 配列）を頑健にパースする。フェンス除去 → [ から ] → JSON.parse →
-// 文字列要素のみ拾う。実在性・一覧包含は呼び出し側の決定的ガードが担う（ここは形式段）。
+// LLM 出力（URL 文字列の JSON 配列）から文字列要素のみ拾う。配列抽出は extractJsonArray に委譲し、
+// ここは文字列要素の検証だけを担う。実在性・一覧包含は呼び出し側の決定的ガードが担う（ここは形式段）。
 export function parseSelectedUrls(raw: string): string[] {
-  if (!raw) return [];
-  const cleaned = raw.replace(/```(?:json)?/gi, "").trim();
-  const start = cleaned.indexOf("[");
-  const end = cleaned.lastIndexOf("]");
-  if (start === -1 || end === -1 || end <= start) return [];
-
-  let arr: unknown;
-  try {
-    arr = JSON.parse(cleaned.slice(start, end + 1));
-  } catch {
-    return [];
-  }
-  if (!Array.isArray(arr)) return [];
+  const arr = extractJsonArray(raw);
+  if (!arr) return [];
 
   const out: string[] = [];
   for (const v of arr) {
