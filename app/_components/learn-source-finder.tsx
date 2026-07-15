@@ -34,6 +34,7 @@ export function LearnSourceFinder({ categories, action }: Props) {
         name="category"
         defaultValue={categories[0]?.slug}
         disabled={pending}
+        aria-label="探索するカテゴリ"
         className="border border-border bg-background px-2 py-1.5 font-mono text-xs tracking-wide text-foreground disabled:opacity-50"
       >
         {categories.map((c) => (
@@ -46,7 +47,8 @@ export function LearnSourceFinder({ categories, action }: Props) {
         type="text"
         name="hint"
         maxLength={100}
-        placeholder="絞り込み（任意・例: TypeScript, React）"
+        aria-label="絞り込みキーワード（任意）"
+        placeholder="例: TypeScript, React"
         disabled={pending}
         className="min-w-0 flex-1 border border-border bg-background px-2 py-1.5 font-mono text-xs tracking-wide text-foreground placeholder:text-faint disabled:opacity-50"
       />
