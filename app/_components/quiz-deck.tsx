@@ -228,14 +228,21 @@ export function QuizDeck({
                 disabled={answered}
                 className={cls}
               >
-                {/* 正誤は色だけに頼らず記号でも示す（色覚差配慮・回答後の一目瞭然）。 */}
+                {/* 正誤は色だけに頼らず記号でも示す（色覚差配慮・回答後の一目瞭然）。
+                    role="img" は aria-label を仕様上有効にするために要る。素の span は
+                    generic ロールで、ARIA 1.2 では name prohibited のため aria-label を
+                    無視する実装がありうる（Chrome は採用するが、依存しない）。 */}
                 {answered && isAnswer && (
-                  <span aria-label="正解" className="mr-1 font-bold">
+                  <span role="img" aria-label="正解" className="mr-1 font-bold">
                     ✓
                   </span>
                 )}
                 {answered && isChosen && !isAnswer && (
-                  <span aria-label="不正解" className="mr-1 font-bold">
+                  <span
+                    role="img"
+                    aria-label="不正解"
+                    className="mr-1 font-bold"
+                  >
                     ✗
                   </span>
                 )}
