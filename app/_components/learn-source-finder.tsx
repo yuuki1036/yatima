@@ -48,7 +48,7 @@ export function LearnSourceFinder({ categories, action }: Props) {
         name="hint"
         maxLength={100}
         aria-label="絞り込みキーワード（任意）"
-        placeholder="絞り込み（任意・例: TypeScript, React）"
+        placeholder="例: TypeScript, React"
         disabled={pending}
         className="min-w-0 flex-1 border border-border bg-background px-2 py-1.5 font-mono text-xs tracking-wide text-foreground placeholder:text-faint disabled:opacity-50"
       />
