@@ -53,8 +53,10 @@ export function SaveActions({
         }
         disabled={pending}
         aria-busy={pending}
+        aria-label="お気に入り"
+        aria-pressed={isStarred}
         className={`${btn} ${isStarred ? "text-accent" : ""}`}
-        title="スター"
+        title={isStarred ? "お気に入りから外す" : "後で読む（お気に入り）"}
       >
         {isStarred ? "★" : "☆"}
       </button>
