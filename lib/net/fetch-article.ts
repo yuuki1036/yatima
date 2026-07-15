@@ -27,7 +27,7 @@ export async function fetchAndExtractArticle(
     timeoutMs: FETCH_TIMEOUT_MS,
     allowContentType: HTML_CONTENT_TYPE,
   });
-  if (!fetched) return null;
+  if (!fetched.ok) return null; // 理由は使わず fail-soft（本文が無い記事は要約側が許容する）
 
   const article = await extractFromHtml(fetched.text, fetched.finalUrl);
   const contentHtml = article?.content ?? "";

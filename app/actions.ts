@@ -283,6 +283,7 @@ export async function refreshNow(): Promise<RefreshState> {
   try {
     let inserted = 0;
     let annotated = 0;
+    let failed = 0;
     if (!onCooldown) {
       // ── 取得・要約パイプライン（fail-soft の各段はそのまま流す。embed は除外）。
       // ガードを先に前進させる（成否・0件取得に関わらず cooldown を消費し、失敗連打のすり抜けを塞ぐ。
@@ -298,6 +299,15 @@ export async function refreshNow(): Promise<RefreshState> {
       );
       const results = await ingestAllFeeds(supabase);
       inserted = results.reduce((n, r) => n + (r.error ? 0 : r.inserted), 0);
+      // 失敗理由は捨てず server ログに残す（cron の scripts/ingest.ts と揃える）。捨てると、
+      // 全 feed が落ちても curate が既存プールから補充して ok:true になり、無言で沈む。
+      // YAT-49 で取得の失敗モード（ガード不通過・リダイレクト超過・サイズ超過）が増えた分ここが効く。
+      for (const r of results) {
+        if (r.error) {
+          failed += 1;
+          console.warn(`[refreshNow] 取得失敗 ${r.feedUrl}: ${r.error}`);
+        }
+      }
       await enrichMissingBodies(supabase);
       const a = await annotateMissing(supabase, {
         limit: MANUAL_ANNOTATE_LIMIT,
@@ -316,9 +326,10 @@ export async function refreshNow(): Promise<RefreshState> {
       const mins = Math.ceil((REFRESH_COOLDOWN_MS - elapsed) / 60_000);
       return { ok: true, message: `${deck}（新規取得は約${mins}分後）` };
     }
+    // 失敗は 0 件のとき黙る（「失敗 0」は常時ノイズ）。出た時だけ件数を見せ、理由は server ログへ。
     return {
       ok: true,
-      message: `取得 +${inserted} / 要約 ${annotated} / ${deck}`,
+      message: `取得 +${inserted}${failed ? `（失敗 ${failed}）` : ""} / 要約 ${annotated} / ${deck}`,
     };
   } catch (e) {
     console.warn("refreshNow 失敗:", e);
