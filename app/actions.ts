@@ -3,6 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { after } from "next/server";
 import { requireSession } from "@/lib/auth/session";
+import { isPubliclyRoutableHttpUrl } from "@/lib/net/ssrf";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { recordFeedback } from "@/lib/ranking/feedback";
 import { FEEDBACK_WEIGHT } from "@/lib/ranking/preferences";
@@ -53,8 +54,17 @@ export async function addFeed(
   formData: FormData,
 ): Promise<AddFeedState> {
   await requireSession();
-  const url = String(formData.get("url") ?? "").trim();
-  if (!url) return { ok: false, message: "URL を入力してください。" };
+  const raw = String(formData.get("url") ?? "").trim();
+  if (!raw) return { ok: false, message: "URL を入力してください。" };
+  // client の type="url" は直 POST で迂回できるため server 側でも検証する（YAT-50）。ingest が
+  // 取得時に通すのと同じガードを使い、パース不能・非 http(s)・内部レンジを入口で弾く。
+  // 保存するのは WHATWG 正規化後の href（scheme/host の小文字化・既定ポート除去まで。www や
+  // 末尾スラッシュは畳まないので、normalize-url.ts の normalizeUrl ほど強い正規化ではない）。
+  const parsed = isPubliclyRoutableHttpUrl(raw);
+  if (!parsed) {
+    return { ok: false, message: "http(s) の公開 URL を入力してください。" };
+  }
+  const url = parsed.href;
   const supabase = createAdminClient();
   const { error } = await supabase
     .from("feeds")
