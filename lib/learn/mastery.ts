@@ -130,8 +130,9 @@ function isEligible(last: LastAttempt | undefined, nowMs: number): boolean {
   return days >= (last.isCorrect ? RETRY_CORRECT_DAYS : RETRY_WRONG_DAYS);
 }
 
-// 1 問のスコア = 弱点度 × 間隔ボーナス × レベル一致 × jitter。rng は注入で pure 性を保つ。
-function scoreQuestion(
+// 1 問のスコア = 弱点度 × 間隔ボーナス × レベル一致 × jitter。rng は注入で pure 性を保つ
+// （export は YAT-53 のユニットテスト用。選定本体は selectSessionQuestions が唯一の呼び出し元）。
+export function scoreQuestion(
   q: QuizQuestion,
   masteryMap: Map<string, MasteryRow>,
   nowMs: number,
