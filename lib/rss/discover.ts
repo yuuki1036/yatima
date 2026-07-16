@@ -140,7 +140,9 @@ async function validateFeed(
 ): Promise<{ title: string | null; siteUrl: string | null } | null> {
   try {
     const fetched = await safeFetchText(url, { timeoutMs: PROBE_TIMEOUT_MS });
-    if (!fetched) return null;
+    // 理由は使わず捨てる: 1 サイトにつき head リンク＋サブパス 13 本を probe し大半が 404 なので、
+    // ログに出すと溢れる（root 取得と違い件数が読めない）。
+    if (!fetched.ok) return null;
     const parsed = await feedParser.parseString(fetched.text);
     const hasItems = (parsed.items?.length ?? 0) > 0;
     // title も items も無いものは feed の体を成さないので不採用。
@@ -170,7 +172,9 @@ export async function discoverFeedsForSite(
   let headLinks: string[] = [];
   try {
     const fetched = await safeFetchText(origin, { timeoutMs: FETCH_TIMEOUT_MS });
-    if (fetched) headLinks = extractFeedLinks(fetched.text, origin);
+    if (fetched.ok) headLinks = extractFeedLinks(fetched.text, origin);
+    // root は 1 サイト 1 回なので理由を出す（validateFeed の probe と違いログが溢れない）。
+    else console.warn(`[discover] root 取得失敗: ${origin}: ${fetched.reason}`);
   } catch (e) {
     // root が落ちていてもサブパスが生きていることがあるので探索は続ける（理由は残す）
     console.warn(`[discover] root 取得失敗: ${origin}: ${errMsg(e)}`);
