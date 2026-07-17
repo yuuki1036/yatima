@@ -1,5 +1,10 @@
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import type { Feed } from "@/lib/types";
+import { loadSourcePrefs } from "@/lib/ranking/preferences";
+import {
+  computeRetireSuggestions,
+  type RetireSuggestion,
+} from "@/lib/ranking/feed-health";
+import type { Feed, FeedCandidate } from "@/lib/types";
 import { AddFeedForm } from "./_components/add-feed-form";
 import { RetireSuggestionsSection } from "./_components/retire-suggestions-section";
 import { DiscoveredCandidatesSection } from "./_components/discovered-candidates-section";
@@ -7,20 +12,53 @@ import { FeedsListSection } from "./_components/feeds-list-section";
 
 export const dynamic = "force-dynamic";
 
-// /feeds はソース管理画面。共有データ（feeds）とページ全体のエラー/空状態だけをここで束ね、
-// 独立した 3 セクション（退役提案 / 発見候補 / 一覧）は各 Server Component に委譲する（YAT-51）。
+// /feeds はソース管理画面。取得とエラー処理はこの page が一手に引き受け、独立した 3 セクション
+// （退役提案 / 発見候補 / 一覧）へは描画だけを委譲する（YAT-51）。
+// 取得をセクション側に分散させると、①どれかの throw が page の catch を抜けて error.tsx に化ける
+// ②feeds 失敗時に他セクションだけ描かれる ③Promise.all の並列が直列に退化する、を招くため、
+// データの流れは意図して page に集約している。
 export default async function FeedsPage() {
   let feeds: Feed[] = [];
+  let candidates: FeedCandidate[] = [];
+  let suggestions: RetireSuggestion[] = [];
   let errorMsg: string | null = null;
 
   try {
     const supabase = await createSupabaseServerClient();
-    const feedsRes = await supabase
-      .from("feeds")
-      .select("*")
-      .order("created_at", { ascending: false });
+    const [feedsRes, candRes, sourcePrefs] = await Promise.all([
+      supabase
+        .from("feeds")
+        .select("*")
+        .order("created_at", { ascending: false }),
+      // 承認待ちの自動発見候補（YAT-16）。新しい順。
+      supabase
+        .from("feed_candidates")
+        .select("*")
+        .eq("status", "pending")
+        .order("created_at", { ascending: false }),
+      // 削除推奨のソース嗜好シグナル用。推奨はベストエフォートなので失敗は空 Map に倒す。
+      loadSourcePrefs(supabase).catch(() => new Map<string, number>()),
+    ]);
     if (feedsRes.error) throw feedsRes.error;
+    // 候補の取得失敗は致命ではない（feeds 一覧は出す）。枠だけ畳む。
     feeds = (feedsRes.data ?? []) as Feed[];
+    candidates = candRes.error ? [] : ((candRes.data ?? []) as FeedCandidate[]);
+
+    // 削除推奨（YAT-20）: active な feed だけを評価対象にする（非活性は既に退役済み）。
+    suggestions = computeRetireSuggestions(
+      feeds
+        .filter((f) => f.active)
+        .map((f) => ({
+          id: f.id,
+          title: f.title,
+          url: f.url,
+          created_at: f.created_at,
+          last_fetched_at: f.last_fetched_at,
+          credibility: f.credibility,
+          near_dup_rate: f.near_dup_rate,
+          sourcePref: sourcePrefs.get(f.id) ?? 0,
+        })),
+    );
   } catch (e) {
     errorMsg = e instanceof Error ? e.message : String(e);
   }
@@ -48,9 +86,9 @@ export default async function FeedsPage() {
         </div>
       )}
 
-      <RetireSuggestionsSection feeds={feeds} />
+      <RetireSuggestionsSection suggestions={suggestions} />
 
-      <DiscoveredCandidatesSection />
+      <DiscoveredCandidatesSection candidates={candidates} />
 
       {!errorMsg && feeds.length === 0 && (
         <p className="border border-line py-12 text-center text-sm text-muted">

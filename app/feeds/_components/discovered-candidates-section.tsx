@@ -1,4 +1,3 @@
-import { createSupabaseServerClient } from "@/lib/supabase/server";
 import type { FeedCandidate } from "@/lib/types";
 import {
   credibilityLevel,
@@ -10,19 +9,13 @@ import {
 import { approveFeedCandidate, rejectFeedCandidate } from "../../actions";
 import { FeedActionButton } from "./feed-action-button";
 
-// 承認待ちの自動発見候補（YAT-16）。取得失敗は致命ではない（feeds 一覧は出る）ので枠ごと畳む。
+// 承認待ちの自動発見候補（YAT-16）。取得と失敗時の畳み込みは page が行い、ここは描画に徹する。
 // 候補が無ければ何も描かない。
-export async function DiscoveredCandidatesSection() {
-  const supabase = await createSupabaseServerClient();
-  const candRes = await supabase
-    .from("feed_candidates")
-    .select("*")
-    .eq("status", "pending")
-    .order("created_at", { ascending: false });
-  const candidates: FeedCandidate[] = candRes.error
-    ? []
-    : ((candRes.data ?? []) as FeedCandidate[]);
-
+export function DiscoveredCandidatesSection({
+  candidates,
+}: {
+  candidates: FeedCandidate[];
+}) {
   if (candidates.length === 0) return null;
 
   return (

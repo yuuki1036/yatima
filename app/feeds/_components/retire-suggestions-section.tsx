@@ -1,38 +1,17 @@
-import { createSupabaseServerClient } from "@/lib/supabase/server";
-import { loadSourcePrefs } from "@/lib/ranking/preferences";
 import {
-  computeRetireSuggestions,
   RETIRE_REASON_LABELS,
+  type RetireSuggestion,
 } from "@/lib/ranking/feed-health";
-import type { Feed } from "@/lib/types";
 import { deactivateFeed } from "../../actions";
 import { FeedActionButton } from "./feed-action-button";
 
-// 削除推奨（YAT-20）: active な feed を 4 シグナルで評価し、退役候補を提示する。
-// feeds は /feeds の一覧と共有（page が取得）。ソース嗜好シグナルはこの section が自前取得する
-// （推奨はベストエフォートなので失敗は空 Map に倒す）。退役候補が無ければ何も描かない。
-export async function RetireSuggestionsSection({ feeds }: { feeds: Feed[] }) {
-  const activeFeeds = feeds.filter((f) => f.active);
-  if (activeFeeds.length === 0) return null;
-
-  const supabase = await createSupabaseServerClient();
-  const sourcePrefs = await loadSourcePrefs(supabase).catch(
-    () => new Map<string, number>(),
-  );
-
-  const suggestions = computeRetireSuggestions(
-    activeFeeds.map((f) => ({
-      id: f.id,
-      title: f.title,
-      url: f.url,
-      created_at: f.created_at,
-      last_fetched_at: f.last_fetched_at,
-      credibility: f.credibility,
-      near_dup_rate: f.near_dup_rate,
-      sourcePref: sourcePrefs.get(f.id) ?? 0,
-    })),
-  );
-
+// 削除推奨（YAT-20）: 4 シグナルで価値低下が疑われた feed を提示する。評価そのものは取得データと
+// 合わせて page が行い、ここは描画に徹する。退役候補が無ければ何も描かない。
+export function RetireSuggestionsSection({
+  suggestions,
+}: {
+  suggestions: RetireSuggestion[];
+}) {
   if (suggestions.length === 0) return null;
 
   return (
