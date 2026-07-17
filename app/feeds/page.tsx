@@ -1,31 +1,22 @@
 import { createSupabaseServerClient } from "@/lib/supabase/server";
-import { formatDateShort } from "@/lib/format";
 import { loadSourcePrefs } from "@/lib/ranking/preferences";
 import {
   computeRetireSuggestions,
-  RETIRE_REASON_LABELS,
   type RetireSuggestion,
 } from "@/lib/ranking/feed-health";
 import type { Feed, FeedCandidate } from "@/lib/types";
-import {
-  credibilityLevel,
-  CREDIBILITY_LABELS,
-  discoverySourceCount,
-  discoveryPreferenceLabel,
-  NOTABLE_SOURCE_COUNT,
-} from "@/lib/feeds/discovery-display";
-import {
-  approveFeedCandidate,
-  deactivateFeed,
-  deleteFeed,
-  reactivateFeed,
-  rejectFeedCandidate,
-} from "../actions";
 import { AddFeedForm } from "./_components/add-feed-form";
-import { FeedActionButton } from "./_components/feed-action-button";
+import { RetireSuggestionsSection } from "./_components/retire-suggestions-section";
+import { DiscoveredCandidatesSection } from "./_components/discovered-candidates-section";
+import { FeedsListSection } from "./_components/feeds-list-section";
 
 export const dynamic = "force-dynamic";
 
+// /feeds はソース管理画面。取得とエラー処理はこの page が一手に引き受け、独立した 3 セクション
+// （退役提案 / 発見候補 / 一覧）へは描画だけを委譲する（YAT-51）。
+// 取得をセクション側に分散させると、①どれかの throw が page の catch を抜けて error.tsx に化ける
+// ②feeds 失敗時に他セクションだけ描かれる ③Promise.all の並列が直列に退化する、を招くため、
+// データの流れは意図して page に集約している。
 export default async function FeedsPage() {
   let feeds: Feed[] = [];
   let candidates: FeedCandidate[] = [];
@@ -72,11 +63,6 @@ export default async function FeedsPage() {
     errorMsg = e instanceof Error ? e.message : String(e);
   }
 
-  // 非活性 feed は一覧末尾へ（active を先に、created_at 降順は各群内で維持）。
-  const orderedFeeds = [...feeds].sort(
-    (a, b) => Number(a.active === false) - Number(b.active === false),
-  );
-
   return (
     <div>
       <div className="mb-5 flex items-baseline justify-between">
@@ -100,151 +86,9 @@ export default async function FeedsPage() {
         </div>
       )}
 
-      {suggestions.length > 0 && (
-        <section className="mb-8">
-          <div className="mb-3 flex items-baseline justify-between">
-            <span className="font-mono text-xs font-medium tracking-widest text-accent">
-              RETIRE SUGGESTIONS
-            </span>
-            <span className="font-mono text-xs tracking-widest text-faint tabular-nums">
-              {String(suggestions.length).padStart(2, "0")}
-            </span>
-          </div>
-          <p className="mb-3 text-xs text-muted">
-            自動評価で価値低下が疑われるフィード。確認して非活性化できます（記事は残り、後で復活できます）。
-          </p>
-          <ul className="border-t border-line">
-            {suggestions.map((s) => (
-              <li
-                key={s.id}
-                className="flex items-start gap-3 border-b border-line py-4"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="font-semibold">{s.title ?? s.url}</div>
-                  <div className="mt-1 truncate font-mono text-xs text-muted">
-                    {s.url}
-                  </div>
-                  <div className="mt-1.5 flex flex-wrap gap-1.5">
-                    {s.reasons.map((r) => (
-                      <span
-                        key={r}
-                        className="border border-border px-1.5 py-0.5 font-mono text-[10px] tracking-wide text-accent"
-                      >
-                        {RETIRE_REASON_LABELS[r]}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-                {/* 非活性化は可逆操作なので muted。赤(accent)は破壊的な「削除」に予約し一覧側と様式を揃える。 */}
-                <FeedActionButton
-                  id={s.id}
-                  action={deactivateFeed}
-                  successMsg="非活性化しました"
-                  className="shrink-0 border border-border px-2.5 py-1 font-mono text-xs tracking-wide text-muted transition-colors hover:bg-surface disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  非活性化
-                </FeedActionButton>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
+      <RetireSuggestionsSection suggestions={suggestions} />
 
-      {candidates.length > 0 && (
-        <section className="mb-8">
-          <div className="mb-3 flex items-baseline justify-between">
-            <span className="font-mono text-xs font-medium tracking-widest text-accent">
-              DISCOVERED
-            </span>
-            <span className="font-mono text-xs tracking-widest text-faint tabular-nums">
-              {String(candidates.length).padStart(2, "0")}
-            </span>
-          </div>
-          <p className="mb-3 text-xs text-muted">
-            記事リンクや興味のあるテーマから自動発見した候補。承認すると購読フィードに加わります（信頼度は低めの初期値で開始）。
-          </p>
-          <ul className="border-t border-line">
-            {candidates.map((c) => (
-              <li
-                key={c.id}
-                className="flex items-start gap-3 border-b border-line py-4"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="font-semibold">{c.title ?? c.source_domain}</div>
-                  <div className="mt-1 truncate font-mono text-xs text-muted">
-                    {c.url}
-                  </div>
-                  <div className="mt-1 font-mono text-xs tracking-wide text-faint">
-                    {c.source_domain}
-                  </div>
-                  {/* 承認/却下の判断材料（YAT-26）: 信頼度の段階と、何媒体が参照していたか。 */}
-                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-                    {(() => {
-                      const level = credibilityLevel(c.credibility);
-                      // 低は控えめ(faint)、中は muted、高は accent で強調して段階を色でも示す。
-                      const tone =
-                        level === "high"
-                          ? "text-accent"
-                          : level === "mid"
-                            ? "text-muted"
-                            : "text-faint";
-                      return (
-                        <span
-                          className={`border border-border px-1.5 py-0.5 font-mono text-[10px] tracking-wide ${tone}`}
-                        >
-                          信頼度 {CREDIBILITY_LABELS[level]}
-                        </span>
-                      );
-                    })()}
-                    {(() => {
-                      const n = discoverySourceCount(c.discovered_from);
-                      if (n === null) return null;
-                      // 複数ソースからの参照は承認寄りの材料なので accent で強調する。
-                      const tone =
-                        n >= NOTABLE_SOURCE_COUNT ? "text-accent" : "text-faint";
-                      return (
-                        <span
-                          className={`border border-border px-1.5 py-0.5 font-mono text-[10px] tracking-wide tabular-nums ${tone}`}
-                        >
-                          {n} 媒体が参照
-                        </span>
-                      );
-                    })()}
-                    {(() => {
-                      // 方式②（嗜好ベース提案）候補は発見経路（起点テーマ）を出す。
-                      const label = discoveryPreferenceLabel(c.discovered_from);
-                      if (label === null) return null;
-                      return (
-                        <span className="border border-border px-1.5 py-0.5 font-mono text-[10px] tracking-wide text-faint">
-                          {label} から発見
-                        </span>
-                      );
-                    })()}
-                  </div>
-                </div>
-                <div className="flex shrink-0 gap-1.5">
-                  <FeedActionButton
-                    id={c.id}
-                    action={approveFeedCandidate}
-                    successMsg="承認しました"
-                    className="border border-border px-2.5 py-1 font-mono text-xs tracking-wide text-accent transition-colors hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    承認
-                  </FeedActionButton>
-                  <FeedActionButton
-                    id={c.id}
-                    action={rejectFeedCandidate}
-                    successMsg="却下しました"
-                    className="border border-border px-2.5 py-1 font-mono text-xs tracking-wide text-muted transition-colors hover:bg-surface disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    却下
-                  </FeedActionButton>
-                </div>
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
+      <DiscoveredCandidatesSection candidates={candidates} />
 
       {!errorMsg && feeds.length === 0 && (
         <p className="border border-line py-12 text-center text-sm text-muted">
@@ -252,53 +96,7 @@ export default async function FeedsPage() {
         </p>
       )}
 
-      {orderedFeeds.length > 0 && (
-        <ul className="border-t border-line">
-          {orderedFeeds.map((f) => (
-            <li
-              key={f.id}
-              className="flex items-start gap-4 border-b border-line py-4"
-            >
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <span className="font-semibold">{f.title ?? f.url}</span>
-                  {!f.active && (
-                    <span className="border border-border px-1.5 py-0.5 font-mono text-[10px] tracking-widest text-faint">
-                      INACTIVE
-                    </span>
-                  )}
-                </div>
-                <div className="mt-1 truncate font-mono text-xs text-muted">
-                  {f.url}
-                </div>
-                <div className="mt-1 font-mono text-xs tracking-wide text-faint">
-                  {f.last_fetched_at
-                    ? `LAST FETCH — ${formatDateShort(f.last_fetched_at)}`
-                    : "NOT FETCHED"}
-                </div>
-              </div>
-              <div className="flex shrink-0 gap-1.5">
-                <FeedActionButton
-                  id={f.id}
-                  action={f.active ? deactivateFeed : reactivateFeed}
-                  successMsg={f.active ? "非活性化しました" : "復活しました"}
-                  className="border border-border px-2.5 py-1 font-mono text-xs tracking-wide text-muted transition-colors hover:bg-surface disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {f.active ? "非活性化" : "復活"}
-                </FeedActionButton>
-                <FeedActionButton
-                  id={f.id}
-                  action={deleteFeed}
-                  successMsg="削除しました"
-                  className="border border-border px-2.5 py-1 font-mono text-xs tracking-wide text-accent transition-colors hover:bg-accent hover:text-accent-foreground disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  削除
-                </FeedActionButton>
-              </div>
-            </li>
-          ))}
-        </ul>
-      )}
+      <FeedsListSection feeds={feeds} />
     </div>
   );
 }
