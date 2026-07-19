@@ -16,15 +16,23 @@ const MAX_CONTENT_CHARS = 200_000; // 抽出後本文の保存上限（さらに
 // allowContentType のコメント参照（YAT-57）。
 const HTML_CONTENT_TYPE = /(text\/html|xhtml|text\/xml|application\/xml)/;
 
+// 本文抽出の対象とみなす Content-Type かどうか。feed 経路へ流用してはいけないことを
+// テストで固定するために述語として公開する（fetch-article.test.ts）。この正規表現は
+// application/rss+xml・application/atom+xml・application/rdf+xml にマッチせず、feed 取得に
+// 使うと実在 feed を弾くため（YAT-57 で本番 feed の 3/10 が落ちると実測）。
+export function isHtmlContentType(ctype: string): boolean {
+  return HTML_CONTENT_TYPE.test(ctype.toLowerCase());
+}
+
 export type FetchedArticle = {
   title: string | null;
   contentHtml: string; // article-extractor が抽出した本文 HTML（本文領域のみ）
 };
 
 // 失敗は理由つきで返す（safeFetchText の SafeFetchResult と同形）。この関数は enrich と
-// source-discovery が共有するプリミティブで、両者でログの適正粒度が違う（enrich は 1 実行 20 件で
-// 理由を出す価値があり、source-discovery は候補数が読めず出すと溢れる）。どちらに合わせても
-// 片方が損をするため、理由は返り値で配ってログ粒度は呼び出し側に決めさせる
+// source-discovery が共有するプリミティブで、呼び出し側ごとにログの適正粒度が違う（件数上限が
+// 読める経路は理由を出す価値があり、全件走査のような上限なしの経路は出すと溢れる）。ここで
+// 一律に決めるとどちらかが損をするため、理由は返り値で配ってログ粒度は呼び出し側に決めさせる
 // （[[shared-primitive-returns-reason-caller-logs]]・YAT-57）。
 export type FetchArticleResult =
   | { ok: true; article: FetchedArticle }
