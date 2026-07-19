@@ -26,15 +26,14 @@ export function isThinBody(content: string | null): boolean {
   return htmlToInputText(content).length < THIN_BODY_CHARS;
 }
 
-// 1 記事の本文をリンク先から取得して content_html を差し替える。差し替えたら新しい
 // 差し替えなかった場合は理由つきで返す。呼び出し側のログが「なぜ差し替わらなかったか」を
 // 語れるようにするため（[[shared-primitive-returns-reason-caller-logs]]・YAT-57）。
 export type EnrichBodyResult =
-  | { ok: true; content: string }
+  | { ok: true; content: string } // 差し替えた後の content_html
   | { ok: false; reason: string };
 
-// content_html を差し替える。URL 無し・SSRF ガードで弾かれた・取得本文が元と同等以下なら
-// ok:false を理由つきで返す（呼び出し側が成否を判定）。
+// 1 記事の本文をリンク先から取得して content_html を差し替える。URL 無し・SSRF ガードで
+// 弾かれた・取得失敗・取得本文が元と同等以下なら ok:false を理由つきで返す。
 // enrichMissingBodies（要約前バッチ）と再アノテート（YAT-13）の両方から再利用する。
 export async function enrichArticleBody(
   supabase: SupabaseClient,

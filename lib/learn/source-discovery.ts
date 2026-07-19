@@ -105,11 +105,20 @@ export async function discoverLearnSources(
     const settled = await Promise.allSettled(
       chunk.map(async (c) => {
         const fetched = await fetchAndExtractArticle(c.url);
-        // 理由は捨てる: LLM 提案の候補数が読めず、大半は取得失敗・薄いページで脱落するため
-        // ログに出すと溢れる（enrich と違い件数が固定されない）。
-        if (!fetched.ok) return null; // SSRF 弾き／取得失敗／本文空
-        if (extractedTextLength(fetched.article.contentHtml) < MIN_SOURCE_TEXT_CHARS) {
-          return null; // ナビだけ等の薄いページ
+        // 候補は PROPOSE_COUNT（5 件）が上限でログは溢れない。ここは user-facing の提案フローで、
+        // UI には「候補 N 件・検証通過 M 件」しか出ないため、脱落理由はサーバログにしか残せない。
+        // SSRF 弾き / 404 / 本文抽出不可を区別できないと「0 件」の原因を追えない（YAT-57）。
+        if (!fetched.ok) {
+          console.warn(`[learn] 候補を検証できず: ${c.url}: ${fetched.reason}`);
+          return null;
+        }
+        const textLen = extractedTextLength(fetched.article.contentHtml);
+        if (textLen < MIN_SOURCE_TEXT_CHARS) {
+          // ナビだけ等の薄いページ
+          console.warn(
+            `[learn] 候補が短すぎる: ${c.url}: ${textLen} < ${MIN_SOURCE_TEXT_CHARS} 文字`,
+          );
+          return null;
         }
         const row: PendingRow = {
           url: c.url,

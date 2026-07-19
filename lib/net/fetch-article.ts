@@ -1,5 +1,5 @@
 import { extractFromHtml } from "@extractus/article-extractor";
-import { HTML_CONTENT_TYPE, safeFetchText } from "@/lib/net/safe-fetch";
+import { safeFetchText } from "@/lib/net/safe-fetch";
 import { htmlToInputText } from "@/lib/llm/extract-text";
 
 // 外部 URL から本文を取得する共通処理（DB 非依存）。取得は safeFetchText（manual redirect + 各ホップ
@@ -10,6 +10,11 @@ import { htmlToInputText } from "@/lib/llm/extract-text";
 
 const FETCH_TIMEOUT_MS = 12_000; // リダイレクト追従を含む全体の時間予算
 const MAX_CONTENT_CHARS = 200_000; // 抽出後本文の保存上限（さらに念のため）
+// HTML 以外（画像/PDF 等）は本文抽出の対象外。明示された Content-Type がこれに合わなければ弾く。
+// RSS の記事リンクは PDF/画像を指すことが実際にあり、弾いても本文が薄いまま要約が続くだけなので
+// ここは絞る価値がある。他の safeFetchText 呼び出しが渡さない理由は safe-fetch.ts の
+// allowContentType のコメント参照（YAT-57）。
+const HTML_CONTENT_TYPE = /(text\/html|xhtml|text\/xml|application\/xml)/;
 
 export type FetchedArticle = {
   title: string | null;

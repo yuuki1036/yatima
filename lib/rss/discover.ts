@@ -1,7 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import Parser from "rss-parser";
 import { isPubliclyRoutableHttpUrl } from "@/lib/net/ssrf";
-import { HTML_CONTENT_TYPE, safeFetchText } from "@/lib/net/safe-fetch";
+import { safeFetchText } from "@/lib/net/safe-fetch";
 
 // 情報源の自動発見（YAT-16）の検証ゲート。方式①（記事リンク発掘）/ 方式②（嗜好ベース提案）
 // のどのフロントも、最終的に「候補サイト → autodiscovery → RSS パース成功で feed 実在確認 →
@@ -139,9 +139,9 @@ async function validateFeed(
   url: string,
 ): Promise<{ title: string | null; siteUrl: string | null } | null> {
   try {
-    // allowContentType では絞らない: feed の Content-Type は配信側で割れており（rss+xml /
-    // atom+xml / xml / text/xml / text/plain）、HTML_CONTENT_TYPE の流用は実在 feed を弾く。
-    // XML かは直後の parseString が実質的に弾く（safe-fetch.ts の HTML_CONTENT_TYPE 参照）。
+    // allowContentType では絞らない: feed の Content-Type は配信側で割れており網羅を試みない
+    // （実測で本番 feed が application/rss+xml・application/rdf+xml を返す）。XML かどうかは
+    // 直後の parseString が throw して弾く（詳細は safe-fetch.ts の allowContentType 参照）。
     const fetched = await safeFetchText(url, { timeoutMs: PROBE_TIMEOUT_MS });
     // 理由は使わず捨てる: 1 サイトにつき head リンク＋サブパス 13 本を probe し大半が 404 なので、
     // ログに出すと溢れる（root 取得と違い件数が読めない）。
@@ -172,14 +172,12 @@ export async function discoverFeedsForSite(
 
   // ① root HTML から宣言された feed リンク（fail-soft: 取得失敗時はサブパス探索へ）。
   // 取得は safeFetchText 経由で manual redirect + 各ホップ SSRF 再検証を通す。
-  // extractFeedLinks に渡すのは HTML なので、fetch-article（同じく HTML を取る）と同じ
-  // allowContentType で絞る。バイナリを掴んだとき maxBytes まで読み切る無駄を省く（YAT-57）。
+  // fetch-article と違い allowContentType では絞らない: HTML を text/plain 等で配るサイトを
+  // 弾くと、feed が別ホスト（FeedBurner 等）にある場合に恒久的に発見不能になる。下のサブパス
+  // 探索は同一 origin しか叩かないので救えない（YAT-57。詳細は safe-fetch.ts のコメント）。
   let headLinks: string[] = [];
   try {
-    const fetched = await safeFetchText(origin, {
-      timeoutMs: FETCH_TIMEOUT_MS,
-      allowContentType: HTML_CONTENT_TYPE,
-    });
+    const fetched = await safeFetchText(origin, { timeoutMs: FETCH_TIMEOUT_MS });
     if (fetched.ok) headLinks = extractFeedLinks(fetched.text, origin);
     // root は 1 サイト 1 回なので理由を出す（validateFeed の probe と違いログが溢れない）。
     else console.warn(`[discover] root 取得失敗: ${origin}: ${fetched.reason}`);

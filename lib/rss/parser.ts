@@ -17,10 +17,9 @@ const FETCH_TIMEOUT_MS = 15_000; // 全リダイレクトホップ合計の時�
 // 取得不能は reason を載せて throw し、呼び出し側の per-feed fail-soft に委ねる。reason は
 // ingest 経由で cron ログ（scripts/ingest.ts）に出る唯一の診断材料なので潰さない。
 export async function fetchAndParse(url: string): Promise<ParsedFeed> {
-  // allowContentType では絞らない: feed の Content-Type は配信側で割れており（rss+xml /
-  // atom+xml / xml / text/xml / text/plain）、HTML 経路の HTML_CONTENT_TYPE を流用すると
-  // 実在 feed を弾く。XML かは直後の parseString が実質的に弾く（safe-fetch.ts の
-  // HTML_CONTENT_TYPE のコメント参照）。
+  // allowContentType では絞らない: feed の Content-Type は配信側で割れており網羅を試みない
+  // （実測で本番 feed が application/rss+xml・application/rdf+xml を返す）。XML かどうかは
+  // 直後の parseString が throw して弾く（詳細は safe-fetch.ts の allowContentType 参照）。
   const fetched = await safeFetchText(url, { timeoutMs: FETCH_TIMEOUT_MS });
   if (!fetched.ok) throw new Error(`feed を取得できません（${fetched.reason}）`);
   return parser.parseString(fetched.text);
