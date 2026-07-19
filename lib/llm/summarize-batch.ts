@@ -220,13 +220,15 @@ export async function annotateUntagged(
         // パターン1（本文がタイトルのみ）由来のタグ空は YAT-7 の本文 fetch で救える。
         if (enrich && row.url && isThinBody(content)) {
           try {
-            const c = await enrichArticleBody(supabase, {
+            const r = await enrichArticleBody(supabase, {
               id: row.id,
               url: row.url,
               content_html: content,
             });
-            if (c) {
-              content = c;
+            // 差し替えなかった理由は捨てる: ここは要約バッチの一括処理で件数が読めず、
+            // 薄いままの記事も要約は継続できるため（enrich 側と違いログに出すと溢れる）。
+            if (r.ok) {
+              content = r.content;
               enriched += 1;
             }
           } catch (e) {

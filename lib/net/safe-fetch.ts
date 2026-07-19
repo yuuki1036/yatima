@@ -25,6 +25,17 @@ export type SafeFetchOptions = {
   allowContentType?: RegExp;
 };
 
+// HTML を取りに行く経路（記事本文の抽出・feed 自動発見の root 取得）で使う allowContentType の既製値。
+// 画像/PDF/バイナリを掴んだときに最大 maxBytes を読み切る無駄を省くのが目的（YAT-57）。
+//
+// feed（XML）取得には使わない。この正規表現は application/rss+xml と application/atom+xml に
+// マッチせず（`application/xml` は部分一致しない）、流用すると実在する feed を弾くため。
+// feed 経路に同種の定数を置いていないのも意図的で、配信側の Content-Type が
+// application/rss+xml / application/atom+xml / application/xml / text/xml / text/plain と
+// 割れており、実用に足る網羅と誤弾きの回避を両立できないため。XML かどうかは後段の
+// parseString が実質的に弾くので、ここでの前段フィルタは費用対効果が合わない。
+export const HTML_CONTENT_TYPE = /(text\/html|xhtml|text\/xml|application\/xml)/;
+
 // 失敗時は reason に理由を載せる。呼び出し側が fail-soft で捨てるか、ログ・例外メッセージに使うかを
 // 選べるようにするため（単なる null だと「ガードに弾かれた」と「404」が区別できず、運用ログから
 // 原因を辿れない）。ここで理由を作るのは、どの条件で落ちたかを知っているのがこの関数の内側だけだから。

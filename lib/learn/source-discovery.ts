@@ -105,14 +105,16 @@ export async function discoverLearnSources(
     const settled = await Promise.allSettled(
       chunk.map(async (c) => {
         const fetched = await fetchAndExtractArticle(c.url);
-        if (!fetched) return null; // SSRF 弾き／取得失敗／本文空
-        if (extractedTextLength(fetched.contentHtml) < MIN_SOURCE_TEXT_CHARS) {
+        // 理由は捨てる: LLM 提案の候補数が読めず、大半は取得失敗・薄いページで脱落するため
+        // ログに出すと溢れる（enrich と違い件数が固定されない）。
+        if (!fetched.ok) return null; // SSRF 弾き／取得失敗／本文空
+        if (extractedTextLength(fetched.article.contentHtml) < MIN_SOURCE_TEXT_CHARS) {
           return null; // ナビだけ等の薄いページ
         }
         const row: PendingRow = {
           url: c.url,
-          title: fetched.title ?? (c.title || null),
-          content_html: fetched.contentHtml,
+          title: fetched.article.title ?? (c.title || null),
+          content_html: fetched.article.contentHtml,
           category: opts.category,
           status: "pending",
           proposed_by: "llm",
