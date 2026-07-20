@@ -139,6 +139,9 @@ async function validateFeed(
   url: string,
 ): Promise<{ title: string | null; siteUrl: string | null } | null> {
   try {
+    // allowContentType では絞らない: feed の Content-Type は配信側で割れており網羅を試みない
+    // （実測で本番 feed が application/rss+xml・application/rdf+xml を返す）。XML かどうかは
+    // 直後の parseString が throw して弾く（詳細は safe-fetch.ts の allowContentType 参照）。
     const fetched = await safeFetchText(url, { timeoutMs: PROBE_TIMEOUT_MS });
     // 理由は使わず捨てる: 1 サイトにつき head リンク＋サブパス 13 本を probe し大半が 404 なので、
     // ログに出すと溢れる（root 取得と違い件数が読めない）。
@@ -169,6 +172,9 @@ export async function discoverFeedsForSite(
 
   // ① root HTML から宣言された feed リンク（fail-soft: 取得失敗時はサブパス探索へ）。
   // 取得は safeFetchText 経由で manual redirect + 各ホップ SSRF 再検証を通す。
+  // fetch-article と違い allowContentType では絞らない: HTML を text/plain 等で配るサイトを
+  // 弾くと、feed が別ホスト（FeedBurner 等）にある場合に恒久的に発見不能になる。下のサブパス
+  // 探索は同一 origin しか叩かないので救えない（YAT-57。詳細は safe-fetch.ts のコメント）。
   let headLinks: string[] = [];
   try {
     const fetched = await safeFetchText(origin, { timeoutMs: FETCH_TIMEOUT_MS });

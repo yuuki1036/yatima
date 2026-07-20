@@ -22,6 +22,21 @@ export type SafeFetchOptions = {
   timeoutMs: number; // 全リダイレクトホップで共有する合計の時間予算
   maxBytes?: number; // 取得 byte 上限（既定 5MB）
   // Content-Type が明示され、かつこの正規表現にマッチしないレスポンスは弾く（未指定ヘッダは許容）。
+  // ストリーム読み込みの前に判定するので、渡せば無関係な巨大ボディの読み切りを避けられる。
+  //
+  // 運用方針（YAT-57 で 4 呼び出し箇所を検討した結論）: 渡すのは fetch-article だけ。
+  // 「取得対象の Content-Type が実際に多様」かつ「弾いても失うものが小さい」経路にだけ渡す。
+  // - fetch-article: RSS の記事リンクは PDF/画像を指すことが実際にある。弾いても本文が
+  //   薄いまま要約が続くだけ（fail-soft・回復可能）なので、渡す価値がある。
+  // - parser / discover の probe（feed 取得）: 配信側の Content-Type が rss+xml / atom+xml /
+  //   rdf+xml / xml / text/xml / text/plain と割れており、網羅を試みると誤弾きする。実測でも
+  //   本番 feed の一部が application/rss+xml・application/rdf+xml を返し、HTML 用の正規表現では
+  //   落ちる。XML かどうかは後段の parseString が throw して弾くので前段フィルタは不要。
+  // - discover の root 取得: root は事実上ほぼ HTML なので絞る便益が小さい一方、HTML を
+  //   text/plain 等で配る設定ミスのサイトを弾くと、そのサイトの feed が別ホスト（FeedBurner や
+  //   feeds.* 等）にある場合に恒久的に発見不能になる（フォールバックのサブパス探索は同一
+  //   origin しか叩かないため救えない）。節約は上限 maxBytes の一回きりで回復可能、損失は
+  //   恒久的かつ静かなので、非対称を見て渡さない判断にした。
   allowContentType?: RegExp;
 };
 

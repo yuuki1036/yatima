@@ -90,8 +90,10 @@ export async function discoverLearnSources(
   result.proposed = proposals.length;
 
   // 正規化＋重複排除（既存＋バッチ内）。ここで残った URL だけ fetch にかける。
+  // count はプロンプト内の指示にすぎず LLM が超過して返しうるため、件数はここで決定的に切る
+  // （超過分をそのまま流すと fetch もログも上限を失う。YAT-57）。
   const candidates: { url: string; title: string; rationale: string }[] = [];
-  for (const p of proposals) {
+  for (const p of proposals.slice(0, opts.count ?? PROPOSE_COUNT)) {
     const url = normalizeUrl(p.url);
     if (!url || seen.has(url)) continue;
     seen.add(url);
@@ -105,14 +107,26 @@ export async function discoverLearnSources(
     const settled = await Promise.allSettled(
       chunk.map(async (c) => {
         const fetched = await fetchAndExtractArticle(c.url);
-        if (!fetched) return null; // SSRF 弾き／取得失敗／本文空
-        if (extractedTextLength(fetched.contentHtml) < MIN_SOURCE_TEXT_CHARS) {
-          return null; // ナビだけ等の薄いページ
+        // 候補は上で count（既定 PROPOSE_COUNT = 5）に切ってあるのでログは溢れない。ここは
+        // user-facing の提案フローで UI には「候補 N 件・検証通過 M 件」しか出ないため、脱落理由は
+        // サーバログにしか残せない。SSRF 弾き / 404 / 本文抽出不可を区別できないと
+        // 「検証通過 0 件」の原因を追えない（YAT-57）。
+        if (!fetched.ok) {
+          console.warn(`[learn] 候補を検証できず: ${c.url}: ${fetched.reason}`);
+          return null;
+        }
+        const textLen = extractedTextLength(fetched.article.contentHtml);
+        if (textLen < MIN_SOURCE_TEXT_CHARS) {
+          // ナビだけ等の薄いページ
+          console.warn(
+            `[learn] 候補が短すぎる: ${c.url}: ${textLen} < ${MIN_SOURCE_TEXT_CHARS} 文字`,
+          );
+          return null;
         }
         const row: PendingRow = {
           url: c.url,
-          title: fetched.title ?? (c.title || null),
-          content_html: fetched.contentHtml,
+          title: fetched.article.title ?? (c.title || null),
+          content_html: fetched.article.contentHtml,
           category: opts.category,
           status: "pending",
           proposed_by: "llm",

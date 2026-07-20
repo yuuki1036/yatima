@@ -26,32 +26,40 @@ export function isThinBody(content: string | null): boolean {
   return htmlToInputText(content).length < THIN_BODY_CHARS;
 }
 
-// 1 記事の本文をリンク先から取得して content_html を差し替える。差し替えたら新しい
-// content_html を、URL 無し・SSRF ガードで弾かれた・取得本文が元と同等以下なら null を返す
-// （呼び出し側が成否を判定）。
+// 差し替えなかった場合は理由つきで返す。呼び出し側のログが「なぜ差し替わらなかったか」を
+// 語れるようにするため（[[shared-primitive-returns-reason-caller-logs]]・YAT-57）。
+export type EnrichBodyResult =
+  | { ok: true; content: string } // 差し替えた後の content_html
+  | { ok: false; reason: string };
+
+// 1 記事の本文をリンク先から取得して content_html を差し替える。URL 無し・SSRF ガードで
+// 弾かれた・取得失敗・取得本文が元と同等以下なら ok:false を理由つきで返す。
 // enrichMissingBodies（要約前バッチ）と再アノテート（YAT-13）の両方から再利用する。
 export async function enrichArticleBody(
   supabase: SupabaseClient,
   row: Row,
-): Promise<string | null> {
-  if (!row.url) return null;
+): Promise<EnrichBodyResult> {
+  if (!row.url) return { ok: false, reason: "URL が無い" };
   // row.url は feed の記事リンク（第三者由来）。SSRF ガード＋fetch＋本文抽出は共通処理に委譲する
-  // （弾かれた／取得失敗は null。source-discovery と同じ一次防御・抽出を共有）。
+  // （弾かれた／取得失敗は理由つきで返る。source-discovery と同じ一次防御・抽出を共有）。
   const fetched = await fetchAndExtractArticle(row.url);
-  if (!fetched) return null;
-  const content = fetched.contentHtml;
+  if (!fetched.ok) return { ok: false, reason: fetched.reason };
+  const content = fetched.article.contentHtml;
   // 取得本文が元より十分長いときだけ差し替える（薄い→薄いは無意味）。
-  if (
-    htmlToInputText(content).length <= htmlToInputText(row.content_html).length
-  ) {
-    return null;
+  const got = htmlToInputText(content).length;
+  const had = htmlToInputText(row.content_html).length;
+  if (got <= had) {
+    return {
+      ok: false,
+      reason: `取得本文が元より長くない（${got} <= ${had} 文字）`,
+    };
   }
   const { error } = await supabase
     .from("articles")
     .update({ content_html: content })
     .eq("id", row.id);
   if (error) throw error;
-  return content;
+  return { ok: true, content };
 }
 
 export async function enrichMissingBodies(
@@ -86,10 +94,10 @@ export async function enrichMissingBodies(
     const chunk = targets.slice(i, i + concurrency);
     const results = await Promise.allSettled(
       chunk.map(async (row) => {
-        const content = await enrichArticleBody(supabase, row);
-        // null は「本文が元と同等以下」「SSRF ガードでスキップ」「取得失敗」を含む。
-        // 理由を断定しない文言にする。
-        if (!content) throw new Error("本文を差し替えなかった（薄い/スキップ）");
+        const result = await enrichArticleBody(supabase, row);
+        // 差し替えなかった理由（取得失敗 / SSRF ガード / 本文が元と同等以下 等）をそのまま載せる。
+        // 1 実行 20 件（DEFAULT_LIMIT）でログが溢れないため、ここは理由を出す価値がある（YAT-57）。
+        if (!result.ok) throw new Error(`本文を差し替えなかった: ${result.reason}`);
       }),
     );
     results.forEach((r, idx) => {
