@@ -48,10 +48,14 @@ export type GroundingReason =
 // - quoteRaw: LLM が付けた原文抜粋（生。呼び出し側で norm しない）
 // - groundBodyNorm: norm() 済みの照合母体（本文）。呼び出し側で一度だけ norm して使い回す想定
 // - targetRaw: 設問本体（MCQ なら stem + choices、qa なら front+back 等）。抜粋が設問と無関係でないか照合
-// minOverlap: ④の語彙重なり閾値。既定は MIN_OVERLAP（qa/cloze カード経路の従来挙動を保つ）。
-// 0 を渡すと④は無効化される。MCQ は英語記事の逐語引用×日本語設問で quote と設問の固有トークンが
-// 言語違いでほぼ重ならず④が支配的な棄却要因になる（YAT-30 の計測）ため、quiz-gate は 0 を渡して
-// ②逐語＋③固有性に依拠する（正誤の真偽は元々④では検証しておらず F2 の別軸）。
+// minOverlap: ④の語彙重なり閾値。0 を渡すと④は無効化される。
+// 英語記事の逐語引用×日本語の設問/カードでは quote と target の固有トークンが言語違いでほぼ重ならず、
+// jaccard が構造的に 0 へ潰れて④が支配的な棄却要因になる（YAT-30: MCQ で棄却の 7 割超、
+// YAT-58: card で 68%・通過率 12%）。このため **本番の 2 経路とも④を無効化している**
+// （quiz-gate の QUIZ_MIN_OVERLAP=0 / card-gate の CARD_MIN_OVERLAP=0）。いずれも②逐語＋
+// ③固有性に依拠する（正誤の真偽は元々④では検証しておらず F2 の別軸）。
+// 注意: 既定値 MIN_OVERLAP を使う本番経路はもう無い。新しい呼び出し側が引数を省略すると、
+// 上記のとおり言語跨ぎで機能しない④が黙って有効になる。省略せず明示的に渡すこと。
 export function groundingReason(
   quoteRaw: string,
   groundBodyNorm: string,

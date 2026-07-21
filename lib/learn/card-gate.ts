@@ -41,13 +41,15 @@ type ArticleRow = {
 };
 
 // cloze 文から穴埋めマーカーを外して素のテキストにする（語彙重なり計算の対象用）。
-function stripCloze(cloze: string): string {
+// 診断スクリプト（diagnose-card-grounding）が本番と同じ target を組めるよう export する。
+export function stripCloze(cloze: string): string {
   // {{c1::答え}} → 答え（ヒント付き {{c1::答え::ヒント}} は答えのみ残す）
   return cloze.replace(/\{\{c\d+::(.*?)(?:::.*?)?\}\}/g, "$1");
 }
 
 // 形式検証（最安・LLM 不要）。type ごとに必須フィールドの充足と cloze 構文を確認する。
-function isValidFormat(card: GeneratedCard): boolean {
+// 診断スクリプトが本番と同じ順序（形式 → grounding）を再現できるよう export する。
+export function isValidFormat(card: GeneratedCard): boolean {
   if (card.type === "qa") {
     return Boolean(card.front?.trim()) && Boolean(card.back?.trim());
   }
@@ -58,6 +60,17 @@ function isValidFormat(card: GeneratedCard): boolean {
   return Boolean(m && m[1].trim());
 }
 
+// ④語彙重なりを無効化する（YAT-58）。YAT-30 が MCQ で下した判断（quiz-gate の QUIZ_MIN_OVERLAP=0）
+// を card 経路へ転記するもの。英語記事の逐語引用×日本語カードで固有トークンが言語違いによりほぼ
+// 重ならず、jaccard が構造的に 0 へ潰れるため閾値較正では解決しない。
+// 計測（YAT-58 / diagnose-card-grounding・サンプル 6 記事・生成 25 件）: low_overlap が棄却の
+// 68%、通過率 12.0% → ④無効で 80.0%。jaccard 実測値は 0.000〜0.054 で qa/cloze とも一様に棄却。
+// ②逐語＋③固有性が「引用は実在の記事固有テキスト」を担保する。この経路では②が現に 25 件中 5 件
+// （20%）を捕捉しており、MCQ（同計測で②棄却 0 件）より防御が効いている。
+// 副作用は MCQ と同じ: quote が設問と無関係な箇所から選ばれる余地が残る。カードは承認制なので
+// 人のレビューが緩衝する（LLM 生成カードを決定的フィルタで囲う設計の前提）。
+const CARD_MIN_OVERLAP = 0;
+
 // grounding 照合（決定的）。type ごとに target（設問本体）を組み、共通の逐語照合ゲート
 // （grounding.ts の isQuoteGrounded）へ委ねる。判定順序＝①長さ →②逐語 →③固有性 →④設問関連。
 function isGrounded(card: GeneratedCard, groundBody: string): boolean {
@@ -65,7 +78,7 @@ function isGrounded(card: GeneratedCard, groundBody: string): boolean {
     card.type === "cloze"
       ? stripCloze(card.cloze_text ?? "")
       : `${card.front ?? ""} ${card.back ?? ""}`;
-  return isQuoteGrounded(card.source_quote, groundBody, target);
+  return isQuoteGrounded(card.source_quote, groundBody, target, CARD_MIN_OVERLAP);
 }
 
 // card_candidates の 1 列を .range() で全件ページ取得する。行は単調増加するため、PostgREST の
