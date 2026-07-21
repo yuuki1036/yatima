@@ -44,6 +44,15 @@ export function CurationDeck({
   // 続き（判定済みの除外）はリロード/再訪時にサーバクエリが行う。
   const [deck] = useState(cards);
 
+  // カウンターの分母は「今日ピックされた総数」に固定する。deck.length（未判定の残り）を分母に
+  // すると、3 件判定して再訪したとき 01/07 のように**分母が縮んで**進捗が読めなくなる。
+  // 分子には判定済み件数をオフセットとして足す（これが無いと再訪のたびに 01 に戻る）。
+  // 分母を定数 10 にしない理由: curate は日次上限 10 を「上限」として使い下限は保証しない
+  // （候補枯渇や dedup で 10 件未満になる日がある。lib/ranking/curate.ts）。生成が保証しない値を
+  // UI が約束すると、6 件の日に 06/10 で終わって「4 件どこ行った」になる。
+  const [judgedOffset] = useState(() => Math.max(0, pickedToday - cards.length));
+  const total = Math.max(pickedToday, deck.length);
+
   // お気に入り状態はクライアントローカルで持つ。toggleStar は /saved のみ revalidate し "/" を
   // 触らないため（デッキの楽観 index を壊さないため）、★の見た目はサーバ再取得に頼らず楽観表示する。
   const [starredIds, setStarredIds] = useState<Set<string>>(
@@ -183,11 +192,11 @@ export function CurationDeck({
   if (!current) {
     return (
       <div>
-        {sectionLabel(`${deck.length} / ${deck.length}`)}
+        {sectionLabel(`${String(total).padStart(2, "0")} / ${String(total).padStart(2, "0")}`)}
         <p className="border border-line py-16 text-center text-sm text-muted">
           ここまで完了です 🎉
           <br />
-          全{deck.length}件を見終わりました。また明日、新しい候補が届きます。
+          全{total}件を見終わりました。また明日、新しい候補が届きます。
         </p>
       </div>
     );
@@ -196,7 +205,7 @@ export function CurationDeck({
   return (
     <div>
       {sectionLabel(
-        `${String(index + 1).padStart(2, "0")} / ${String(deck.length).padStart(2, "0")}`,
+        `${String(judgedOffset + index + 1).padStart(2, "0")} / ${String(total).padStart(2, "0")}`,
       )}
 
       <div className="relative touch-pan-y select-none" {...pointerHandlers}>
@@ -241,10 +250,17 @@ export function CurationDeck({
           </div>
         </div>
 
-        {/* スワイプ方向のヒント（指の移動量に応じてフェードイン） */}
-        <div className="pointer-events-none absolute inset-0 flex items-start justify-between p-4">
+        {/* スワイプ方向のヒント（指の移動量に応じてフェードイン）。
+            zIndex はカードラッパー（zIndex: 2）より上に置くこと。position のみ指定して
+            z-index を省くと、CSS の描画順で「z-index:auto の positioned 要素」はカードより
+            先に描かれ、不透明な bg-surface の裏に完全に隠れる（DOM 順が後でも隠れる）。
+            SKIP/KEEP が判定方向を示す唯一の視覚フィードバックなので、色でも区別する。 */}
+        <div
+          className="pointer-events-none absolute inset-0 flex items-start justify-between p-4"
+          style={{ zIndex: 3 }}
+        >
           <span
-            className="border-2 border-border px-3 py-1 font-mono text-base font-bold tracking-widest text-foreground"
+            className="border-2 border-rose-500 px-3 py-1 font-mono text-base font-bold tracking-widest text-rose-500"
             style={{
               // 送り出し中（flyOut）はヒントを消す。dx を保持したままだとバッジが
               // 飛んでいくカードに残って汚いため。
@@ -255,7 +271,7 @@ export function CurationDeck({
             SKIP
           </span>
           <span
-            className="border-2 border-accent px-3 py-1 font-mono text-base font-bold tracking-widest text-accent"
+            className="border-2 border-emerald-500 px-3 py-1 font-mono text-base font-bold tracking-widest text-emerald-500"
             style={{
               opacity: flyOut || dx <= 0 ? 0 : Math.min(1, dx / SWIPE_THRESHOLD),
               transform: "rotate(12deg)",
