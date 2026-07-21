@@ -5,8 +5,9 @@ config({ path: ".env.local" });
 
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { createAdminClient } from "../lib/supabase/admin";
-import { nextMastery, buildCategoryMastery } from "../lib/learn/mastery";
-import type { QuizDifficulty } from "../lib/types";
+import { nextMastery, buildCategoryMastery, scoreQuestion } from "../lib/learn/mastery";
+import { padEndWide, padStartWide } from "./_report-format";
+import type { QuizDifficulty, QuizQuestion } from "../lib/types";
 
 // YAT-60: mastery パラメータ較正のための replay 診断スクリプト。
 // mastery.ts の冒頭が「較正・再計算の退路は元帳（quiz_attempts）から nextMastery を replay する
@@ -26,7 +27,7 @@ const SELECT_PAGE = 1000; // PostgREST 既定の 1 ページ上限。元帳は�
 const TOP_CONCEPTS = 15; // 軌跡を詳細表示する concept 数（attempts 降順）
 
 // 現行値（mastery.ts:17-24 の写し。非 export のためここに複製する。
-// 下の assertBaselineMatches が本物の nextMastery と突き合わせて写し間違いを検出する）。
+// 下の assertAlphaMatches / assertPriorMatches が本物と突き合わせて写し間違いを検出する）。
 const CURRENT: MasteryParams = {
   prior: 0.3,
   alpha: {
@@ -105,7 +106,9 @@ function nextWith(prev: number, difficulty: QuizDifficulty, isCorrect: boolean, 
 
 // 再実装が本番の nextMastery と一致することを確認する。ここが落ちたら以降の数字は信用できないので
 // 即座に止める（乖離したまま較正すると YAT-58 と同じ「計測が本番と別物」を繰り返す）。
-function assertBaselineMatches() {
+// nextMastery は prev に対してアフィン（傾き 1-a）で prev,a∈[0,1] なら clamp は不活性なので、
+// 3 難易度 × 正誤 × prev 5 点で alpha 側は必要十分に押さえられる。
+function assertAlphaMatches() {
   const diffs: QuizDifficulty[] = ["easy", "medium", "hard"];
   for (const d of diffs) {
     for (const correct of [true, false]) {
@@ -117,11 +120,51 @@ function assertBaselineMatches() {
             `再実装が本番 nextMastery と不一致: prev=${prev} ${d} correct=${correct}` +
               ` → 再実装 ${mine} / 本番 ${real}`,
           );
-          console.error("mastery.ts の MASTERY_ALPHA が変わった可能性がある。CURRENT を更新すること。");
+          console.error("mastery.ts の MASTERY_ALPHA が変わった可能性がある。CURRENT.alpha を更新すること。");
           process.exit(1);
         }
       }
     }
+  }
+}
+
+// prior は nextMastery が参照しないので上の assert では検出できない（alpha だけ守っても
+// CURRENT.prior の写し間違いは素通りする）。prior は各 concept の初回 attempt の prev に直接
+// 入るため、ズレると attempts の少ない concept が丸ごと狂う。
+// scoreQuestion が未登録 concept の既定値として MASTERY_PRIOR を使う（row?.mastery ?? PRIOR）
+// ことを利用し、「空 map で採点した値」と「CURRENT.prior を入れた map で採点した値」の一致を
+// 見ることで、非 export のまま間接的に検証する。
+function assertPriorMatches() {
+  const q: QuizQuestion = {
+    id: "probe",
+    concept_key: "probe-concept",
+    concept_label: "probe",
+    category: "tech/programming",
+    difficulty: "medium",
+    stem: "probe",
+    choices: ["a", "b", "c", "d"],
+    answer_index: 0,
+    explanation: "probe",
+    source_quote: null,
+    grounded: false,
+    source_ref: null,
+  };
+  const nowMs = 0;
+  const rng = () => 0.5; // jitter を固定して差分を prior 由来だけにする
+  const withEmpty = scoreQuestion(q, new Map(), nowMs, rng);
+  const withPrior = scoreQuestion(
+    q,
+    new Map([[q.concept_key, { mastery: CURRENT.prior, last_served_at: null }]]),
+    nowMs,
+    rng,
+  );
+  if (Math.abs(withEmpty - withPrior) > 1e-12) {
+    console.error(
+      `CURRENT.prior (${CURRENT.prior}) が本番 MASTERY_PRIOR と一致しない` +
+        `（scoreQuestion の既定値経由で検出: 空 map ${withEmpty} / prior 指定 ${withPrior}）`,
+    );
+    console.error("mastery.ts の MASTERY_PRIOR を確認して CURRENT.prior を更新すること。");
+    process.exit(1);
   }
 }
 
@@ -163,7 +206,8 @@ function mean(xs: number[]): number {
 }
 
 async function main() {
-  assertBaselineMatches();
+  assertAlphaMatches();
+  assertPriorMatches();
 
   const supabase = createAdminClient();
   const attempts = await loadAllAttempts(supabase);
@@ -217,13 +261,34 @@ async function main() {
       }
     }
   }
+  // topic_mastery にあるのに元帳へ 1 行も残っていない concept。question 削除の cascade で
+  // attempt が全滅した最極端ケースで、base 側のループだけでは数え落とす（このセクションの
+  // 目的がまさに元帳欠損の検出なので、取りこぼすと健全に見えてしまう）。
+  const orphans = topics.filter((t) => !base.has(t.concept_key));
+
   console.log(`\n--- replay と topic_mastery の整合 ---`);
-  console.log(`  一致 ${matched} / 乖離 ${drifted}（現行パラメータで再生した結果との比較）`);
+  console.log(
+    `  一致 ${matched} / 乖離 ${drifted} / 元帳に attempt が残っていない concept ${orphans.length}` +
+      `（現行パラメータで再生した結果との比較）`,
+  );
+  if (orphans.length > 0) {
+    console.log(
+      `  孤児 concept（topic_mastery にあるが元帳ゼロ・attempts 保存値）: ` +
+        orphans
+          .slice(0, 5)
+          .map((t) => `${t.concept_key}(${t.attempts})`)
+          .join(", "),
+    );
+    console.log(
+      "  ※ attempts>0 なのに元帳ゼロなら question 削除の cascade で attempt 行ごと消えた証拠。" +
+        "この concept は replay で再計算できない",
+    );
+  }
   if (drifted > 0) {
     console.log("  乖離の例（concept / replay 値 attempts / 保存値 attempts）:");
     for (const d of driftExamples) {
       console.log(
-        `    ${d.key.slice(0, 32).padEnd(34)} ${d.replayed.toFixed(3)} (${d.nR})  vs  ${d.stored.toFixed(3)} (${d.nS})`,
+        `    ${padEndWide(d.key, 34)} ${d.replayed.toFixed(3)} (${d.nR})  vs  ${d.stored.toFixed(3)} (${d.nS})`,
       );
     }
     console.log(
@@ -235,7 +300,7 @@ async function main() {
   // ── パラメータ候補の比較 ─────────────────────────────────────────────
   console.log(`\n--- パラメータ候補の比較（全 concept の mastery 分布）---`);
   console.log(
-    `${"候補".padEnd(22)} ${"平均".padStart(6)} ${"中央".padStart(6)} ${"<0.3".padStart(6)} ${"≥0.7".padStart(6)}`,
+    `${padEndWide("候補", 22)} ${padStartWide("平均", 6)} ${padStartWide("中央", 6)} ${padStartWide("<0.3", 6)} ${padStartWide("≥0.7", 6)}`,
   );
   const results = CANDIDATES.map((c) => ({ ...c, acc: replay(attempts, c.params) }));
   for (const r of results) {
@@ -244,8 +309,8 @@ async function main() {
     const weak = vals.filter((v) => v < 0.3).length;
     const strong = vals.filter((v) => v >= 0.7).length;
     console.log(
-      `${r.name.padEnd(22)} ${mean(vals).toFixed(3).padStart(6)} ${med.toFixed(3).padStart(6)}` +
-        ` ${String(weak).padStart(6)} ${String(strong).padStart(6)}`,
+      `${padEndWide(r.name, 22)} ${padStartWide(mean(vals).toFixed(3), 6)} ${padStartWide(med.toFixed(3), 6)}` +
+        ` ${padStartWide(String(weak), 6)} ${padStartWide(String(strong), 6)}`,
     );
   }
 
@@ -253,15 +318,15 @@ async function main() {
   const ranked = [...base].sort((a, b) => b[1].n - a[1].n).slice(0, TOP_CONCEPTS);
   console.log(`\n--- concept 別の mastery（attempts 上位 ${ranked.length} 件）---`);
   console.log(
-    `${"concept".padEnd(34)} ${"n".padStart(4)} ` +
-      CANDIDATES.map((c) => c.name.slice(0, 8).padStart(9)).join(""),
+    `${padEndWide("concept", 34)} ${padStartWide("n", 4)} ` +
+      CANDIDATES.map((c) => padStartWide(padEndWide(c.name, 8).trimEnd(), 9)).join(""),
   );
   for (const [key, r] of ranked) {
     const label = topicByKey.get(key)?.concept_label ?? key;
     const cells = results
-      .map((res) => (res.acc.get(key)?.mastery ?? 0).toFixed(3).padStart(9))
+      .map((res) => padStartWide((res.acc.get(key)?.mastery ?? 0).toFixed(3), 9))
       .join("");
-    console.log(`${label.slice(0, 33).padEnd(34)} ${String(r.n).padStart(4)} ${cells}`);
+    console.log(`${padEndWide(label, 34)} ${padStartWide(String(r.n), 4)} ${cells}`);
   }
 
   // ── カテゴリ別（buildCategoryMastery を再利用して本番と同じ集計にする）──────
@@ -285,7 +350,7 @@ async function main() {
   }
   for (const c of cats) {
     console.log(
-      `  ${c.label.padEnd(24)} mastery ${c.mastery.toFixed(3)} / concept ${c.conceptCount}` +
+      `  ${padEndWide(c.label, 24)} mastery ${c.mastery.toFixed(3)} / concept ${c.conceptCount}` +
         `  弱点: ${c.weakest.map((w) => w.concept_label).join(", ") || "―"}`,
     );
   }

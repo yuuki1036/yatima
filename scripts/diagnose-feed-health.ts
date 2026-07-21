@@ -14,6 +14,7 @@ import {
 } from "../lib/ranking/feed-health";
 import { loadSourcePrefs, FEEDBACK_WEIGHT } from "../lib/ranking/preferences";
 import { parseEmbedding } from "../lib/ranking/dedup";
+import { padEndWide } from "./_report-format";
 import type { Feed } from "../lib/types";
 
 // YAT-60: feed 引退推奨スコアリングの較正用診断スクリプト。
@@ -47,18 +48,7 @@ function fmtDays(ms: number): string {
   return `${(ms / DAY_MS).toFixed(1)}d`;
 }
 
-function pad(s: string, n: number): string {
-  // 全角を 2 幅として数え、日本語 title が混ざっても列がずれないようにする。
-  let w = 0;
-  let out = "";
-  for (const ch of s) {
-    const cw = /[　-鿿＀-｠￠-￦]/.test(ch) ? 2 : 1;
-    if (w + cw > n) break;
-    out += ch;
-    w += cw;
-  }
-  return out + " ".repeat(Math.max(0, n - w));
-}
+const pad = padEndWide;
 
 async function main() {
   const supabase = createAdminClient();
@@ -76,7 +66,14 @@ async function main() {
     process.exit(1);
   }
   const feeds = (feedData ?? []) as Feed[];
-  const sourcePrefs = await loadSourcePrefs(supabase).catch(() => new Map<string, number>());
+  // page.tsx は空 Map に倒す（UI が落ちないことを優先）。診断では黙って倒すと「pref シグナルが
+  // 一件も立たない」を「嗜好は健全」と誤読するので、失敗したことを明示する。
+  let prefsFailed = false;
+  const sourcePrefs = await loadSourcePrefs(supabase).catch((e) => {
+    console.warn("⚠ preferences の取得に失敗。pref 列は全て 0 として扱う（判定は無意味になる）:", e);
+    prefsFailed = true;
+    return new Map<string, number>();
+  });
 
   const active = feeds.filter((f) => f.active);
   const inputs: FeedHealthInput[] = active.map((f) => ({
@@ -94,10 +91,15 @@ async function main() {
   // compute-dedup-rate.ts と同じ条件で数える: 直近 WINDOW_DAYS・embedding 非 null。
   // parseEmbedding 失敗分まで揃えるため embedding 本体も引く。
   const since = new Date(now - WINDOW_DAYS * DAY_MS).toISOString();
+  // compute-dedup-rate.ts と同じクエリ形（窓と embedding をサーバ側で絞ってから limit）にする。
+  // JS 側で絞ると 5000 件の予算を窓外・embedding 無しの行に食われ、母数が実際より小さく出る
+  // ＝ near_dup_rate=null の内訳（このスクリプトの主目的）が狂う。
   const { data: artData, error: artErr } = await supabase
     .from("articles")
     .select("feed_id, embedding, published_at")
-    .order("published_at", { ascending: false, nullsFirst: false })
+    .gte("published_at", since)
+    .not("embedding", "is", null)
+    .order("published_at", { ascending: false })
     .limit(FETCH_LIMIT);
   if (artErr) {
     console.error("articles の取得に失敗:", artErr);
@@ -108,20 +110,33 @@ async function main() {
   for (const a of articles) {
     const s = stats.get(a.feed_id) ?? { inWindow: 0, withEmbedding: 0, total: 0, nullPublished: 0 };
     s.total += 1;
-    // published_at が null の記事は 30 日窓の gte から漏れる（compute-dedup-rate と同じ挙動）。
-    // 「記事は来ているのに窓に入らない」ケースの主因になるので別に数える。
-    if (a.published_at === null) s.nullPublished += 1;
-    else if (a.published_at >= since) {
-      s.inWindow += 1;
-      if (parseEmbedding(a.embedding)) s.withEmbedding += 1;
-    }
+    s.inWindow += 1;
+    // compute-dedup-rate は parseEmbedding 失敗行も捨てるので、そこまで揃える。
+    if (parseEmbedding(a.embedding)) s.withEmbedding += 1;
     stats.set(a.feed_id, s);
   }
   if (articles.length >= FETCH_LIMIT) {
     console.warn(
-      `⚠ articles の取得が上限 ${FETCH_LIMIT} 件に達した。古い記事が切れているため` +
-        `「30d 記事 0 件」の判定が実態より多く出る可能性がある`,
+      `⚠ articles の取得が上限 ${FETCH_LIMIT} 件に達した。古い記事が切れており、` +
+        `feed 別の embedding 件数が実態より小さく出る（母数不足の誤判定につながる）`,
     );
+  }
+
+  // 窓外・embedding 無しも含めた feed 別の記事有無。「記事そのものが無い」と
+  // 「記事はあるが窓/embedding の条件で落ちた」を切り分けるために別クエリで取る。
+  const { data: anyArtData } = await supabase
+    .from("articles")
+    .select("feed_id, published_at")
+    .order("fetched_at", { ascending: false })
+    .limit(FETCH_LIMIT);
+  const anyArticles = (anyArtData ?? []) as unknown as { feed_id: string; published_at: string | null }[];
+  const hasAnyArticle = new Map<string, { total: number; nullPublished: number }>();
+  for (const a of anyArticles) {
+    const s = hasAnyArticle.get(a.feed_id) ?? { total: 0, nullPublished: 0 };
+    s.total += 1;
+    // published_at が null の記事は compute-dedup-rate の 30d 窓（gte）から構造的に漏れる。
+    if (a.published_at === null) s.nullPublished += 1;
+    hasAnyArticle.set(a.feed_id, s);
   }
 
   // ── 評価（filter せず全 active feed）────────────────────────────────────
@@ -146,6 +161,9 @@ async function main() {
   console.log(
     `加重: ${(Object.keys(RETIRE_SIGNAL_WEIGHTS) as RetireReason[]).map((k) => `${k}=${RETIRE_SIGNAL_WEIGHTS[k]}`).join(" / ")}`,
   );
+  if (prefsFailed) {
+    console.log("⚠ preferences 取得失敗のため pref 列と low_pref 判定は無効（全て 0 扱い）");
+  }
 
   console.log("\n--- 全 active feed のシグナル値（score 降順・推奨は ★）---");
   console.log(
@@ -165,33 +183,59 @@ async function main() {
   // ── 閾値までの距離（出すぎ/出なすぎの判断材料）──────────────────────────
   console.log("\n--- 閾値までの距離（近いものから。閾値を動かしたとき最初に動く feed）---");
   const dismissW = Math.abs(FEEDBACK_WEIGHT.dismiss);
-  // 各シグナルについて「閾値まであとどれだけか」。既に跨いでいるものは到達済と明示する
-  // （負の gap を「あと 0 回」と表示すると未到達と誤読されるため）。
-  const gapStr = (gap: number, unit: string): string =>
-    gap < 0 ? `到達済(${gap.toFixed(2)}${unit})` : `+${gap.toFixed(2)}${unit}`;
+  // 「閾値を動かしたとき最初に動く feed」を見るための表なので、**まだ立っていないシグナル**の
+  // うち閾値に最も近いものを並べる。既に立っている feed を混ぜると（符号付き gap の昇順だと
+  // 大きく割り込んだ feed が上位を占め）肝心の境界付近が枠から押し出される。
+  const gapStr = (gap: number): string => (gap < 0 ? `到達済(${gap.toFixed(2)})` : `+${gap.toFixed(2)}`);
+  const graceMs = TH.NEW_FEED_GRACE_DAYS * DAY_MS;
   const near = rows
-    .map((r) => ({
-      title: r.input.title ?? r.input.url,
+    .map((r) => {
       // credibility / pref は「閾値を下回る」で立つので、gap は現在値 - 閾値（負なら到達済）。
-      credGap: r.input.credibility - TH.LOW_CREDIBILITY,
-      prefGap: r.input.sourcePref - TH.LOW_PREF,
-      staleGap: (TH.DEAD_DAYS * DAY_MS - r.staleMs) / DAY_MS,
-      flagged: r.result.recommend,
-    }))
-    .sort((a, b) => Math.min(a.credGap, a.prefGap) - Math.min(b.credGap, b.prefGap))
+      const credGap = r.input.credibility - TH.LOW_CREDIBILITY;
+      const prefGap = r.input.sourcePref - TH.LOW_PREF;
+      // dead は evaluateFeedHealth が新規猶予中は判定自体をスキップする。ここもそれに揃えないと
+      // 追加直後で未取得（staleMs=Infinity）の feed が「dead 到達済」と出てスコア表と矛盾する。
+      const isNew = r.ageMs < graceMs;
+      const staleGap = isNew ? null : (TH.DEAD_DAYS * DAY_MS - r.staleMs) / DAY_MS;
+      // まだ立っていないシグナルの中で最も閾値に近い距離。全部立っていれば対象外。
+      const pending = [credGap, prefGap, staleGap].filter(
+        (g): g is number => g !== null && g >= 0,
+      );
+      return {
+        title: r.input.title ?? r.input.url,
+        credGap,
+        prefGap,
+        staleGap,
+        isNew,
+        graceLeftDays: (graceMs - r.ageMs) / DAY_MS,
+        flagged: r.result.recommend,
+        nearest: pending.length > 0 ? Math.min(...pending) : Infinity,
+      };
+    })
+    .filter((n) => Number.isFinite(n.nearest))
+    .sort((a, b) => a.nearest - b.nearest)
     .slice(0, 12);
   for (const n of near) {
-    const dismissesLeft = n.prefGap >= 0 ? Math.ceil(n.prefGap / dismissW) : 0;
+    // 判定は strict（< 閾値）なので、gap をちょうど使い切っただけでは立たない。1 回余分に要る。
+    const dismissesLeft = n.prefGap >= 0 ? Math.floor(n.prefGap / dismissW) + 1 : 0;
     const dismissNote = n.prefGap >= 0 ? `あと ${dismissesLeft} 回 dismiss` : "pref 到達済";
+    const deadNote = n.isNew
+      ? `新規猶予中（あと ${n.graceLeftDays.toFixed(1)}d は判定対象外）`
+      : n.staleGap !== null && n.staleGap > 0
+        ? `あと ${n.staleGap.toFixed(1)}d`
+        : "到達済";
     console.log(
-      `  ${n.flagged ? "★" : " "}${pad(n.title, 27)} cred ${gapStr(n.credGap, "")}` +
-        ` / pref ${gapStr(n.prefGap, "")}（${dismissNote}）` +
-        ` / dead ${n.staleGap > 0 ? `あと ${n.staleGap.toFixed(1)}d` : "到達済"}`,
+      `  ${n.flagged ? "★" : " "}${pad(n.title, 27)} cred ${gapStr(n.credGap)}` +
+        ` / pref ${gapStr(n.prefGap)}（${dismissNote}）` +
+        ` / dead ${deadNote}`,
     );
   }
   console.log(
-    `  ※ credibility は「< ${TH.LOW_CREDIBILITY}」の strict 比較。ちょうど ${TH.LOW_CREDIBILITY} の feed は` +
-      `フラグが立たない（cred +0.00 の行がそれ）`,
+    `  ※ 未到達のシグナルが 1 つ以上ある feed のみ、閾値に近い順に最大 12 件。★ は別シグナルで既に推奨済み`,
+  );
+  console.log(
+    `  ※ credibility / pref は「< 閾値」の strict 比較。ちょうど ${TH.LOW_CREDIBILITY} の feed は` +
+      `フラグが立たない（cred +0.00 の行がそれ）。dismiss 回数もこれを織り込んで +1 している`,
   );
 
   // ── near_dup_rate = null の内訳 ────────────────────────────────────────
@@ -208,19 +252,29 @@ async function main() {
   let onlyNullPublished = 0;
   let noEmbed = 0;
   let tooFew = 0;
+  let enoughButNull = 0; // 母数は足りているのに null ＝ cron 未実行 / 途中失敗
   for (const r of nullRows) {
-    const s = r.stat;
-    if (!s || s.total === 0) noArticle += 1;
-    // 記事は存在するが published_at が全て null → 30d 窓に入らず母数 0 になる。
-    else if (s.inWindow === 0 && s.nullPublished > 0) onlyNullPublished += 1;
-    else if (s.inWindow === 0) noArticle += 1;
-    else if (s.withEmbedding === 0) noEmbed += 1;
-    else tooFew += 1;
+    const withEmbed = r.stat?.withEmbedding ?? 0;
+    const any = hasAnyArticle.get(r.input.id);
+    if (withEmbed >= MIN_OWN_ARTICLES) enoughButNull += 1;
+    else if (withEmbed > 0) tooFew += 1;
+    else if (!any || any.total === 0) noArticle += 1;
+    // 記事は存在するが published_at が全て null → 30d 窓（gte）に構造的に入らない。
+    else if (any.nullPublished === any.total) onlyNullPublished += 1;
+    else noEmbed += 1;
   }
-  console.log(`  記事そのものが無い / 30d 窓に該当なし : ${noArticle}`);
+  console.log(`  記事そのものが無い                   : ${noArticle}`);
   console.log(`  記事はあるが published_at が全て null : ${onlyNullPublished}`);
   console.log(`  窓内に記事はあるが embedding が 0 件  : ${noEmbed}`);
   console.log(`  embedding 1〜${MIN_OWN_ARTICLES - 1} 件（母数不足）       : ${tooFew}`);
+  console.log(`  embedding ${MIN_OWN_ARTICLES} 件以上あるのに null      : ${enoughButNull}`);
+  if (enoughButNull > 0) {
+    console.log(
+      `  ⚠ 母数は足りているので「MIN_OWN_ARTICLES を下げる」は対処にならない。` +
+        `compute-dedup-rate は週次（月曜）なので、直近に追加した feed か、` +
+        `update 失敗でループが途中終了した可能性を先に疑うこと`,
+    );
+  }
   if (onlyNullPublished > 0) {
     console.log(
       `  ※ published_at が null の記事は compute-dedup-rate の 30d 窓（gte）から漏れる。` +
