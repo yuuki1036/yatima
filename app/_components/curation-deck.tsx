@@ -50,8 +50,13 @@ export function CurationDeck({
   // 分母を定数 10 にしない理由: curate は日次上限 10 を「上限」として使い下限は保証しない
   // （候補枯渇や dedup で 10 件未満になる日がある。lib/ranking/curate.ts）。生成が保証しない値を
   // UI が約束すると、6 件の日に 06/10 で終わって「4 件どこ行った」になる。
-  const [judgedOffset] = useState(() => Math.max(0, pickedToday - cards.length));
-  const total = Math.max(pickedToday, deck.length);
+  // deck と同じくマウント時に固定する。ライブの pickedToday を読むと、セッション中に「更新」を
+  // 押したとき（curate が当日ピックを追加し pickedToday だけ増える）分母だけが膨らみ、
+  // 5 枚しか捌いていないのに「全 8 件を見終わりました」と出てしまう。
+  const [{ judgedOffset, total }] = useState(() => ({
+    judgedOffset: Math.max(0, pickedToday - cards.length),
+    total: Math.max(pickedToday, cards.length),
+  }));
 
   // お気に入り状態はクライアントローカルで持つ。toggleStar は /saved のみ revalidate し "/" を
   // 触らないため（デッキの楽観 index を壊さないため）、★の見た目はサーバ再取得に頼らず楽観表示する。
@@ -243,7 +248,9 @@ export function CurationDeck({
           <div key={current.id} className={reduced ? undefined : "animate-card-enter"}>
             <SwipeCard
               card={current}
-              index={index + 1}
+              // カード上の通し番号もヘッダのカウンターと同じ基準にする（判定済み分をオフセット）。
+              // ここだけ index+1 のままだと、再訪時にヘッダ 04/07 とカード 01 が食い違う。
+              index={judgedOffset + index + 1}
               isStarred={starredIds.has(current.id)}
               onToggleStar={() => toggleStar(current)}
             />
@@ -254,13 +261,17 @@ export function CurationDeck({
             zIndex はカードラッパー（zIndex: 2）より上に置くこと。position のみ指定して
             z-index を省くと、CSS の描画順で「z-index:auto の positioned 要素」はカードより
             先に描かれ、不透明な bg-surface の裏に完全に隠れる（DOM 順が後でも隠れる）。
-            SKIP/KEEP が判定方向を示す唯一の視覚フィードバックなので、色でも区別する。 */}
+            カード自体の追従移動や下部ボタンも方向を示すが、SKIP/KEEP バッジが「今離すとどちらに
+            判定されるか」を最も直接に示すので、色でも区別する。色は
+            globals.css の negative/positive トークンを使う（a459529 の「色はトークンに集約」方針。
+            palette 色を直書きするとダークテーマで追従しない）。accent の赤は OPEN ボタンなど
+            一次アクションに予約されているので、判定色は別トークンに分けている。 */}
         <div
           className="pointer-events-none absolute inset-0 flex items-start justify-between p-4"
           style={{ zIndex: 3 }}
         >
           <span
-            className="border-2 border-rose-500 px-3 py-1 font-mono text-base font-bold tracking-widest text-rose-500"
+            className="border-2 border-negative px-3 py-1 font-mono text-base font-bold tracking-widest text-negative"
             style={{
               // 送り出し中（flyOut）はヒントを消す。dx を保持したままだとバッジが
               // 飛んでいくカードに残って汚いため。
@@ -271,7 +282,7 @@ export function CurationDeck({
             SKIP
           </span>
           <span
-            className="border-2 border-emerald-500 px-3 py-1 font-mono text-base font-bold tracking-widest text-emerald-500"
+            className="border-2 border-positive px-3 py-1 font-mono text-base font-bold tracking-widest text-positive"
             style={{
               opacity: flyOut || dx <= 0 ? 0 : Math.min(1, dx / SWIPE_THRESHOLD),
               transform: "rotate(12deg)",
