@@ -4,6 +4,8 @@ import {
   cosineSim,
   isNearDuplicate,
   DEDUP_THRESHOLD,
+  CARD_DEDUP_THRESHOLD,
+  QUIZ_DEDUP_THRESHOLD,
 } from "@/lib/ranking/dedup";
 
 describe("parseEmbedding", () => {
@@ -79,5 +81,24 @@ describe("isNearDuplicate", () => {
     const picked = [[1, 1]];
     expect(isNearDuplicate(cand, picked, 0.6)).toBe(true);
     expect(isNearDuplicate(cand, picked, DEDUP_THRESHOLD)).toBe(false);
+  });
+});
+
+// YAT-56 で実データ較正して 3 値を分離した。同値に戻す変更を検知するためのガード
+// （分離の根拠は dedup.ts のコメント / 再測定は `npm run diagnose-dedup`）。
+describe("dedup 閾値の分離（YAT-56 の較正結果）", () => {
+  it("quiz は card より高い（MCQ の兄弟は構造的に似るため巻き込みを避ける）", () => {
+    expect(QUIZ_DEDUP_THRESHOLD).toBeGreaterThan(CARD_DEDUP_THRESHOLD);
+  });
+
+  it("card は記事用と同値（maxSim 中央値から十分離れており動かす根拠が無い）", () => {
+    expect(CARD_DEDUP_THRESHOLD).toBe(DEDUP_THRESHOLD);
+  });
+
+  it("すべて 0..1 の cosine 域にある", () => {
+    for (const t of [DEDUP_THRESHOLD, CARD_DEDUP_THRESHOLD, QUIZ_DEDUP_THRESHOLD]) {
+      expect(t).toBeGreaterThan(0);
+      expect(t).toBeLessThanOrEqual(1);
+    }
   });
 });

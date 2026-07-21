@@ -292,8 +292,13 @@ async function main() {
       );
     }
     console.log(
-      "  ※ attempts 数がズレていれば cascade 欠損（question 削除で attempt 行も消える）の可能性。" +
-        "パラメータ間の相対比較は同一元帳上で行うため、乖離があっても比較の妥当性は保たれる。",
+      "  ※ 乖離の切り分け（YAT-56 で 1 件を実際に追跡した手順）:\n" +
+        "     - attempts 数がズレている → cascade 欠損（question 削除で attempt 行も消える）\n" +
+        "     - attempts 数は一致するのに値がズレる → その concept の初回 attempt が YAT-28（EWMA 導入・\n" +
+        "       2026-07-03 20:56 JST）より前で、topic_mastery に YAT-27 の素正答率が prev として\n" +
+        "       残っている可能性。保存値から逆算して素正答率を初期値にすると一致することが多い\n" +
+        "  ※ いずれの場合もパラメータ間の相対比較は同一元帳上で行うため、比較の妥当性は保たれる。\n" +
+        "     元帳を正とするなら backfill で解消する（キャッシュを replay 値で上書きする）",
     );
   }
 
