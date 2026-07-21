@@ -4,6 +4,8 @@ import {
   cosineSim,
   isNearDuplicate,
   DEDUP_THRESHOLD,
+  CARD_DEDUP_THRESHOLD,
+  QUIZ_DEDUP_THRESHOLD,
 } from "@/lib/ranking/dedup";
 
 describe("parseEmbedding", () => {
@@ -79,5 +81,26 @@ describe("isNearDuplicate", () => {
     const picked = [[1, 1]];
     expect(isNearDuplicate(cand, picked, 0.6)).toBe(true);
     expect(isNearDuplicate(cand, picked, DEDUP_THRESHOLD)).toBe(false);
+  });
+});
+
+// YAT-56 の較正の記録。3 値は現状すべて 0.86 だが、それぞれ別の理由で 0.86 に居る
+// （card=プラトー中央で動かす根拠なし / quiz=弾いた候補を観測できず判断保留 / 記事=別ドメイン）。
+// 値そのものをリテラルで固定し、「気づかず動く」ことだけを防ぐ。定数間の関係は固定しない
+// （偶然の一致を仕様にすると、無関係なドメインの較正で別ドメインのテストが落ちる）。
+describe("dedup 閾値（YAT-56 の較正記録）", () => {
+  it("card は 0.86（maxSim 中央値 0.740 に対しプラトーの中央）", () => {
+    expect(CARD_DEDUP_THRESHOLD).toBe(0.86);
+  });
+
+  it("quiz は 0.86（弾いた候補が観測できないため据え置き。根拠は dedup.ts のコメント）", () => {
+    expect(QUIZ_DEDUP_THRESHOLD).toBe(0.86);
+  });
+
+  it("すべて 0..1 の cosine 域にある", () => {
+    for (const t of [DEDUP_THRESHOLD, CARD_DEDUP_THRESHOLD, QUIZ_DEDUP_THRESHOLD]) {
+      expect(t).toBeGreaterThan(0);
+      expect(t).toBeLessThanOrEqual(1);
+    }
   });
 });

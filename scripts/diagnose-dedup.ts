@@ -34,9 +34,38 @@ const SELECT_PAGE = 1000; // PostgREST 既定の 1 ページ上限。超える�
 const THRESHOLDS = [0.8, 0.82, 0.84, 0.86, 0.88, 0.9, 0.92]; // スイープする閾値（tunable）
 const HIST_BUCKETS = [0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95]; // maxSim 分布のバケツ下限
 const EXAMPLES = 5; // ダンプする高類似ペアの実例上限
+const PAIR_DUMP_LIMIT = 40; // --pairs で列挙するペアの上限
+
+// `--pairs <lo> <hi>` で類似度帯を指定すると、その帯に入る全ペアを類似度降順で列挙する。
+// 閾値を決めるには「この帯のペアが本当に重複か」を人が見る必要があり、maxSim の実例 5 件では
+// 判断材料が足りない（YAT-56 の較正作業で追加）。
+function parsePairBand(): { lo: number; hi: number } | null {
+  const i = process.argv.indexOf("--pairs");
+  if (i < 0) {
+    // 形式ミス（--pairs=0.8 等）を黙って無視すると「該当ペアなし」と誤解される。
+    const unknown = process.argv.slice(2).filter((a) => a.startsWith("-"));
+    if (unknown.length > 0) {
+      console.error(`未知の引数: ${unknown.join(" ")}`);
+      console.error("使い方: npm run diagnose-dedup -- --pairs <lo> <hi>  例: --pairs 0.86 0.9");
+      process.exit(1);
+    }
+    return null;
+  }
+  const lo = Number(process.argv[i + 1]);
+  const hi = Number(process.argv[i + 2]);
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo >= hi) {
+    console.error("使い方: npm run diagnose-dedup -- --pairs <lo> <hi>  例: --pairs 0.78 0.95");
+    process.exit(1);
+  }
+  return { lo, hi };
+}
+
+const PAIR_BAND = parsePairBand();
 
 // 本番の母集団更新の違い。閾値スイープの計算方法がこれで変わる。
 type DedupMode = "keep-all" | "skip-dup";
+
+type Parsed = { vec: number[]; label: string; source: string | null };
 
 type Row = {
   id: string;
@@ -45,6 +74,7 @@ type Row = {
   status?: string | null;
   dup_similarity?: number | null;
   label: string; // 実例ダンプ用の短い識別テキスト
+  source: string | null; // 由来（card は article_id / quiz は source_ref）。同一ソース内かの判定用
 };
 
 // 1 テーブルを .range() で全件ページ取得する。created_at desc だけでは同一 created_at で
@@ -80,11 +110,66 @@ type Analysis = {
   maxSims: number[]; // 各行の「自分より古い全行」に対する最大 cosine（分布表示用）
   sweep: { threshold: number; dup: number }[]; // 閾値ごとの dup 件数
   examples: { sim: number; a: string; b: string }[];
+  bandPairs: { sim: number; a: string; b: string; sameSource: boolean }[]; // --pairs 指定時のみ
+  // 同一ソース由来（同じ記事から生成された兄弟）と、ソース跨ぎのペアを閾値ごとに分けた件数。
+  // dedup が「重複した設問」ではなく「同じ記事の別観点」を弾いていないかを見る。
+  sourceSplit: { threshold: number; same: number; cross: number; unknown: number }[];
+  sourceNullRows: number; // source が null の行数（多いと分割の解釈が成立しない）
 };
 
+// 全ペアを走査して、閾値ごとに「同一ソース内」「ソース跨ぎ」の件数を数える。
+// 全ペアの cosine を 1 度だけ計算し、閾値ごとのバケツに振る。閾値ごとに再計算すると
+// THRESHOLDS の数だけ N² が増える（母集団が伸びたときに効く）。
+// source が片方でも null のペアは「跨ぎ」ではなく unknown に分ける。null を跨ぎに混ぜると
+// 「別記事の重複を拾っている」と正反対に読める出力になる。
+function splitBySource(
+  parsed: Parsed[],
+): { threshold: number; same: number; cross: number; unknown: number }[] {
+  const acc = THRESHOLDS.map((threshold) => ({ threshold, same: 0, cross: 0, unknown: 0 }));
+  for (let i = 0; i < parsed.length; i += 1) {
+    for (let j = 0; j < i; j += 1) {
+      if (parsed[i].vec.length !== parsed[j].vec.length) continue;
+      const sim = cosineSim(parsed[i].vec, parsed[j].vec);
+      const si = parsed[i].source;
+      const sj = parsed[j].source;
+      const kind = si === null || sj === null ? "unknown" : si === sj ? "same" : "cross";
+      for (const bucket of acc) {
+        if (sim >= bucket.threshold) bucket[kind] += 1;
+      }
+    }
+  }
+  return acc;
+}
+
+// 指定した類似度帯に入る全ペアを類似度降順で返す（--pairs 用）。maxSim と違い「各行の最近傍」に
+// 限らないので、同一記事から作られた設問群のように 3 件以上が互いに似ているケースも見える。
+function pairsInBand(
+  parsed: Parsed[],
+  band: { lo: number; hi: number },
+): { sim: number; a: string; b: string; sameSource: boolean }[] {
+  const out: { sim: number; a: string; b: string; sameSource: boolean }[] = [];
+  for (let i = 0; i < parsed.length; i += 1) {
+    for (let j = 0; j < i; j += 1) {
+      if (parsed[i].vec.length !== parsed[j].vec.length) continue;
+      const sim = cosineSim(parsed[i].vec, parsed[j].vec);
+      if (sim >= band.lo && sim <= band.hi) {
+        const si = parsed[i].source;
+        const sj = parsed[j].source;
+        out.push({
+          sim,
+          a: parsed[i].label,
+          b: parsed[j].label,
+          sameSource: si !== null && sj !== null && si === sj,
+        });
+      }
+    }
+  }
+  return out.sort((x, y) => y.sim - x.sim);
+}
+
 // 古い順に並べた embedding 列。本番の累積（候補 vs それまでの母集団）と順序を揃える。
-function parseInOrder(rows: Row[]): { parsed: { vec: number[]; label: string }[]; failed: number } {
-  const parsed: { vec: number[]; label: string }[] = [];
+function parseInOrder(rows: Row[]): { parsed: Parsed[]; failed: number } {
+  const parsed: Parsed[] = [];
   let failed = 0;
   // 取得は created_at desc なので、累積を本番と揃えるため古い順に反転する。
   for (const r of [...rows].reverse()) {
@@ -93,13 +178,13 @@ function parseInOrder(rows: Row[]): { parsed: { vec: number[]; label: string }[]
       failed += 1;
       continue;
     }
-    parsed.push({ vec, label: r.label });
+    parsed.push({ vec, label: r.label, source: r.source });
   }
   return { parsed, failed };
 }
 
 // 全行を母集団に積む前提での maxSim（card の挙動）。分布表示にも使う。
-function computeMaxSims(parsed: { vec: number[]; label: string }[]): {
+function computeMaxSims(parsed: Parsed[]): {
   maxSims: number[];
   dimMismatch: number;
   examples: { sim: number; a: string; b: string }[];
@@ -137,7 +222,7 @@ function computeMaxSims(parsed: { vec: number[]; label: string }[]): {
 
 // skip 方式（quiz）の閾値スイープ。dup を母集団に積まないので閾値ごとに累積を回し直す。
 // keep-all（card）で使うと母集団が変わらないため maxSims との比較と一致する。
-function sweepWithSkip(parsed: { vec: number[]; label: string }[], threshold: number): number {
+function sweepWithSkip(parsed: Parsed[], threshold: number): number {
   const population: number[][] = [];
   let skipped = 0;
   for (const cand of parsed) {
@@ -171,6 +256,9 @@ function analyze(rows: Row[], mode: DedupMode): Analysis {
     maxSims,
     sweep,
     examples,
+    bandPairs: PAIR_BAND ? pairsInBand(parsed, PAIR_BAND) : [],
+    sourceSplit: splitBySource(parsed),
+    sourceNullRows: parsed.filter((p) => p.source === null).length,
   };
 }
 
@@ -201,6 +289,36 @@ function report(title: string, a: Analysis, current: number, mode: DedupMode, no
     );
   }
 
+  {
+    // dedup が「重複した設問」を弾いているのか「同じ素材から作られた別観点」を弾いているのかを
+    // 分ける。後者が支配的なら、閾値の上下では解決しない構造の問題。
+    console.log("\n  閾値以上のペアの内訳（同一ソース内 / ソース跨ぎ / ソース不明）:");
+    if (a.sourceNullRows > 0) {
+      console.log(
+        `    ⚠ source が null の行が ${a.sourceNullRows}/${a.withEmbedding} 件。` +
+          `その行を含むペアは「不明」に計上され、同一/跨ぎの比率は当てにならない`,
+      );
+    }
+    for (const s of a.sourceSplit) {
+      const total = s.same + s.cross + s.unknown;
+      const mark = Math.abs(s.threshold - current) < 1e-9 ? "  ← 現行" : "";
+      console.log(
+        `    ${s.threshold.toFixed(2)}  同一 ${String(s.same).padStart(4)}` +
+          ` / 跨ぎ ${String(s.cross).padStart(4)}` +
+          ` / 不明 ${String(s.unknown).padStart(4)}` +
+          `（同一が ${pct(s.same, total)}）${mark}`,
+      );
+    }
+    if (mode === "skip-dup") {
+      // 閾値スイープと同じ survivorship がここにも効く。現存行だけを見ているので
+      // 「跨ぎ 0 件」は跨ぎ重複が無い証拠にならない（弾かれた側は DB に残らない）。
+      console.log(
+        "    ※ skip 方式では弾かれた候補が DB に残らないため、この内訳は現存行に対するもの。" +
+          "「跨ぎ 0 件」は跨ぎ重複が無い証拠ではなく、除去された結果と区別がつかない",
+      );
+    }
+  }
+
   console.log("\n  maxSim の分布（全行を母集団に積んだ場合の最近傍。分布把握用）:");
   const sorted = [...a.maxSims].sort((x, y) => x - y);
   for (let i = HIST_BUCKETS.length - 1; i >= 0; i -= 1) {
@@ -217,6 +335,24 @@ function report(title: string, a: Analysis, current: number, mode: DedupMode, no
     `  中央値 ${p(0.5).toFixed(3)} / p90 ${p(0.9).toFixed(3)} / p99 ${p(0.99).toFixed(3)}` +
       ` / 最大 ${(sorted[sorted.length - 1] ?? 0).toFixed(3)}`,
   );
+
+  if (PAIR_BAND) {
+    // 閾値を決めるための目視用。各ペアが「真の重複」か「同一記事の別観点」かを人が判定する。
+    const shown = a.bandPairs.slice(0, PAIR_DUMP_LIMIT);
+    console.log(
+      `\n  --- 類似度 ${PAIR_BAND.lo}〜${PAIR_BAND.hi}（両端含む）のペア（全 ${a.bandPairs.length} 組` +
+        `${a.bandPairs.length > shown.length ? `・上位 ${shown.length} 組を表示` : ""}）---`,
+    );
+    for (const p of shown) {
+      console.log(`    [sim=${p.sim.toFixed(3)} ${p.sameSource ? "同一ソース" : "ソース跨ぎ"}]`);
+      console.log(`      A: ${p.a.replace(/\s+/g, " ").slice(0, 110)}`);
+      console.log(`      B: ${p.b.replace(/\s+/g, " ").slice(0, 110)}`);
+    }
+    if (a.bandPairs.length > shown.length) {
+      console.log(`    …残り ${a.bandPairs.length - shown.length} 組は非表示`);
+    }
+    return;
+  }
 
   if (a.examples.length > 0) {
     console.log("\n  --- 高類似ペアの実例 ---");
@@ -237,7 +373,7 @@ async function main() {
   const cardRaw = await selectAllRows(
     supabase,
     "card_candidates",
-    "id, created_at, embedding, status, dup_similarity, type, front, back, cloze_text",
+    "id, created_at, embedding, status, dup_similarity, article_id, type, front, back, cloze_text",
   );
   const cardRows: Row[] = cardRaw.map((r) => ({
     id: r.id as string,
@@ -249,6 +385,7 @@ async function main() {
       (r.type === "cloze" ? (r.cloze_text as string) : (r.front as string)) ??
       (r.back as string) ??
       "(空)",
+    source: (r.article_id as string | null) ?? null,
   }));
   report(
     "card_candidates（全 status）",
@@ -285,7 +422,7 @@ async function main() {
   const quizRaw = await selectAllRows(
     supabase,
     "quiz_questions",
-    "id, created_at, embedding, status, stem",
+    "id, created_at, embedding, status, source_ref, stem",
   );
   const toQuizRow = (r: Record<string, unknown>): Row => ({
     id: r.id as string,
@@ -293,6 +430,7 @@ async function main() {
     embedding: r.embedding,
     status: r.status as string | null,
     label: (r.stem as string) ?? "(空)",
+    source: (r.source_ref as string | null) ?? null,
   });
   const quizActive = quizRaw.filter((r) => r.status === "active").map(toQuizRow);
   report(
