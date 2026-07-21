@@ -6,7 +6,8 @@ config({ path: ".env.local" });
 import { createAdminClient } from "../lib/supabase/admin";
 import { createCardGenerator } from "../lib/llm/generate-cards";
 import { htmlToInputText } from "../lib/llm/extract-text";
-import { stripCloze, isValidFormat } from "../lib/learn/card-gate";
+import { cardTarget, isValidFormat } from "../lib/learn/card-gate";
+import { MAX_CARDS_PER_ARTICLE } from "../lib/llm/generate-cards";
 import {
   norm,
   groundingReason,
@@ -44,12 +45,17 @@ async function main() {
     return;
   }
 
-  // 本番 runCardGate は read 済み・useful 記事を対象にするが、ここは棄却理由の分布を見るのが目的
-  // なので素の新着を取る（MCQ 版と同条件にして経路間で比較できるようにする）。
+  // 本番 runCardGate（loadTargetArticles）の母集団は「useful フィードバック済み × summary 有り ×
+  // 未カード化」。ここは棄却理由の分布を見るのが目的なので素の新着を取り、MCQ 版と条件を揃えて
+  // 経路間で比較できるようにする。ただし summary は照合母体の一部なので本番と同じく必須にする
+  // （summary=null が混ざると母体が短くなり②の棄却が本番より出やすくなる）。
+  // 既知の限界: published_at 降順の新着は投稿量の多い英語フィードに偏るため、日本語記事×日本語
+  // カードの層は事実上サンプルされない。④の言語ミスマッチはこのサンプルでしか確認していない。
   const { data, error } = await supabase
     .from("articles")
     .select("id, title, content_html, summary")
     .not("content_html", "is", null)
+    .not("summary", "is", null)
     .order("published_at", { ascending: false, nullsFirst: false })
     .limit(SAMPLE_ARTICLES);
   if (error) {
@@ -82,6 +88,10 @@ async function main() {
     target: string;
     jac: number;
   }[] = [];
+  // 本番は grounding 通過後に MAX_CARDS_PER_ARTICLE で切る（runCardGate の slice）。この診断は
+  // 棄却理由の分布を見るのが目的なので cap を掛けずに数えるが、④無効化で survivors が増えると
+  // cap が binding しやすくなり通過率が実効値より上振れする。差分を可視化するため別途数える。
+  let cappedByMaxCards = 0; // cap 適用なら捨てられていた枚数（④無効時の survivors 基準）
 
   for (const article of articles) {
     // 本番 runCardGate と同じ照合母体の組み方（本文 + summary）。
@@ -106,18 +116,25 @@ async function main() {
     }
     generated += cards.length;
 
+    // ④無効（＝現行本番）で grounding を通る枚数。cap がこの記事で binding するかを測る。
+    const survivorsNoOverlap = cards.filter(
+      (c) =>
+        isValidFormat(c) &&
+        groundingReason(c.source_quote, groundBody, cardTarget(c), 0) === "pass",
+    ).length;
+    cappedByMaxCards += Math.max(0, survivorsNoOverlap - MAX_CARDS_PER_ARTICLE);
+
     for (const card of cards) {
       // runCardGate と同じ順: ①形式 → ②grounding。
       if (!isValidFormat(card)) {
         invalidFormat += 1;
         continue;
       }
-      // isGrounded と同じ target の組み方（cloze は穴埋めマーカーを外す）。
-      const target =
-        card.type === "cloze"
-          ? stripCloze(card.cloze_text ?? "")
-          : `${card.front ?? ""} ${card.back ?? ""}`;
-      const reason = groundingReason(card.source_quote, groundBody, target);
+      // target は本番と同じ組み方（card-gate の cardTarget を共有）。
+      // ここは④を有効にした場合の棄却内訳を測るのが目的なので、既定値を明示的に渡す
+      // （grounding.ts の注記どおり、省略せず意図を残す）。
+      const target = cardTarget(card);
+      const reason = groundingReason(card.source_quote, groundBody, target, MIN_OVERLAP);
       reasonCounts[reason] += 1;
       byType[card.type].total += 1;
 
@@ -154,8 +171,13 @@ async function main() {
   console.log(`  not_verbatim(②) ${reasonCounts.not_verbatim}`);
   console.log(`  not_specific(③) ${reasonCounts.not_specific}`);
   console.log(`  low_overlap(④)  ${reasonCounts.low_overlap}`);
-  console.log(`④有効（=${MIN_OVERLAP}）とした場合の通過率（pass / 生成）= ${passRate}%`);
-  console.log(`現行本番の通過率（④無効: pass+low_overlap / 生成）= ${noOverlapRate}%`);
+  console.log(`  └ ④棄却は生成の ${((reasonCounts.low_overlap / Math.max(1, generated)) * 100).toFixed(1)}%`);
+  console.log(`④有効（=${MIN_OVERLAP}）とした場合の grounding 通過率（pass / 生成）= ${passRate}%`);
+  console.log(`現行本番の grounding 通過率（④無効: pass+low_overlap / 生成）= ${noOverlapRate}%`);
+  console.log(
+    `  ※ 上記は枚数上限（MAX_CARDS_PER_ARTICLE=${MAX_CARDS_PER_ARTICLE}）適用前。` +
+      `cap で落ちる枚数: ${cappedByMaxCards}`,
+  );
 
   console.log("\n--- type 別の④棄却 ---");
   for (const t of ["qa", "cloze"] as const) {
