@@ -41,7 +41,16 @@ const PAIR_DUMP_LIMIT = 40; // --pairs で列挙するペアの上限
 // 判断材料が足りない（YAT-56 の較正作業で追加）。
 function parsePairBand(): { lo: number; hi: number } | null {
   const i = process.argv.indexOf("--pairs");
-  if (i < 0) return null;
+  if (i < 0) {
+    // 形式ミス（--pairs=0.8 等）を黙って無視すると「該当ペアなし」と誤解される。
+    const unknown = process.argv.slice(2).filter((a) => a.startsWith("-"));
+    if (unknown.length > 0) {
+      console.error(`未知の引数: ${unknown.join(" ")}`);
+      console.error("使い方: npm run diagnose-dedup -- --pairs <lo> <hi>  例: --pairs 0.86 0.9");
+      process.exit(1);
+    }
+    return null;
+  }
   const lo = Number(process.argv[i + 1]);
   const hi = Number(process.argv[i + 2]);
   if (!Number.isFinite(lo) || !Number.isFinite(hi) || lo >= hi) {
@@ -104,27 +113,32 @@ type Analysis = {
   bandPairs: { sim: number; a: string; b: string; sameSource: boolean }[]; // --pairs 指定時のみ
   // 同一ソース由来（同じ記事から生成された兄弟）と、ソース跨ぎのペアを閾値ごとに分けた件数。
   // dedup が「重複した設問」ではなく「同じ記事の別観点」を弾いていないかを見る。
-  sourceSplit: { threshold: number; same: number; cross: number }[];
-  sourceKnown: boolean; // source が 1 件でも非 null か（不明なら分割は無意味）
+  sourceSplit: { threshold: number; same: number; cross: number; unknown: number }[];
+  sourceNullRows: number; // source が null の行数（多いと分割の解釈が成立しない）
 };
 
 // 全ペアを走査して、閾値ごとに「同一ソース内」「ソース跨ぎ」の件数を数える。
-function splitBySource(parsed: Parsed[]): { threshold: number; same: number; cross: number }[] {
-  return THRESHOLDS.map((threshold) => {
-    let same = 0;
-    let cross = 0;
-    for (let i = 0; i < parsed.length; i += 1) {
-      for (let j = 0; j < i; j += 1) {
-        if (parsed[i].vec.length !== parsed[j].vec.length) continue;
-        if (cosineSim(parsed[i].vec, parsed[j].vec) < threshold) continue;
-        const si = parsed[i].source;
-        const sj = parsed[j].source;
-        if (si !== null && sj !== null && si === sj) same += 1;
-        else cross += 1;
+// 全ペアの cosine を 1 度だけ計算し、閾値ごとのバケツに振る。閾値ごとに再計算すると
+// THRESHOLDS の数だけ N² が増える（母集団が伸びたときに効く）。
+// source が片方でも null のペアは「跨ぎ」ではなく unknown に分ける。null を跨ぎに混ぜると
+// 「別記事の重複を拾っている」と正反対に読める出力になる。
+function splitBySource(
+  parsed: Parsed[],
+): { threshold: number; same: number; cross: number; unknown: number }[] {
+  const acc = THRESHOLDS.map((threshold) => ({ threshold, same: 0, cross: 0, unknown: 0 }));
+  for (let i = 0; i < parsed.length; i += 1) {
+    for (let j = 0; j < i; j += 1) {
+      if (parsed[i].vec.length !== parsed[j].vec.length) continue;
+      const sim = cosineSim(parsed[i].vec, parsed[j].vec);
+      const si = parsed[i].source;
+      const sj = parsed[j].source;
+      const kind = si === null || sj === null ? "unknown" : si === sj ? "same" : "cross";
+      for (const bucket of acc) {
+        if (sim >= bucket.threshold) bucket[kind] += 1;
       }
     }
-    return { threshold, same, cross };
-  });
+  }
+  return acc;
 }
 
 // 指定した類似度帯に入る全ペアを類似度降順で返す（--pairs 用）。maxSim と違い「各行の最近傍」に
@@ -138,7 +152,7 @@ function pairsInBand(
     for (let j = 0; j < i; j += 1) {
       if (parsed[i].vec.length !== parsed[j].vec.length) continue;
       const sim = cosineSim(parsed[i].vec, parsed[j].vec);
-      if (sim >= band.lo && sim < band.hi) {
+      if (sim >= band.lo && sim <= band.hi) {
         const si = parsed[i].source;
         const sj = parsed[j].source;
         out.push({
@@ -244,7 +258,7 @@ function analyze(rows: Row[], mode: DedupMode): Analysis {
     examples,
     bandPairs: PAIR_BAND ? pairsInBand(parsed, PAIR_BAND) : [],
     sourceSplit: splitBySource(parsed),
-    sourceKnown: parsed.some((p) => p.source !== null),
+    sourceNullRows: parsed.filter((p) => p.source === null).length,
   };
 }
 
@@ -275,17 +289,32 @@ function report(title: string, a: Analysis, current: number, mode: DedupMode, no
     );
   }
 
-  if (a.sourceKnown) {
-    // dedup が「重複した設問」を弾いているのか「同じ記事から作られた別観点の設問」を
-    // 弾いているのかを分ける。後者が支配的なら、閾値の上下では解決しない構造の問題。
-    console.log("\n  閾値以上のペアの内訳（同一ソース内 / ソース跨ぎ）:");
+  {
+    // dedup が「重複した設問」を弾いているのか「同じ素材から作られた別観点」を弾いているのかを
+    // 分ける。後者が支配的なら、閾値の上下では解決しない構造の問題。
+    console.log("\n  閾値以上のペアの内訳（同一ソース内 / ソース跨ぎ / ソース不明）:");
+    if (a.sourceNullRows > 0) {
+      console.log(
+        `    ⚠ source が null の行が ${a.sourceNullRows}/${a.withEmbedding} 件。` +
+          `その行を含むペアは「不明」に計上され、同一/跨ぎの比率は当てにならない`,
+      );
+    }
     for (const s of a.sourceSplit) {
-      const total = s.same + s.cross;
+      const total = s.same + s.cross + s.unknown;
       const mark = Math.abs(s.threshold - current) < 1e-9 ? "  ← 現行" : "";
       console.log(
-        `    ${s.threshold.toFixed(2)}  同一ソース ${String(s.same).padStart(4)}` +
+        `    ${s.threshold.toFixed(2)}  同一 ${String(s.same).padStart(4)}` +
           ` / 跨ぎ ${String(s.cross).padStart(4)}` +
-          `（同一ソースが ${pct(s.same, total)}）${mark}`,
+          ` / 不明 ${String(s.unknown).padStart(4)}` +
+          `（同一が ${pct(s.same, total)}）${mark}`,
+      );
+    }
+    if (mode === "skip-dup") {
+      // 閾値スイープと同じ survivorship がここにも効く。現存行だけを見ているので
+      // 「跨ぎ 0 件」は跨ぎ重複が無い証拠にならない（弾かれた側は DB に残らない）。
+      console.log(
+        "    ※ skip 方式では弾かれた候補が DB に残らないため、この内訳は現存行に対するもの。" +
+          "「跨ぎ 0 件」は跨ぎ重複が無い証拠ではなく、除去された結果と区別がつかない",
       );
     }
   }
@@ -311,7 +340,7 @@ function report(title: string, a: Analysis, current: number, mode: DedupMode, no
     // 閾値を決めるための目視用。各ペアが「真の重複」か「同一記事の別観点」かを人が判定する。
     const shown = a.bandPairs.slice(0, PAIR_DUMP_LIMIT);
     console.log(
-      `\n  --- 類似度 ${PAIR_BAND.lo}〜${PAIR_BAND.hi} のペア（全 ${a.bandPairs.length} 組` +
+      `\n  --- 類似度 ${PAIR_BAND.lo}〜${PAIR_BAND.hi}（両端含む）のペア（全 ${a.bandPairs.length} 組` +
         `${a.bandPairs.length > shown.length ? `・上位 ${shown.length} 組を表示` : ""}）---`,
     );
     for (const p of shown) {

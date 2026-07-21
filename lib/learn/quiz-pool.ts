@@ -1,14 +1,10 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { createEmbedder, type Embedder } from "@/lib/llm/embed";
-import {
-  vecToPg,
-  quizQuestionEmbedText,
-  embedMissingQuizQuestions,
-} from "@/lib/rss/embed";
-import { cosineSim, parseEmbedding, QUIZ_DEDUP_THRESHOLD } from "@/lib/ranking/dedup";
+import { embedMissingQuizQuestions } from "@/lib/rss/embed";
 import { createQuizGenerator } from "@/lib/llm/generate-quiz";
 import { TAG_LEAVES, type TagSlug } from "@/lib/tags/vocabulary";
 import {
+  embedAndDedupQuizRows,
   generateGatedQuizRows,
   insertQuizRows,
   type QuizInsertRow,
@@ -34,11 +30,6 @@ const BACKFILL_EMBED_LIMIT = 12; // オンデマンド由来の embedding=null �
 // レート制御外のため）。succeeded ではなく「叩いたか」で判定する（全チャンク失敗でもリクエストは飛ぶ）。
 const INTER_EMBED_SLEEP_MS = 21_000;
 
-// dedup 母集団の全件ページ取得の 1 ページ上限（PostgREST 既定。card-gate と同値）。
-const SELECT_PAGE = 1000;
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
 // cron の対象カテゴリ = tech/* leaf（オンデマンドの parseQuizCategory が tech/* のみ許すため、
 // おまかせも tech プールで賄える）。
 const CRON_CATEGORIES: TagSlug[] = TAG_LEAVES.filter(
@@ -55,40 +46,6 @@ export type QuizPoolResult = {
   backfill: { picked: number; succeeded: number; skipped: boolean }; // 補完 embed の結果
   skipped: boolean; // ANTHROPIC_API_KEY 未設定で生成スキップ
 };
-
-// active かつ embedding 持ちの quiz_questions の embedding 列を全件ページ取得して dedup 母集団にする。
-// 取得失敗は fail-soft で空母集団に倒す（＝この回は dedup が効かないだけ）。
-// deficit 収束により active プールは POOL_TARGET_PER_CATEGORY×カテゴリ数（≈100 問）に頭打ちするため
-// 全件で足りる。POOL_TARGET を大幅に上げる／retire 運用を止める場合は母集団を窓（直近 N 件）で切ること。
-async function loadQuizDedupPopulation(
-  supabase: SupabaseClient,
-): Promise<number[][]> {
-  const vecs: number[][] = [];
-  try {
-    for (let from = 0; ; from += SELECT_PAGE) {
-      const { data, error } = await supabase
-        .from("quiz_questions")
-        .select("embedding")
-        .eq("status", "active")
-        .not("embedding", "is", null)
-        // id を二次キーにしてページ境界の取りこぼし/重複を防ぐ（card-gate と同じ作法）。
-        .order("created_at", { ascending: false })
-        .order("id", { ascending: true })
-        .range(from, from + SELECT_PAGE - 1);
-      if (error) throw error;
-      const batch = (data ?? []) as unknown as Record<string, unknown>[];
-      for (const r of batch) {
-        const v = parseEmbedding(r.embedding);
-        if (v) vecs.push(v);
-      }
-      if (batch.length < SELECT_PAGE) break;
-    }
-  } catch (e) {
-    console.warn("クイズ dedup 母集団の取得に失敗（空母集団で続行）:", e);
-    return [];
-  }
-  return vecs;
-}
 
 // active 件数を数える（head:true で行本体は取らない軽量 count）。category=null は全カテゴリ合算。
 // 失敗は 0 扱い＝deficit を大きく見積もって生成側に倒す（プールが空に見えても生成上限で頭打ちに
@@ -199,46 +156,17 @@ export async function runQuizPool(
 
   if (candidates.length === 0) return result;
 
-  // ③ dedup 母集団を読み込む（②のバックフィル分も DB に反映済みなので拾える）。
-  const population = await loadQuizDedupPopulation(supabase);
-
-  // ④ 候補を 1 回の embed() でまとめて埋める（Voyage 呼び出し 2 回目）。呼び出し"間"は 21s 保険。
-  let vectors: (number[] | null)[] = candidates.map(() => null);
-  if (embedder) {
-    if (backfill.picked > 0 && !backfill.skipped) await sleep(INTER_EMBED_SLEEP_MS);
-    try {
-      // row は QuizInsertRow 型なのでキャストなしで embed テキストを組める（quizQuestionEmbedText の
-      // 構造的型を満たす）。フィールド改名は gateMCQs 側でコンパイルエラーになり静かに壊れない。
-      vectors = await embedder.embed(
-        candidates.map((row) => quizQuestionEmbedText(row)),
-      );
-    } catch (e) {
-      console.warn("候補クイズの embed に失敗（embedding=null で積む）:", e);
-    }
-  }
-
-  // ⑤ dedup: 既存母集団＋バッチ内既採用と cosine 照合。閾値超えは skip（insert しない）。
-  // embed 失敗（null）は embedding=null で積み、次回バックフィルが埋めて以降の母集団に乗せる。
-  const rows: QuizInsertRow[] = [];
-  candidates.forEach((row, i) => {
-    const vec = vectors[i];
-    if (vec) {
-      let maxSim = 0;
-      for (const p of population) {
-        const sim = cosineSim(vec, p);
-        if (sim > maxSim) maxSim = sim;
-      }
-      if (maxSim >= QUIZ_DEDUP_THRESHOLD) {
-        result.dupSkipped += 1;
-        return;
-      }
-      population.push(vec); // 同一 run の後続候補ともダブらせない
-      rows.push({ ...row, embedding: vecToPg(vec) });
-    } else {
-      result.embedFailed += 1;
-      rows.push({ ...row, embedding: null });
-    }
+  // ③④⑤ embed → dedup（quiz-gate の共有ヘルパ。オンデマンド経路と同一実装を通す）。
+  // 直前のバックフィルが実際に Voyage を叩いた回だけ、候補 embed との間に保険の sleep を挟む
+  // （embed() 呼び出し"間"はレート制御外のため）。succeeded ではなく「叩いたか」で判定する。
+  const deduped = await embedAndDedupQuizRows(supabase, candidates, {
+    embedder,
+    sleepBeforeEmbedMs:
+      backfill.picked > 0 && !backfill.skipped ? INTER_EMBED_SLEEP_MS : 0,
   });
+  result.dupSkipped = deduped.dupSkipped;
+  result.embedFailed = deduped.embedFailed;
+  const rows = deduped.rows;
 
   // ⑥ 一括 insert（全行に embedding キーを付与済み＝PostgREST の bulk insert のキー整合を満たす）。
   const inserted = await insertQuizRows(supabase, rows);

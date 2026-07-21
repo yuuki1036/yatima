@@ -84,15 +84,17 @@ describe("isNearDuplicate", () => {
   });
 });
 
-// YAT-56 で実データ較正して 3 値を分離した。同値に戻す変更を検知するためのガード
-// （分離の根拠は dedup.ts のコメント / 再測定は `npm run diagnose-dedup`）。
-describe("dedup 閾値の分離（YAT-56 の較正結果）", () => {
-  it("quiz は card より高い（MCQ の兄弟は構造的に似るため巻き込みを避ける）", () => {
-    expect(QUIZ_DEDUP_THRESHOLD).toBeGreaterThan(CARD_DEDUP_THRESHOLD);
+// YAT-56 の較正の記録。3 値は現状すべて 0.86 だが、それぞれ別の理由で 0.86 に居る
+// （card=プラトー中央で動かす根拠なし / quiz=弾いた候補を観測できず判断保留 / 記事=別ドメイン）。
+// 値そのものをリテラルで固定し、「気づかず動く」ことだけを防ぐ。定数間の関係は固定しない
+// （偶然の一致を仕様にすると、無関係なドメインの較正で別ドメインのテストが落ちる）。
+describe("dedup 閾値（YAT-56 の較正記録）", () => {
+  it("card は 0.86（maxSim 中央値 0.740 に対しプラトーの中央）", () => {
+    expect(CARD_DEDUP_THRESHOLD).toBe(0.86);
   });
 
-  it("card は記事用と同値（maxSim 中央値から十分離れており動かす根拠が無い）", () => {
-    expect(CARD_DEDUP_THRESHOLD).toBe(DEDUP_THRESHOLD);
+  it("quiz は 0.86（弾いた候補が観測できないため据え置き。根拠は dedup.ts のコメント）", () => {
+    expect(QUIZ_DEDUP_THRESHOLD).toBe(0.86);
   });
 
   it("すべて 0..1 の cosine 域にある", () => {
