@@ -17,6 +17,7 @@
     "generate-cards": "tsx scripts/generate-cards.ts",
     "generate-quiz": "tsx scripts/generate-quiz.ts",
     "diagnose-grounding": "tsx scripts/diagnose-grounding.ts",
+    "diagnose-card-grounding": "tsx scripts/diagnose-card-grounding.ts",
     "diagnose-dedup": "tsx scripts/diagnose-dedup.ts",
     "diagnose-feed-health": "tsx scripts/diagnose-feed-health.ts",
     "diagnose-mastery": "tsx scripts/diagnose-mastery.ts",

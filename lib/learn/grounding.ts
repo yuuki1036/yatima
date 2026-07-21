@@ -3,9 +3,13 @@
 // MCQ（quiz-gate.ts）と qa/cloze（card-gate.ts）の双方が各々 target を組んで呼べるようにする（F4）。
 // LLM 出力の逐語照合という一次防御をここに集約し、型ごとの分岐は呼び出し側に閉じる。
 
-// ── grounding 閾値（design doc open「grounding 強度下限」の起点値・PoC で較正前提）─────
+// ── grounding 閾値（design doc open「grounding 強度下限」の起点値）─────
+// YAT-58 時点の状態: どちらも「較正前提の仮値」ではなくなっている。下の groundingReason の注記も参照。
 export const MIN_QUOTE_CHARS = 24; // source_quote の最小文字数（日本語記事の主防御。短い断片を弾く）
+// 較正対象から外した（YAT-58）。MCQ・card 両経路の計測とも①の棄却が 0 件で、動かす根拠になる
+// 観測データが出ない。値を変える前にまず①が発火する条件を観測すること。
 export const MIN_OVERLAP = 0.12; // source_quote と設問本体の最小語彙重なり（無関係な前書き抜粋を弾く）
+// 呼び出し側が④を無効化（0 を渡す）したため、この既定値を使う経路は実質デッド。下の注記を参照。
 
 // 本文照合の母体テキストの上限。要約用の 2000 字では grounding 母体として短すぎ逐語照合が落ちる
 // ため、本文を厚めに取る（content_html 全体に近い長さ）。
@@ -48,10 +52,19 @@ export type GroundingReason =
 // - quoteRaw: LLM が付けた原文抜粋（生。呼び出し側で norm しない）
 // - groundBodyNorm: norm() 済みの照合母体（本文）。呼び出し側で一度だけ norm して使い回す想定
 // - targetRaw: 設問本体（MCQ なら stem + choices、qa なら front+back 等）。抜粋が設問と無関係でないか照合
-// minOverlap: ④の語彙重なり閾値。既定は MIN_OVERLAP（qa/cloze カード経路の従来挙動を保つ）。
-// 0 を渡すと④は無効化される。MCQ は英語記事の逐語引用×日本語設問で quote と設問の固有トークンが
-// 言語違いでほぼ重ならず④が支配的な棄却要因になる（YAT-30 の計測）ため、quiz-gate は 0 を渡して
-// ②逐語＋③固有性に依拠する（正誤の真偽は元々④では検証しておらず F2 の別軸）。
+// minOverlap: ④の語彙重なり閾値。0 を渡すと④は無効化される。
+// 英語記事の逐語引用×日本語の設問/カードでは quote と target の固有トークンが言語違いでほぼ重ならず、
+// jaccard が構造的に 0 へ潰れて④が支配的な棄却要因になる（YAT-30: MCQ で生成の 69%、
+// YAT-58: card で生成の 68%・通過率 12%）。このため呼び出し側 2 経路とも④を無効化している
+// （quiz-gate の QUIZ_MIN_OVERLAP=0 / card-gate の CARD_MIN_OVERLAP=0）。いずれも②逐語＋
+// ③固有性に依拠する（正誤の真偽は元々④では検証しておらず F2 の別軸）。
+// 稼働状況は非対称: 現用の cron 経路は quiz-gate のみ。card-gate は YAT-27 で凍結済みで、
+// card 側の④無効化は本番で運用実績が無い（詳細は card-gate.ts の CARD_MIN_OVERLAP を参照）。
+// 注意: 既定値 MIN_OVERLAP を使う呼び出し側はもう無い（診断スクリプトが比較用に使うのみ）。
+// 引数を省略すると、上記のとおり言語跨ぎで機能しない④が黙って有効になる。省略せず明示的に渡すこと。
+// なお④は injection 防御ではない。攻撃者が本文を制御できる前提では①〜④すべて自明に満たせる
+// （payload の語をカード本文にも含ませればよい）。④の実体は「LLM が無関係な箇所を帰属先に選ぶ」
+// ことへの品質防御であり、無効化による injection 耐性の低下は無い。
 export function groundingReason(
   quoteRaw: string,
   groundBodyNorm: string,
