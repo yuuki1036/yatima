@@ -13,6 +13,11 @@
   --line: #e6e6e6; /* ヘアライン（区切り罫・デッキの重なり） */
   --accent: #d11f14; /* 赤アクセント（一次アクション・ラベル）。白文字で AA を満たすやや深い赤 */
   --accent-foreground: #ffffff; /* 赤ベタ上の文字 */
+  /* 二値の判定を色で区別する用途に限る（YAT-62: スワイプの SKIP/KEEP バッジ）。
+     ブルータリストの白黒＋赤を崩さないため、面には使わず枠線と文字だけに使う。
+     accent（赤）は一次アクション用に予約済みなので、判定色は別トークンに分ける。 */
+  --negative: #c2352b; /* 否定的な判定（SKIP）。accent より彩度を落として一次アクションと区別 */
+  --positive: #0f7a5a; /* 肯定的な判定（KEEP）。白地で AA を満たす深い緑 */
 }
 
 /* ダークトークン。OS 追従ではなく属性ベース（:root[data-theme="dark"]）で適用する。
@@ -28,6 +33,8 @@
   --line: #2a2a2e;
   --accent: #ff5a4d;
   --accent-foreground: #0e0e10;
+  --negative: #ff8079; /* 暗い地で視認できるよう明度を上げる */
+  --positive: #3ecfa3;
 }
 
 @theme inline {
@@ -40,6 +47,8 @@
   --color-line: var(--line);
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
+  --color-negative: var(--negative);
+  --color-positive: var(--positive);
 
   --font-sans: var(--font-inter);
   --font-mono: var(--font-ibm-plex-mono);

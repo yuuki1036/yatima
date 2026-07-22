@@ -44,6 +44,20 @@ export function CurationDeck({
   // 続き（判定済みの除外）はリロード/再訪時にサーバクエリが行う。
   const [deck] = useState(cards);
 
+  // カウンターの分母は「今日ピックされた総数」に固定する。deck.length（未判定の残り）を分母に
+  // すると、3 件判定して再訪したとき 01/07 のように**分母が縮んで**進捗が読めなくなる。
+  // 分子には判定済み件数をオフセットとして足す（これが無いと再訪のたびに 01 に戻る）。
+  // 分母を定数 10 にしない理由: curate は日次上限 10 を「上限」として使い下限は保証しない
+  // （候補枯渇や dedup で 10 件未満になる日がある。lib/ranking/curate.ts）。生成が保証しない値を
+  // UI が約束すると、6 件の日に 06/10 で終わって「4 件どこ行った」になる。
+  // deck と同じくマウント時に固定する。ライブの pickedToday を読むと、セッション中に「更新」を
+  // 押したとき（curate が当日ピックを追加し pickedToday だけ増える）分母だけが膨らみ、
+  // 5 枚しか捌いていないのに「全 8 件を見終わりました」と出てしまう。
+  const [{ judgedOffset, total }] = useState(() => ({
+    judgedOffset: Math.max(0, pickedToday - cards.length),
+    total: Math.max(pickedToday, cards.length),
+  }));
+
   // お気に入り状態はクライアントローカルで持つ。toggleStar は /saved のみ revalidate し "/" を
   // 触らないため（デッキの楽観 index を壊さないため）、★の見た目はサーバ再取得に頼らず楽観表示する。
   const [starredIds, setStarredIds] = useState<Set<string>>(
@@ -183,11 +197,11 @@ export function CurationDeck({
   if (!current) {
     return (
       <div>
-        {sectionLabel(`${deck.length} / ${deck.length}`)}
+        {sectionLabel(`${String(total).padStart(2, "0")} / ${String(total).padStart(2, "0")}`)}
         <p className="border border-line py-16 text-center text-sm text-muted">
           ここまで完了です 🎉
           <br />
-          全{deck.length}件を見終わりました。また明日、新しい候補が届きます。
+          全{total}件を見終わりました。また明日、新しい候補が届きます。
         </p>
       </div>
     );
@@ -196,7 +210,7 @@ export function CurationDeck({
   return (
     <div>
       {sectionLabel(
-        `${String(index + 1).padStart(2, "0")} / ${String(deck.length).padStart(2, "0")}`,
+        `${String(judgedOffset + index + 1).padStart(2, "0")} / ${String(total).padStart(2, "0")}`,
       )}
 
       <div className="relative touch-pan-y select-none" {...pointerHandlers}>
@@ -234,17 +248,30 @@ export function CurationDeck({
           <div key={current.id} className={reduced ? undefined : "animate-card-enter"}>
             <SwipeCard
               card={current}
-              index={index + 1}
+              // カード上の通し番号もヘッダのカウンターと同じ基準にする（判定済み分をオフセット）。
+              // ここだけ index+1 のままだと、再訪時にヘッダ 04/07 とカード 01 が食い違う。
+              index={judgedOffset + index + 1}
               isStarred={starredIds.has(current.id)}
               onToggleStar={() => toggleStar(current)}
             />
           </div>
         </div>
 
-        {/* スワイプ方向のヒント（指の移動量に応じてフェードイン） */}
-        <div className="pointer-events-none absolute inset-0 flex items-start justify-between p-4">
+        {/* スワイプ方向のヒント（指の移動量に応じてフェードイン）。
+            zIndex はカードラッパー（zIndex: 2）より上に置くこと。position のみ指定して
+            z-index を省くと、CSS の描画順で「z-index:auto の positioned 要素」はカードより
+            先に描かれ、不透明な bg-surface の裏に完全に隠れる（DOM 順が後でも隠れる）。
+            カード自体の追従移動や下部ボタンも方向を示すが、SKIP/KEEP バッジが「今離すとどちらに
+            判定されるか」を最も直接に示すので、色でも区別する。色は
+            globals.css の negative/positive トークンを使う（a459529 の「色はトークンに集約」方針。
+            palette 色を直書きするとダークテーマで追従しない）。accent の赤は OPEN ボタンなど
+            一次アクションに予約されているので、判定色は別トークンに分けている。 */}
+        <div
+          className="pointer-events-none absolute inset-0 flex items-start justify-between p-4"
+          style={{ zIndex: 3 }}
+        >
           <span
-            className="border-2 border-border px-3 py-1 font-mono text-base font-bold tracking-widest text-foreground"
+            className="border-2 border-negative px-3 py-1 font-mono text-base font-bold tracking-widest text-negative"
             style={{
               // 送り出し中（flyOut）はヒントを消す。dx を保持したままだとバッジが
               // 飛んでいくカードに残って汚いため。
@@ -255,7 +282,7 @@ export function CurationDeck({
             SKIP
           </span>
           <span
-            className="border-2 border-accent px-3 py-1 font-mono text-base font-bold tracking-widest text-accent"
+            className="border-2 border-positive px-3 py-1 font-mono text-base font-bold tracking-widest text-positive"
             style={{
               opacity: flyOut || dx <= 0 ? 0 : Math.min(1, dx / SWIPE_THRESHOLD),
               transform: "rotate(12deg)",
