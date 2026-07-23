@@ -19,12 +19,12 @@ import { padEndWide, padStartWide, pct } from "./_report-format";
 // （compute-dedup-rate.ts は feed 単位の記事重複率しか出さず、この 2 定数に触れない）。
 // 本番の dedup ループを再現し、閾値を振ったときに dup 判定がどう動くかを出す。
 //
-// card と quiz で再現方法が違う（ここを間違えると数字が狂う）:
-// - card は dup 判定に関わらず population.push するので母集団が閾値に依存しない。各行の maxSim を
-//   1 度だけ求めて閾値と比較すれば全閾値を一括判定できる。
-// - quiz は dup を skip して population に積まない。閾値を変えると母集団自体がカスケードで変わる
-//   ため、閾値ごとに累積ループを回し直さないと件数が過大に出る（A が B を弾けば B は母集団に
-//   入らず、C は B と比較されない）。
+// YAT-61 以降、card / quiz とも dup 判定に関わらず population.push する（keep-all）。母集団が閾値に
+// 依存しないので、各行の maxSim を 1 度だけ求めて閾値と比較すれば全閾値を一括判定できる。
+// 旧 quiz は dup を skip して population に積まなかったため、閾値ごとに累積ループを回し直さないと
+// 件数が過大に出た（A が B を弾けば B は母集団に入らず、C は B と比較されない）。その分岐は
+// 両テーブルが keep-all になった時点で不要になったので削除した。skip 方式のゲートを再び診断する
+// ことになったら、閾値ごとに累積を回し直す実装が要る点だけ覚えておくこと。
 //
 // 読み取り専用。DB は一切書き換えない（compute-dedup-rate.ts は near_dup_rate を UPDATE するため
 // 気軽に走らせられない。この診断は SELECT のみに徹する）。LLM 呼び出しも無いので課金は発生しない。
@@ -62,9 +62,6 @@ function parsePairBand(): { lo: number; hi: number } | null {
 
 const PAIR_BAND = parsePairBand();
 
-// 本番の母集団更新の違い。閾値スイープの計算方法がこれで変わる。
-type DedupMode = "keep-all" | "skip-dup";
-
 type Parsed = { vec: number[]; label: string; source: string | null };
 
 type Row = {
@@ -72,6 +69,7 @@ type Row = {
   created_at: string;
   embedding: unknown;
   status?: string | null;
+  dup_flag?: boolean | null;
   dup_similarity?: number | null;
   label: string; // 実例ダンプ用の短い識別テキスト
   source: string | null; // 由来（card は article_id / quiz は source_ref）。同一ソース内かの判定用
@@ -220,33 +218,12 @@ function computeMaxSims(parsed: Parsed[]): {
   return { maxSims, dimMismatch, examples };
 }
 
-// skip 方式（quiz）の閾値スイープ。dup を母集団に積まないので閾値ごとに累積を回し直す。
-// keep-all（card）で使うと母集団が変わらないため maxSims との比較と一致する。
-function sweepWithSkip(parsed: Parsed[], threshold: number): number {
-  const population: number[][] = [];
-  let skipped = 0;
-  for (const cand of parsed) {
-    let maxSim = 0;
-    for (const p of population) {
-      if (p.length !== cand.vec.length) continue;
-      const sim = cosineSim(cand.vec, p);
-      if (sim > maxSim) maxSim = sim;
-    }
-    if (maxSim >= threshold) skipped += 1;
-    else population.push(cand.vec);
-  }
-  return skipped;
-}
-
-function analyze(rows: Row[], mode: DedupMode): Analysis {
+function analyze(rows: Row[]): Analysis {
   const { parsed, failed } = parseInOrder(rows);
   const { maxSims, dimMismatch, examples } = computeMaxSims(parsed);
   const sweep = THRESHOLDS.map((threshold) => ({
     threshold,
-    dup:
-      mode === "keep-all"
-        ? maxSims.filter((s) => s >= threshold).length
-        : sweepWithSkip(parsed, threshold),
+    dup: maxSims.filter((s) => s >= threshold).length,
   }));
   return {
     total: rows.length,
@@ -262,7 +239,7 @@ function analyze(rows: Row[], mode: DedupMode): Analysis {
   };
 }
 
-function report(title: string, a: Analysis, current: number, mode: DedupMode, note?: string) {
+function report(title: string, a: Analysis, current: number, note?: string) {
   console.log(`\n=== ${title} ===`);
   console.log(
     `行数 ${a.total} / embedding 有り ${a.withEmbedding}（${pct(a.withEmbedding, a.total)}）` +
@@ -277,11 +254,9 @@ function report(title: string, a: Analysis, current: number, mode: DedupMode, no
     return;
   }
 
-  const how =
-    mode === "keep-all"
-      ? "母集団は閾値に依存しない（dup も積む）"
-      : "閾値ごとに累積を回し直した（dup は積まないので母集団がカスケードで変わる）";
-  console.log(`\n  閾値スイープ（dup 判定される件数）— ${how}:`);
+  console.log(
+    "\n  閾値スイープ（dup 判定される件数）— 母集団は閾値に依存しない（dup も積む）:",
+  );
   for (const s of a.sweep) {
     const mark = Math.abs(s.threshold - current) < 1e-9 ? "  ← 現行" : "";
     console.log(
@@ -307,14 +282,6 @@ function report(title: string, a: Analysis, current: number, mode: DedupMode, no
           ` / 跨ぎ ${String(s.cross).padStart(4)}` +
           ` / 不明 ${String(s.unknown).padStart(4)}` +
           `（同一が ${pct(s.same, total)}）${mark}`,
-      );
-    }
-    if (mode === "skip-dup") {
-      // 閾値スイープと同じ survivorship がここにも効く。現存行だけを見ているので
-      // 「跨ぎ 0 件」は跨ぎ重複が無い証拠にならない（弾かれた側は DB に残らない）。
-      console.log(
-        "    ※ skip 方式では弾かれた候補が DB に残らないため、この内訳は現存行に対するもの。" +
-          "「跨ぎ 0 件」は跨ぎ重複が無い証拠ではなく、除去された結果と区別がつかない",
       );
     }
   }
@@ -364,6 +331,50 @@ function report(title: string, a: Analysis, current: number, mode: DedupMode, no
   }
 }
 
+// insert 時に記録された dup_flag / dup_similarity の報告（YAT-61 で card / quiz 共通化）。
+// **ゲートに弾かれた候補（dup_flag=true）を含む唯一のデータ**で、現存プールの再計算では代用できない
+// （再計算は通過した側しか見ないため）。閾値の妥当性は「弾いた候補を見て、捨てすぎ / 残しすぎを
+// 判断する」以外に測る方法が無い。
+//
+// 再計算 maxSim との違いに注意: dup_similarity は insert 当時の母集団に対する値で、母集団は時間と
+// 共に増えるため、古い行ほど「当時は非 dup だったが今なら dup」になりうる。閾値を動かしたときに
+// **その時点で何件が dup 側へ移るか**を測れるのは保存値のほうなので、両方を出す。
+function reportStoredDup(rows: Row[], threshold: number) {
+  const flagged = rows.filter((r) => r.dup_flag === true).length;
+  const sims = rows
+    .map((r) => r.dup_similarity)
+    .filter((v): v is number => typeof v === "number");
+
+  console.log(
+    `\n  dup_flag=true（ゲートが近重複と判定した行）: ${flagged} 件` +
+      `（全 ${rows.length} 行中 ${pct(flagged, rows.length)}）`,
+  );
+  if (sims.length === 0) {
+    // card は 0007 の時点から dup_similarity を持つため、ここに来るのは生成が止まっている等が原因。
+    // quiz は YAT-61 より前に積まれた行が該当する。テーブル非依存の言い方に留める。
+    console.log(
+      "    dup_similarity を持つ行が無い（この列が埋まるようになる前に積まれた行だけの状態）。" +
+        "弾かれた候補の標本はまだ 0 件で、較正は新しい生成が貯まってから",
+    );
+    return;
+  }
+  const storedDup = sims.filter((s) => s >= threshold).length;
+  console.log(
+    `  保存済み dup_similarity: ${sims.length} 件中 ${storedDup} 件が現行閾値超え` +
+      `（insert 当時の母集団に対する値）`,
+  );
+  // 保存値での閾値スイープ。「閾値をこう動かしたら、実際に弾かれた/通った件数がどう変わったか」を
+  // 現存プールの再計算ではなく当時の判定値で測る（較正はこちらを見る）。
+  console.log("    保存値での閾値スイープ（その閾値なら dup 判定だった件数）:");
+  for (const t of THRESHOLDS) {
+    const n = sims.filter((s) => s >= t).length;
+    const mark = Math.abs(t - threshold) < 1e-9 ? "  ← 現行" : "";
+    console.log(
+      `      ${t.toFixed(2)}  ${String(n).padStart(5)} 件（${pct(n, sims.length)}）${mark}`,
+    );
+  }
+}
+
 async function main() {
   const supabase = createAdminClient();
 
@@ -373,13 +384,14 @@ async function main() {
   const cardRaw = await selectAllRows(
     supabase,
     "card_candidates",
-    "id, created_at, embedding, status, dup_similarity, article_id, type, front, back, cloze_text",
+    "id, created_at, embedding, status, dup_flag, dup_similarity, article_id, type, front, back, cloze_text",
   );
   const cardRows: Row[] = cardRaw.map((r) => ({
     id: r.id as string,
     created_at: r.created_at as string,
     embedding: r.embedding,
     status: r.status as string | null,
+    dup_flag: r.dup_flag as boolean | null,
     dup_similarity: r.dup_similarity as number | null,
     label:
       (r.type === "cloze" ? (r.cloze_text as string) : (r.front as string)) ??
@@ -389,9 +401,8 @@ async function main() {
   }));
   report(
     "card_candidates（全 status）",
-    analyze(cardRows, "keep-all"),
+    analyze(cardRows),
     CARD_DEDUP_THRESHOLD,
-    "keep-all",
   );
 
   // status 別の内訳。承認 UI の効き方（YAT-27 で撤去済みなので現状は pending 一色のはず）が見える。
@@ -404,52 +415,44 @@ async function main() {
     `\n  status 内訳: ${[...byStatus].map(([s, n]) => `${s}=${n}`).join(" / ") || "(行なし)"}`,
   );
 
-  // insert 時点で保存された dup_similarity と、現在の母集団での再計算値のズレ。母集団は時間と共に
-  // 増えるため、古い行ほど「当時は非 dup だったが今なら dup」になりうる。
-  const storedSims = cardRows
-    .map((r) => r.dup_similarity)
-    .filter((v): v is number => typeof v === "number");
-  if (storedSims.length > 0) {
-    const storedDup = storedSims.filter((s) => s >= CARD_DEDUP_THRESHOLD).length;
-    console.log(
-      `  保存済み dup_similarity: ${storedSims.length} 件中 ${storedDup} 件が現行閾値超え` +
-        `（insert 当時の母集団に対する値）`,
-    );
-  }
+  reportStoredDup(cardRows, CARD_DEDUP_THRESHOLD);
 
   // ── quiz_questions ───────────────────────────────────────────────
-  // 本番の母集団は status='active' かつ embedding 非 null（quiz-pool の loadQuizDedupPopulation）。
+  // 本番の母集団は status='active' かつ embedding 非 null（quiz-gate の loadQuizDedupPopulation）。
+  // dup_flag=true の行も母集団に入る（YAT-61 の keep-all）ので、ここでも除外しない。
   const quizRaw = await selectAllRows(
     supabase,
     "quiz_questions",
-    "id, created_at, embedding, status, source_ref, stem",
+    "id, created_at, embedding, status, dup_flag, dup_similarity, source_ref, stem",
   );
   const toQuizRow = (r: Record<string, unknown>): Row => ({
     id: r.id as string,
     created_at: r.created_at as string,
     embedding: r.embedding,
     status: r.status as string | null,
+    dup_flag: r.dup_flag as boolean | null,
+    dup_similarity: r.dup_similarity as number | null,
     label: (r.stem as string) ?? "(空)",
     source: (r.source_ref as string | null) ?? null,
   });
   const quizActive = quizRaw.filter((r) => r.status === "active").map(toQuizRow);
   report(
     "quiz_questions（status=active・本番の母集団）",
-    analyze(quizActive, "skip-dup"),
+    analyze(quizActive),
     QUIZ_DEDUP_THRESHOLD,
-    "skip-dup",
-    "現存する問題は全て現行閾値 0.86 を通過済み（skip された問題は insert されず DB に無い）。" +
-      "この母集団に対して閾値を振り直した結果なので、0.86 より上へ動かしたときに「本来通っていた" +
-      "はずの問題」は復元できない。",
+    "YAT-61 で dup_flag 方式へ移行済み（近重複も insert され、出題時に dup_flag=false で絞る）。" +
+      "ただし移行前に積まれた行は skip 方式の生き残りで dup_similarity を持たない。" +
+      "この再計算スイープは現存プールの構造を見るためのもので、閾値較正には下の「保存済み" +
+      "dup_similarity」を使うこと（弾いた候補が含まれるのはそちらだけ）。",
   );
+  reportStoredDup(quizActive, QUIZ_DEDUP_THRESHOLD);
 
   const quizAll = quizRaw.map(toQuizRow);
   if (quizAll.length !== quizActive.length) {
     report(
       "quiz_questions（全 status・retired 含む）",
-      analyze(quizAll, "skip-dup"),
+      analyze(quizAll),
       QUIZ_DEDUP_THRESHOLD,
-      "skip-dup",
       "retire 運用の影響を見るための参考値。本番の dedup 母集団ではない。",
     );
   }
@@ -459,7 +462,8 @@ async function main() {
   );
   console.log(
     padStartWide("", 0) +
-      "※ card と quiz で母集団の扱いが違うため、同じ閾値でも件数の意味が異なる（上の注記を参照）",
+      "※ 較正は「保存済み dup_similarity」のスイープを見ること。再計算スイープは現存プールに対する" +
+      "もので、ゲートが弾いた候補（dup_flag=true）も含めた判断は保存値でしかできない",
   );
 }
 

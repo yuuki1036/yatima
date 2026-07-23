@@ -177,6 +177,9 @@ export async function selectSessionQuestions(
     .from("quiz_questions")
     .select(QUIZ_SELECT)
     .eq("status", "active")
+    // YAT-61: 近重複は insert されるが出題しない（dedup が skip 方式から dup_flag 方式へ変わり、
+    // 弾いた候補も行として残るようになったため。除外しないと重複問題がそのまま出題される）。
+    .eq("dup_flag", false)
     .order("created_at", { ascending: false })
     .limit(POOL_FETCH_LIMIT);
   if (opts.category) poolQuery = poolQuery.eq("category", opts.category);
