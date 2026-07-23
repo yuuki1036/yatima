@@ -12,8 +12,9 @@ create extension if not exists vector;
 -- （照合失敗は quiz-gate が捨てる＝grounded=true のみ insert する MVP。ungrounded 経路は後続）。
 -- embedding は dedup 母集団用（embed 失敗分は null で積み、YAT-29 の cron が後追いで埋める）。
 -- dup_flag は YAT-29 が skip 方式（近重複を insert しない）を採ったため長らく未使用の予約列だったが、
--- YAT-61 で本来の想定どおり「insert してフラグを立てる」方式に戻した（skip では弾いた候補が DB に
--- 残らず閾値を較正できないため）。生の類似度 dup_similarity は 0013 で追加。
+-- YAT-61 で使い始めた（skip では弾いた候補が DB に残らず閾値を較正できないため）。当初は「cron が
+-- 後追いで立てる」想定だったのに対し、実際は cron / オンデマンドの両経路が insert 時に立てる。
+-- 生の類似度 dup_similarity は 0013 で追加。
 -- 出題側（selectSessionQuestions）は dup_flag = false に絞る。status で active/retired を管理し行は消さない。
 create table if not exists public.quiz_questions (
   id             uuid primary key default gen_random_uuid(),
@@ -28,7 +29,7 @@ create table if not exists public.quiz_questions (
   source_quote   text,                              -- grounding 根拠（原文の逐語抜粋）。ungrounded は null
   grounded       boolean not null default false,    -- 逐語照合を通過したか（MVP は true のみ積む）
   source_ref     text,                              -- 由来 article_id 等（FK なし＝記事削除で問題は残す）
-  -- dedup 母集団用。articles.embedding と同じ Voyage 1024 次元（0003_embeddings.sql）。MVP は null。
+  -- dedup 母集団用。articles.embedding と同じ Voyage 1024 次元（0003_embeddings.sql）。insert 時に付与（embed 失敗時のみ null）。
   embedding      vector(1024),
   dup_flag       boolean not null default false,    -- 近重複フラグ。自動削除せず出題プールから外すだけ（YAT-61）
   status         text not null default 'active',    -- active → retired（誤り報告・退役）

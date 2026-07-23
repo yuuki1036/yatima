@@ -332,8 +332,9 @@ function report(title: string, a: Analysis, current: number, note?: string) {
 }
 
 // insert 時に記録された dup_flag / dup_similarity の報告（YAT-61 で card / quiz 共通化）。
-// **これがゲートに弾かれた候補そのもの**で、現存プール（＝通過した側）の分析では代用できない。
-// 閾値の妥当性は「弾いた候補を見て、捨てすぎ / 残しすぎを判断する」以外に測る方法が無い。
+// **ゲートに弾かれた候補（dup_flag=true）を含む唯一のデータ**で、現存プールの再計算では代用できない
+// （再計算は通過した側しか見ないため）。閾値の妥当性は「弾いた候補を見て、捨てすぎ / 残しすぎを
+// 判断する」以外に測る方法が無い。
 //
 // 再計算 maxSim との違いに注意: dup_similarity は insert 当時の母集団に対する値で、母集団は時間と
 // 共に増えるため、古い行ほど「当時は非 dup だったが今なら dup」になりうる。閾値を動かしたときに
@@ -349,9 +350,11 @@ function reportStoredDup(rows: Row[], threshold: number) {
       `（全 ${rows.length} 行中 ${pct(flagged, rows.length)}）`,
   );
   if (sims.length === 0) {
+    // card は 0007 の時点から dup_similarity を持つため、ここに来るのは生成が止まっている等が原因。
+    // quiz は YAT-61 より前に積まれた行が該当する。テーブル非依存の言い方に留める。
     console.log(
-      "    dup_similarity を持つ行が無い。dup_flag 方式へ移行する前に積まれた行だけの状態で、" +
-        "弾かれた候補の標本はまだ 0 件（較正は新しい生成が貯まってから）",
+      "    dup_similarity を持つ行が無い（この列が埋まるようになる前に積まれた行だけの状態）。" +
+        "弾かれた候補の標本はまだ 0 件で、較正は新しい生成が貯まってから",
     );
     return;
   }

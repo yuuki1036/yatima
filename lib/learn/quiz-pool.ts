@@ -17,8 +17,9 @@ import { hasApprovedLearnSources } from "@/lib/learn/learn-sources";
 // はプール不足時のトップアップに縮退する。card-gate.ts の runCardGate（母集団照合→その場 embed→
 // dedup→bulk insert）を雛形に、生成コアと dedup は quiz-gate と共有する。
 // YAT-61: dedup は skip 方式（近重複を insert しない）から dup_flag 方式（insert してフラグを立て、
-// 出題プールから外す）へ変更。skip では弾いた候補が DB に残らず閾値を較正できなかったため
-// （0011_quiz.sql の「cron が dup_flag を立てる」という当初想定に戻した形）。
+// 出題プールから外す）へ変更。skip では弾いた候補が DB に残らず閾値を較正できなかったため。
+// 0011_quiz.sql が予約したまま使われていなかった dup_flag 列をここで使い始める（当初想定は
+// 「cron が後追いで立てる」だったが、実際は cron / オンデマンドの両経路が insert 時に立てる）。
 // これに伴い deficit の充足数え（countActive）と出題プール取得（selectSessionQuestions）の双方が
 // dup_flag=false で絞る。
 
@@ -120,8 +121,11 @@ export async function runQuizPool(
     return result;
   }
 
-  // ① バックフィル: 先週以降のオンデマンド生成分（embedding=null）を先に埋め、今回の dedup 母集団に
-  // 載せる（Voyage 呼び出し 1 回目）。active のみ対象。
+  // ① バックフィル: その場 embed に失敗して embedding=null で積まれた行を先に埋め、今回の dedup
+  // 母集団に載せる（Voyage 呼び出し 1 回目）。active のみ対象。YAT-56 以降は両経路が insert 前に
+  // embed するので、ここに残るのは embed 失敗分だけ（オンデマンド由来という帰属はもう成立しない）。
+  // なお backfill は embedding を埋めるだけで dup 判定はやり直さないため、これらの行は
+  // dup_flag=false のまま出題プールに残る（安全側）。
   const backfill = await embedMissingQuizQuestions(supabase, {
     limit: BACKFILL_EMBED_LIMIT,
     embedder,

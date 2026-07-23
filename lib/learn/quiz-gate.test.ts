@@ -41,6 +41,14 @@ describe("markQuizDuplicates", () => {
     expect(r.dupFlagged).toBe(1);
   });
 
+  // embedding は optional なので、付け忘れても tsc が落ちない。壊れると全行が embedding=null で
+  // insert され、以降 loadQuizDedupPopulation がその回の行を拾えず dedup が静かに無効化する
+  // （YAT-56 で塞いだ穴の再発）。vecToPg の出力形式ごと固定して pgvector 側の回帰も一緒に守る。
+  it("embed 成功行には vecToPg 済みの embedding が付く", () => {
+    const r = markQuizDuplicates([row("Q1")], [[1, 0]], []);
+    expect(r.rows[0].embedding).toBe("[1,0]");
+  });
+
   it("dup_similarity に生の maxSim を残す（閾値を動かしたときの件数を後から数え直せる）", () => {
     const r = markQuizDuplicates([row("Q1")], [unit(ANGLE_087)], [unit(0)]);
     expect(r.rows[0].dup_similarity).toBeCloseTo(0.87, 5);
@@ -78,9 +86,14 @@ describe("markQuizDuplicates", () => {
     expect(r.rows[0].embedding).toBeNull();
     expect(r.rows[0].dup_flag).toBe(false);
     expect(r.rows[0].dup_similarity).toBeNull();
+    // dupFlagged を汚さない（汚すと cron ログの「うち出題可」が狂い、較正の判断材料がずれる）。
+    expect(r.dupFlagged).toBe(0);
   });
 
-  it("次元が食い違う母集団は比較を飛ばす（cosineSim の無言 0 を dup 判定に混ぜない）", () => {
+  // 次元不一致は cosineSim も 0 を返すため、実装側の continue の有無で結果は変わらない
+  // （continue を消してもこのテストは通る＝ガードの回帰ガードではない）。ここで固定しているのは
+  // 「次元が違う相手は dup 判定に効かない」という結果側の性質。
+  it("次元が食い違う母集団は dup 判定に効かない（dup_similarity=0）", () => {
     const r = markQuizDuplicates([row("Q1")], [[1, 0]], [[1, 0, 0]]);
     expect(r.rows[0].dup_flag).toBe(false);
     expect(r.rows[0].dup_similarity).toBe(0);

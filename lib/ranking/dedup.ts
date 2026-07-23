@@ -25,9 +25,9 @@ export const CARD_DEDUP_THRESHOLD = 0.86;
 //   強く引っ張られ、maxSim 中央値は 0.819（card は 0.740）。**card と別値にすべき示唆はある**
 // - 0.86〜0.90 帯の 8 組を目視すると、真の重複と別設問が混在している
 //
-// それでも動かさなかった理由:
-// - **弾いた候補を観測できない。** quiz は近重複を insert しない skip 方式なので、ゲートが捨てた
-//   ものは DB に残らない。「閾値が厳しすぎるか」を判定する標本そのものが手に入らない
+// それでも動かさなかった理由（いずれも当時 quiz が skip 方式＝近重複を insert しなかったことに由来）:
+// - **弾いた候補を観測できなかった。** ゲートが捨てたものは DB に残らず、「閾値が厳しすぎるか」を
+//   判定する標本そのものが手に入らなかった
 // - 現存プールを見ても代用にならない。0.90 以上のペアが 17 組残っており、これはゲートが唯一の
 //   入口でないことを示していた（YAT-56 以前はオンデマンド経路が dedup を通らず insert していた。
 //   この穴は quiz-gate の embedAndDedupQuizRows で塞いだ）。目視した 8 組も、ゲートを通った行と
@@ -37,9 +37,12 @@ export const CARD_DEDUP_THRESHOLD = 0.86;
 //   generate-quiz のプロンプトが「1 問 1 概念で互いに重複させないこと」を課すため、同一記事の
 //   兄弟は設計上必ず別 concept になる
 //
-// 較正を再開する条件: skip をやめて dup_flag を立てて insert する（＝弾いた候補を観測可能にする）。
-// dup_flag 列は 0011_quiz.sql に予約済みだが、selectSessionQuestions が参照しないため、
-// 方式を変えるなら選定側で除外する対応もセットで要る。
+// YAT-61: **観測手段は用意した。** skip をやめて dup_flag を立てて insert する方式へ移行し
+// （quiz-gate の markQuizDuplicates）、選定側の除外（mastery の selectSessionQuestions）と
+// 充足数え側の除外（quiz-pool の countActive）も揃えた。生の類似度は dup_similarity 列に残す。
+// **ただし移行前に積まれた行は dup_similarity を持たないため、標本は移行後の生成が貯まるまで 0 件。**
+// 較正の再開は `npm run diagnose-dedup` の「保存済み dup_similarity」スイープを見てから。
+// 現存プールの再計算スイープは通過した側しか含まないので、そちらでは判断しないこと。
 export const QUIZ_DEDUP_THRESHOLD = 0.86;
 
 // PostgREST が返す vector 列は文字列 "[v1,v2,...]"。number[] にパースする。

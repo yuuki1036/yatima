@@ -17,7 +17,7 @@ import type { QuizDifficulty, QuizQuestion } from "@/lib/types";
 
 // quiz_questions への insert 行（gateMCQs が積み、cron/オンデマンドが insert する）。名前付き型に
 // することで、キー改名や欠落をコンパイルで検出する（card-gate が GeneratedCard を持ち回って得ていた
-// 型保証を、Record<string, unknown> の引き回しで手放さないため）。embedding は cron のみ付与する。
+// 型保証を、Record<string, unknown> の引き回しで手放さないため）。
 export type QuizInsertRow = {
   concept_key: string;
   concept_label: string;
@@ -184,14 +184,15 @@ export type QuizGenCoreResult = {
   requested: number; // 目標生成数
   generated: number; // LLM が返した候補総数
   passed: number; // 形式＋grounding を通過した数
-  rows: QuizInsertRow[]; // quiz_questions へ insert 可能な行（embedding は未設定＝cron が付与）
+  rows: QuizInsertRow[]; // 候補行（embedding / dup_flag は未設定＝embedAndDedupQuizRows が付与する）
   skipped: boolean; // ANTHROPIC_API_KEY 未設定でスキップ
 };
 
 // 生成コア: 素材取得（承認済み learn_sources）→ LLM 生成 → 形式検証 → concept 正規化 → grounding
 // 逐語照合まで。DB 書き込みはしない（候補行の生産に専念）。オンデマンド（generateQuizForCategory）と
-// cron（quiz-pool）が共有し、insert / embed / dedup の組み立ては呼び側に委ねる（両経路で embedding
-// 付与の有無が非対称なため）。素材が 0 件（ソース未登録カテゴリ）なら生成せず空で返る。
+// cron（quiz-pool）が共有する。embed / dedup / insert の組み立ては呼び側に委ねる（cron だけが
+// バックフィルと sleep 制御を前段に挟むため。dedup 自体は YAT-56 以降どちらも同じ実装を通る）。
+// 素材が 0 件（ソース未登録カテゴリ）なら生成せず空で返る。
 export async function generateGatedQuizRows(
   supabase: SupabaseClient,
   opts: {
@@ -281,18 +282,22 @@ export async function insertQuizRows(
   return (data ?? []) as unknown as QuizQuestion[];
 }
 
-// カテゴリの記事から count 問を目標に生成し、通過分を quiz_questions へ積んで返す。生成コアの薄い
-// ラッパ（embedding 付与・dedup はしない＝embed/dedup は cron が backfill。YAT-27 の判断）。
-// セッション開始の裏補充（after）から呼ぶため maxSources で LLM 呼び出し数を絞れる（YAT-31）。
 // dedup 母集団の全件ページ取得の 1 ページ上限（PostgREST 既定。card-gate と同値）。
 const SELECT_PAGE = 1000;
 
 // active プールの embedding を全件ロードして dedup 母集団にする。
 // dup_flag=true の行も母集団に含める（keep-all。出題には出ないが「既に似た問題を持っている」事実は
-// 変わらないので、除くと同じ近重複を何度も積む）。card-gate の母集団取得がフィルタ無しなのと同じ作法。
+// 変わらないので、除くと同じ近重複を何度も積む）。card-gate が dup_flag で絞らないのと同じ作法
+// （quiz は retired を出題母集団から外すため status だけは絞る点が card と違う）。
 // 取得失敗は fail-soft で空母集団に倒す（＝この回は dedup が効かないだけ）。
-// deficit 収束により active プールは目標深度×カテゴリ数（≈100 問）に頭打ちするため全件で足りる。
-// 目標を大幅に上げる／retire 運用を止める場合は母集団を窓（直近 N 件）で切ること。
+//
+// **YAT-61 で母集団の有界性が失われた。** 旧 skip 方式では近重複が insert されず、active 行数＝
+// 出題可能数だったため「deficit 収束により目標深度×カテゴリ数（≈100 問）で頭打ち」が成立し、
+// それが全件ロードの根拠だった。dup_flag 方式では dup 行も active として残る一方、countActive は
+// それを充足に数えない（＝deficit を埋めない）ので、行数は頭打ちしない。増加ペースは週次 cron の
+// MAX_NEW_PER_RUN=24 とセッション補充が上限なので緩やかだが、単調に増える。
+// 較正が済んで dup_similarity の標本が不要になったら、dup 行の retire か母集団の窓（直近 N 件）
+// 切りを入れること。全件ロードのまま放置すると O(候補数×母集団) の cosine が効いてくる。
 export async function loadQuizDedupPopulation(
   supabase: SupabaseClient,
 ): Promise<number[][]> {
@@ -329,7 +334,9 @@ export type QuizDedupResult = {
   embedFailed: number; // embed できず embedding=null で積む数
 };
 
-// 候補行を母集団と cosine 照合し、dup_flag / dup_similarity / embedding を付与する（純粋関数）。
+// 候補行を母集団と cosine 照合し、dup_flag / dup_similarity / embedding を付与する。
+// DB にも外部 API にも触らないので、この関数だけを直接ユニットテストできる（判定ロジックを
+// embedAndDedupQuizRows から切り出した理由）。ただし population は書き換える（下記）。
 // YAT-61: 閾値超えを **捨てず**に flag を立てて insert する（card-gate と同じ非破壊方式）。skip 方式は
 // 弾いた候補が DB に一切残らず、閾値が厳しすぎて正当な設問を捨てていないかを判定する標本が原理的に
 // 手に入らなかった（survivorship bias。YAT-56 の較正がこれに阻まれて差し戻し）。
@@ -358,7 +365,9 @@ export function markQuizDuplicates(
     }
     let maxSim = 0;
     for (const p of population) {
-      if (p.length !== vec.length) continue; // 次元不一致は cosineSim が無言に 0 を返すので明示的に飛ばす
+      // 次元不一致は cosineSim も 0 を返すので結果は変わらない（maxSim は 0 初期化＋ sim > maxSim で
+      // 更新するため 0 は素通り）。1024 次元の内積を無駄に回さないための計算量対策にすぎない。
+      if (p.length !== vec.length) continue;
       const sim = cosineSim(vec, p);
       if (sim > maxSim) maxSim = sim;
     }
@@ -387,7 +396,9 @@ export async function embedAndDedupQuizRows(
   candidates: QuizInsertRow[],
   opts: { embedder?: Embedder | null; sleepBeforeEmbedMs?: number } = {},
 ): Promise<QuizDedupResult> {
-  if (candidates.length === 0) return { rows: [], dupFlagged: 0, embedFailed: 0 };
+  // 空なら embed も母集団取得もせず即返す。戻り値の形は markQuizDuplicates に作らせて
+  // QuizDedupResult の初期値を 2 箇所で定義しない（フィールドが増えたときの取りこぼし防止）。
+  if (candidates.length === 0) return markQuizDuplicates([], [], []);
 
   const embedder = opts.embedder === undefined ? createEmbedder() : opts.embedder;
   const population = await loadQuizDedupPopulation(supabase);
@@ -408,6 +419,8 @@ export async function embedAndDedupQuizRows(
   return markQuizDuplicates(candidates, vectors, population);
 }
 
+// カテゴリの素材から count 問を目標に生成し、embed → dedup を通して quiz_questions へ積んで返す。
+// セッション開始の裏補充（after）から呼ぶため maxSources で LLM 呼び出し数を絞れる（YAT-31）。
 export async function generateQuizForCategory(
   supabase: SupabaseClient,
   opts: {
