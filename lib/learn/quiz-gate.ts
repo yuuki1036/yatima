@@ -31,13 +31,16 @@ export type QuizInsertRow = {
   grounded: boolean;
   source_ref: string | null;
   status: "active";
-  embedding?: string | null; // vecToPg 済み文字列。オンデマンドは未設定（null 混入なし）
+  embedding?: string | null; // vecToPg 済み文字列。embedAndDedupQuizRows が付与する
+  dup_flag?: boolean; // 近重複か（YAT-61。出題プールからは外れるが行は残る）
+  dup_similarity?: number | null; // 最も近い既存問題との cosine。閾値較正の標本
 };
 
 // YAT-27: 適応クイズの生成ゲート。素材から MCQ を生成し、決定的に検証（形式 → concept 正規化 →
 // 逐語 grounding）してから quiz_questions(active) へ積む。card-gate.ts の「母集団取得 → 生成 → 形式
-// → grounding → insert」構造を選択式に写した MVP 版。dedup（embedding/cosine）はここでは行わず
-// cron に委ねる（Server Action の maxDuration=60 内に収めるため）。照合失敗の問題は捨てる。
+// → grounding → dedup → insert」構造を選択式に写したもの。照合失敗の問題は捨てる。
+// YAT-56: dedup は cron 専属をやめ、オンデマンドも同じ embedAndDedupQuizRows を通す（after() の
+// 中で走るためユーザーは待たない）。YAT-61: その dedup は skip から dup_flag 方式へ。
 // YAT-32: 素材は RSS 記事プールから承認制 evergreen ソース（learn_sources）へ切替（時事偏重の是正）。
 
 const CANDIDATE_SOURCES = 8; // 1 セッションで素材にする候補ソースの上限（LLM 呼び出し数の上限に効く）
@@ -54,7 +57,8 @@ export type QuizGenResult = {
   requested: number; // 目標生成数
   generated: number; // LLM が返した候補総数
   passed: number; // 形式＋grounding を通過した数
-  inserted: QuizQuestion[]; // quiz_questions へ積んだ問題
+  inserted: QuizQuestion[]; // quiz_questions へ積んだ問題（dup_flag=true の行も含む）
+  dupFlagged: number; // うち近重複として dup_flag を立てた数（出題プールには乗らない）
   skipped: boolean; // ANTHROPIC_API_KEY 未設定でスキップ
 };
 
@@ -164,7 +168,7 @@ function gateMCQs(
       source_quote: q.source_quote,
       grounded: true,
       source_ref: sourceId, // learn_sources.id（YAT-32。旧: article_id）
-      // embedding / dup_flag は MVP 未設定（YAT-29 の cron が dedup で埋める）。
+      // embedding / dup_flag / dup_similarity は embedAndDedupQuizRows が付与する（両経路が通る）。
       status: "active",
     });
   }
@@ -284,6 +288,8 @@ export async function insertQuizRows(
 const SELECT_PAGE = 1000;
 
 // active プールの embedding を全件ロードして dedup 母集団にする。
+// dup_flag=true の行も母集団に含める（keep-all。出題には出ないが「既に似た問題を持っている」事実は
+// 変わらないので、除くと同じ近重複を何度も積む）。card-gate の母集団取得がフィルタ無しなのと同じ作法。
 // 取得失敗は fail-soft で空母集団に倒す（＝この回は dedup が効かないだけ）。
 // deficit 収束により active プールは目標深度×カテゴリ数（≈100 問）に頭打ちするため全件で足りる。
 // 目標を大幅に上げる／retire 運用を止める場合は母集団を窓（直近 N 件）で切ること。
@@ -318,12 +324,58 @@ export async function loadQuizDedupPopulation(
 }
 
 export type QuizDedupResult = {
-  rows: QuizInsertRow[]; // insert してよい行（embedding 付与済み）
-  dupSkipped: number; // 近重複として捨てた数
+  rows: QuizInsertRow[]; // insert する行（全候補。dup も dup_flag=true で含む）
+  dupFlagged: number; // 近重複として dup_flag を立てた数
   embedFailed: number; // embed できず embedding=null で積む数
 };
 
-// 候補行を embed して既存 active プール＋バッチ内既採用と cosine 照合し、閾値超えを捨てる。
+// 候補行を母集団と cosine 照合し、dup_flag / dup_similarity / embedding を付与する（純粋関数）。
+// YAT-61: 閾値超えを **捨てず**に flag を立てて insert する（card-gate と同じ非破壊方式）。skip 方式は
+// 弾いた候補が DB に一切残らず、閾値が厳しすぎて正当な設問を捨てていないかを判定する標本が原理的に
+// 手に入らなかった（survivorship bias。YAT-56 の較正がこれに阻まれて差し戻し）。
+//
+// dup 判定された vec も population に積む（card と同じ keep-all）。積まないと母集団が閾値に依存して
+// カスケードで変わり、閾値スイープを閾値ごとに回し直さないと件数が狂う
+// （[[generated-sibling-dedup-threshold]]「skip 方式は閾値スイープの計算方法まで変える」）。
+// keep-all にすることで各行の dup_similarity が閾値非依存の値になり、後から任意の閾値で数え直せる。
+//
+// population は破壊的に伸ばす（同一 run の後続候補ともダブらせるため）。呼び出し側は使い捨ての
+// 配列を渡すこと。
+export function markQuizDuplicates(
+  candidates: QuizInsertRow[],
+  vectors: (number[] | null)[],
+  population: number[][],
+): QuizDedupResult {
+  const result: QuizDedupResult = { rows: [], dupFlagged: 0, embedFailed: 0 };
+  candidates.forEach((row, i) => {
+    const vec = vectors[i];
+    if (!vec) {
+      // embed 失敗は embedding=null・dup_flag=false で積み、次回バックフィルが embedding を埋めて
+      // 以降の母集団に乗せる。dup 判定はやり直さない＝未判定分は出題プールに残る（安全側）。
+      result.embedFailed += 1;
+      result.rows.push({ ...row, embedding: null, dup_flag: false, dup_similarity: null });
+      return;
+    }
+    let maxSim = 0;
+    for (const p of population) {
+      if (p.length !== vec.length) continue; // 次元不一致は cosineSim が無言に 0 を返すので明示的に飛ばす
+      const sim = cosineSim(vec, p);
+      if (sim > maxSim) maxSim = sim;
+    }
+    const dupFlag = maxSim >= QUIZ_DEDUP_THRESHOLD;
+    if (dupFlag) result.dupFlagged += 1;
+    population.push(vec);
+    result.rows.push({
+      ...row,
+      embedding: vecToPg(vec),
+      dup_flag: dupFlag,
+      dup_similarity: maxSim,
+    });
+  });
+  return result;
+}
+
+// 候補行を embed して既存 active プール＋バッチ内既採用と cosine 照合し、近重複に dup_flag を立てる。
 // YAT-56: **cron とオンデマンドの両経路がこれを通る**。以前はオンデマンド（generateQuizForCategory）
 // だけが dedup を通らず embedding=null で insert し、cron の backfill が後から embedding を埋めて
 // いた。その結果、ゲートを一度も通らない行が active プールに入り、以降の dedup 母集団にも載る
@@ -335,8 +387,7 @@ export async function embedAndDedupQuizRows(
   candidates: QuizInsertRow[],
   opts: { embedder?: Embedder | null; sleepBeforeEmbedMs?: number } = {},
 ): Promise<QuizDedupResult> {
-  const result: QuizDedupResult = { rows: [], dupSkipped: 0, embedFailed: 0 };
-  if (candidates.length === 0) return result;
+  if (candidates.length === 0) return { rows: [], dupFlagged: 0, embedFailed: 0 };
 
   const embedder = opts.embedder === undefined ? createEmbedder() : opts.embedder;
   const population = await loadQuizDedupPopulation(supabase);
@@ -354,28 +405,7 @@ export async function embedAndDedupQuizRows(
     }
   }
 
-  candidates.forEach((row, i) => {
-    const vec = vectors[i];
-    if (!vec) {
-      // embed 失敗は embedding=null で積み、次回バックフィルが埋めて以降の母集団に乗せる。
-      result.embedFailed += 1;
-      result.rows.push({ ...row, embedding: null });
-      return;
-    }
-    let maxSim = 0;
-    for (const p of population) {
-      const sim = cosineSim(vec, p);
-      if (sim > maxSim) maxSim = sim;
-    }
-    if (maxSim >= QUIZ_DEDUP_THRESHOLD) {
-      result.dupSkipped += 1;
-      return;
-    }
-    population.push(vec); // 同一 run の後続候補ともダブらせない
-    result.rows.push({ ...row, embedding: vecToPg(vec) });
-  });
-
-  return result;
+  return markQuizDuplicates(candidates, vectors, population);
 }
 
 export async function generateQuizForCategory(
@@ -397,6 +427,7 @@ export async function generateQuizForCategory(
     generated: core.generated,
     passed: core.passed,
     inserted,
+    dupFlagged: deduped.dupFlagged,
     skipped: core.skipped,
   };
 }

@@ -15,9 +15,12 @@ import { hasApprovedLearnSources } from "@/lib/learn/learn-sources";
 // 不足分（deficit）だけ生成し、その場 embed → 既存 active プール＋バッチ内既採用との cosine dedup
 // を通してから quiz_questions(active) へ積む。オンデマンド（quiz-gate の generateQuizForCategory）
 // はプール不足時のトップアップに縮退する。card-gate.ts の runCardGate（母集団照合→その場 embed→
-// dedup→bulk insert）を雛形に、生成コアは quiz-gate と共有する（decision: skip 方式。dup_flag では
-// なく近重複を insert しない＝selectSessionQuestions が dup_flag を見ないため。
-// supabase/migrations/0011_quiz.sql の「cron が dup_flag を立てる」コメントとは方式が異なる）。
+// dedup→bulk insert）を雛形に、生成コアと dedup は quiz-gate と共有する。
+// YAT-61: dedup は skip 方式（近重複を insert しない）から dup_flag 方式（insert してフラグを立て、
+// 出題プールから外す）へ変更。skip では弾いた候補が DB に残らず閾値を較正できなかったため
+// （0011_quiz.sql の「cron が dup_flag を立てる」という当初想定に戻した形）。
+// これに伴い deficit の充足数え（countActive）と出題プール取得（selectSessionQuestions）の双方が
+// dup_flag=false で絞る。
 
 // 保守的な起点値（tunable）。予算根拠は下記コメント参照。Voyage 無料枠 3 RPM / 10K TPM・cron の
 // timeout 20 分に収める。支払い登録でレート緩和されたら上げてよい。
@@ -40,14 +43,17 @@ export type QuizPoolResult = {
   deficitCategories: number; // 不足があり生成対象にしたカテゴリ数
   generated: number; // LLM が返した候補総数
   passed: number; // 形式＋grounding を通過した候補数
-  dupSkipped: number; // dedup で近重複として捨てた数
+  dupFlagged: number; // dedup で近重複として dup_flag を立てた数（insert はされるが出題しない）
   inserted: number; // quiz_questions へ insert した数
   embedFailed: number; // その場 embed に失敗し embedding=null で積んだ数
   backfill: { picked: number; succeeded: number; skipped: boolean }; // 補完 embed の結果
   skipped: boolean; // ANTHROPIC_API_KEY 未設定で生成スキップ
 };
 
-// active 件数を数える（head:true で行本体は取らない軽量 count）。category=null は全カテゴリ合算。
+// 出題可能な active 件数を数える（head:true で行本体は取らない軽量 count）。category=null は全カテゴリ合算。
+// YAT-61: dup_flag=true を除く。selectSessionQuestions が出題しない行を deficit の充足に数えると、
+// 近重複が積まれるほどプールが満ちたと誤認して補充が止まり、出題可能な問題が枯れる。
+// 「数える母集団」と「出題する母集団」は同じ条件で引くこと。
 // 失敗は 0 扱い＝deficit を大きく見積もって生成側に倒す（プールが空に見えても生成上限で頭打ちに
 // なるため安全）。
 async function countActive(
@@ -57,7 +63,8 @@ async function countActive(
   let query = supabase
     .from("quiz_questions")
     .select("id", { count: "exact", head: true })
-    .eq("status", "active");
+    .eq("status", "active")
+    .eq("dup_flag", false);
   if (category) query = query.eq("category", category);
   const { count, error } = await query;
   if (error) {
@@ -100,7 +107,7 @@ export async function runQuizPool(
     deficitCategories: 0,
     generated: 0,
     passed: 0,
-    dupSkipped: 0,
+    dupFlagged: 0,
     inserted: 0,
     embedFailed: 0,
     backfill: { picked: 0, succeeded: 0, skipped: false },
@@ -164,7 +171,7 @@ export async function runQuizPool(
     sleepBeforeEmbedMs:
       backfill.picked > 0 && !backfill.skipped ? INTER_EMBED_SLEEP_MS : 0,
   });
-  result.dupSkipped = deduped.dupSkipped;
+  result.dupFlagged = deduped.dupFlagged;
   result.embedFailed = deduped.embedFailed;
   const rows = deduped.rows;
 

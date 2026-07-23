@@ -1,9 +1,100 @@
 import { describe, it, expect } from "vitest";
-import { shuffleChoices, choiceShuffleSeed } from "@/lib/learn/quiz-gate";
+import {
+  shuffleChoices,
+  choiceShuffleSeed,
+  markQuizDuplicates,
+  type QuizInsertRow,
+} from "@/lib/learn/quiz-gate";
+import { QUIZ_DEDUP_THRESHOLD } from "@/lib/ranking/dedup";
 
 // YAT-62: LLM は正解を choices[0] に置きがちなので、insert 前に決定的シャッフルで位置を一様化する。
 // 実使用で「選択肢 1 つ目が答えであることがほとんど」という報告が出た件の回帰ガード
 // （原因はシャッフル導入前の旧データだったが、シャッフル自体が壊れていないことも固定しておく）。
+
+// YAT-61: dedup は「近重複を insert しない」skip 方式から「insert して dup_flag を立てる」方式へ。
+// skip 方式では弾いた候補が DB に残らず閾値較正の標本が原理的に取れなかったため
+// （[[generated-sibling-dedup-threshold]]）、行が残ることを回帰ガードとして固定する。
+describe("markQuizDuplicates", () => {
+  const row = (stem: string): QuizInsertRow => ({
+    concept_key: "api-design",
+    concept_label: "API 設計",
+    category: "tech/web",
+    difficulty: "medium",
+    stem,
+    choices: ["a", "b", "c", "d"],
+    answer_index: 0,
+    explanation: "解説",
+    source_quote: "引用",
+    grounded: true,
+    source_ref: "src-1",
+    status: "active",
+  });
+
+  // 単位ベクトルの cosine は角度の cos そのものなので、狙った類似度をそのまま作れる。
+  const unit = (rad: number) => [Math.cos(rad), Math.sin(rad)];
+  const ANGLE_087 = Math.acos(0.87); // 閾値 0.86 をわずかに超える角度
+
+  it("閾値超えでも行を捨てず dup_flag=true で積む（skip 方式との差）", () => {
+    const r = markQuizDuplicates([row("Q1")], [unit(ANGLE_087)], [unit(0)]);
+    expect(r.rows).toHaveLength(1);
+    expect(r.rows[0].dup_flag).toBe(true);
+    expect(r.dupFlagged).toBe(1);
+  });
+
+  it("dup_similarity に生の maxSim を残す（閾値を動かしたときの件数を後から数え直せる）", () => {
+    const r = markQuizDuplicates([row("Q1")], [unit(ANGLE_087)], [unit(0)]);
+    expect(r.rows[0].dup_similarity).toBeCloseTo(0.87, 5);
+  });
+
+  it("閾値未満は dup_flag=false（出題プールに乗る）", () => {
+    const r = markQuizDuplicates([row("Q1")], [unit(Math.acos(0.5))], [unit(0)]);
+    expect(r.rows[0].dup_flag).toBe(false);
+    expect(r.rows[0].dup_similarity).toBeCloseTo(0.5, 5);
+    expect(r.dupFlagged).toBe(0);
+  });
+
+  it("母集団が空なら最初の候補は非 dup（maxSim=0）", () => {
+    const r = markQuizDuplicates([row("Q1")], [unit(0)], []);
+    expect(r.rows[0].dup_flag).toBe(false);
+    expect(r.rows[0].dup_similarity).toBe(0);
+  });
+
+  it("dup 判定された候補も母集団に積む（keep-all。積まないと閾値でカスケードが変わる）", () => {
+    // A(0°) → B(29.5°) は 0.87 で dup、C(59.1°) は A とは 0.51 だが B とは 0.87。
+    // B を積んでいれば C も dup になる＝dup も母集団に入っている証拠。
+    const r = markQuizDuplicates(
+      [row("B"), row("C")],
+      [unit(ANGLE_087), unit(ANGLE_087 * 2)],
+      [unit(0)],
+    );
+    expect(r.rows.map((x) => x.dup_flag)).toEqual([true, true]);
+    expect(r.rows[1].dup_similarity).toBeCloseTo(0.87, 5);
+    expect(r.dupFlagged).toBe(2);
+  });
+
+  it("embed 失敗（vec=null）は embedding=null・dup 未判定で積む", () => {
+    const r = markQuizDuplicates([row("Q1")], [null], [unit(0)]);
+    expect(r.embedFailed).toBe(1);
+    expect(r.rows[0].embedding).toBeNull();
+    expect(r.rows[0].dup_flag).toBe(false);
+    expect(r.rows[0].dup_similarity).toBeNull();
+  });
+
+  it("次元が食い違う母集団は比較を飛ばす（cosineSim の無言 0 を dup 判定に混ぜない）", () => {
+    const r = markQuizDuplicates([row("Q1")], [[1, 0]], [[1, 0, 0]]);
+    expect(r.rows[0].dup_flag).toBe(false);
+    expect(r.rows[0].dup_similarity).toBe(0);
+  });
+
+  it("閾値ちょうどは dup 扱い（>= 比較。境界の回帰ガード）", () => {
+    const r = markQuizDuplicates(
+      [row("Q1")],
+      [unit(Math.acos(QUIZ_DEDUP_THRESHOLD))],
+      [unit(0)],
+    );
+    expect(r.rows[0].dup_flag).toBe(true);
+  });
+});
 
 describe("choiceShuffleSeed", () => {
   it("同じ入力からは同じ seed（再現可能・移行 script が同じ並びを再現できる前提）", () => {
