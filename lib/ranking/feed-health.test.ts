@@ -29,6 +29,30 @@ const healthy = (over: Partial<FeedHealthInput> = {}): FeedHealthInput => ({
   ...over,
 });
 
+describe("閾値・加重の現在値", () => {
+  // 較正前の「現在の挙動」固定は判定ロジックだけでは完成しない。テスト本体は定数をシンボリック
+  // 参照するため、値が変わってもアサーションが追従して通ってしまう。値そのものをここで固定し、
+  // 較正で動かすときはこのスナップショットを仕様変更として書き換える。
+  it("FEED_HEALTH_THRESHOLDS の現在値を固定する", () => {
+    expect(FEED_HEALTH_THRESHOLDS).toEqual({
+      DEAD_DAYS: 14,
+      NEW_FEED_GRACE_DAYS: 3,
+      LOW_CREDIBILITY: -0.3,
+      LOW_PREF: -2.0,
+      NEAR_DUP_RATE: 0.5,
+    });
+  });
+
+  it("RETIRE_SIGNAL_WEIGHTS の現在値を固定する", () => {
+    expect(RETIRE_SIGNAL_WEIGHTS).toEqual({
+      dead: 3.0,
+      near_dup: 2.5,
+      low_pref: 2.0,
+      low_credibility: 1.5,
+    });
+  });
+});
+
 describe("evaluateFeedHealth: 健全側", () => {
   it("全シグナルが閾値内なら推奨しない（score 0・理由なし）", () => {
     const r = evaluateFeedHealth(healthy(), NOW);
@@ -167,7 +191,8 @@ describe("evaluateFeedHealth: score と加重", () => {
       }),
       NOW,
     );
-    expect(r.reasons).toHaveLength(4);
+    // reasons の並び順は実装の push 順（UI の理由タグ表示にそのまま使われる）ごと固定する。
+    expect(r.reasons).toEqual(["dead", "low_credibility", "low_pref", "near_dup"]);
     expect(r.score).toBe(
       RETIRE_SIGNAL_WEIGHTS.dead +
         RETIRE_SIGNAL_WEIGHTS.low_credibility +
