@@ -18,7 +18,8 @@ import {
 } from "../lib/learn/grounding";
 
 // YAT-58: qa/cloze カード経路の grounding 棄却内訳を測る診断スクリプト。
-// diagnose-grounding.ts（MCQ 専用・YAT-30）の card 経路版。本番 cron の runCardGate と同じ
+// diagnose-grounding.ts（MCQ 専用・YAT-30）の card 経路版。runCardGate（凍結中・cron 経路なし。
+// ADR-20260728184233 / YAT-59）と同じ
 // 順序（①形式 →②grounding）・同じ照合母体（本文 + summary）を再現し、④語彙重なりが MCQ と
 // 同様に言語ミスマッチで支配的な棄却要因になっているかを数字で確かめる。
 // 初回計測（サンプル 6 記事 / 生成 25 件）で④棄却 68%・通過率 12.0% を確認し、MCQ（YAT-30）と
@@ -45,7 +46,7 @@ async function main() {
     return;
   }
 
-  // 本番 runCardGate（loadTargetArticles）の母集団は「useful フィードバック済み × summary 有り ×
+  // runCardGate（loadTargetArticles）の母集団は「useful フィードバック済み × summary 有り ×
   // 未カード化」。ここは棄却理由の分布を見るのが目的なので素の新着を取り、MCQ 版と条件を揃えて
   // 経路間で比較できるようにする。ただし summary は照合母体の一部なので本番と同じく必須にする
   // （summary=null が混ざると母体が短くなり②の棄却が本番より出やすくなる）。

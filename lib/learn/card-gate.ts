@@ -121,7 +121,8 @@ async function selectAllCardColumn(
 }
 
 // 既存 card_candidates の embedding を全 status 分ロードして dedup 母集団にする（行は永続）。
-// 取得失敗は fail-soft で空母集団に倒す（＝この回は dedup が効かないだけ。承認制が緩衝する）。
+// 取得失敗は fail-soft で空母集団に倒す（＝この回は dedup が効かないだけ。重複候補が pending に
+// 積まれる可能性は許容する。承認層は存在しないので、緩衝はない — ADR-20260728184233）。
 async function loadDedupPopulation(
   supabase: SupabaseClient,
 ): Promise<number[][]> {
@@ -221,6 +222,11 @@ async function loadTargetArticles(
 
 // 機械ゲート本体。母集団取得 → 記事ごとに 形式 → grounding → その場 embed + dedup → pending insert。
 // 各段は fail-soft（1 記事の失敗が全体を止めない）。runDiscoveryGate の集計・構造に倣う。
+//
+// 【凍結中・承認層なし】この経路は YAT-27 で凍結された（ADR-20260728184233 / YAT-59）。
+// cron からは呼ばれず、到達手段は手動 `npm run generate-cards` のみ。pending に積まれた候補を
+// 承認・消費する UI は存在せず、昇格先（cards / SRS）も未実装。「人手承認が緩衝する」前提の
+// 判断をこの経路に積まないこと。復活は ADR の supersede とセットで行う。
 export async function runCardGate(
   supabase: SupabaseClient,
   opts: {
