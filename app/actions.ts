@@ -197,6 +197,10 @@ export async function rejectFeedCandidate(
 // 学習カード候補（card_candidates）を承認する（YAT-17）。誤生成を本番に混ぜないための承認制の
 // 出口。YAT-17 スコープでは status を approved に倒すだけで、cards への昇格（FSRS createEmptyCard）
 // は YAT-18 で行う。承認済み行は永続するので YAT-18 で一括昇格できる。
+//
+// 【凍結中・呼び出しゼロ】承認 UI は YAT-27 で撤去され、本 Action の呼び出し側はリポジトリ全体で
+// 存在しない（rejectCard も同様）。card 経路の承認層は不在が正（ADR-20260728184233 / YAT-59）。
+// 撤去せず残すのはデータ保全と復活時の再利用のため。
 export async function approveCard(formData: FormData) {
   await requireSession();
   const id = String(formData.get("id") ?? "");
