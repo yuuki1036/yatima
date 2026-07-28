@@ -35,6 +35,10 @@ const THRESHOLDS = [0.8, 0.82, 0.84, 0.86, 0.88, 0.9, 0.92]; // スイープす�
 const HIST_BUCKETS = [0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95]; // maxSim 分布のバケツ下限
 const EXAMPLES = 5; // ダンプする高類似ペアの実例上限
 const PAIR_DUMP_LIMIT = 40; // --pairs で列挙するペアの上限
+// quiz_questions が dup_similarity を付け始めた時点（YAT-61 / migration 0013 のデプロイ = 570ea6a）。
+// これ以降の行で dup_similarity が NULL なら embed 失敗が原因と特定できる。これより前の行は
+// skip 方式時代の生き残りで、0013 が「遡って dup_flag は立てない」と決めているため区別が要る。
+const QUIZ_DUP_SINCE = "2026-07-23T04:29:43Z";
 
 // `--pairs <lo> <hi>` で類似度帯を指定すると、その帯に入る全ペアを類似度降順で列挙する。
 // 閾値を決めるには「この帯のペアが本当に重複か」を人が見る必要があり、maxSim の実例 5 件では
@@ -339,7 +343,30 @@ function report(title: string, a: Analysis, current: number, note?: string) {
 // 再計算 maxSim との違いに注意: dup_similarity は insert 当時の母集団に対する値で、母集団は時間と
 // 共に増えるため、古い行ほど「当時は非 dup だったが今なら dup」になりうる。閾値を動かしたときに
 // **その時点で何件が dup 側へ移るか**を測れるのは保存値のほうなので、両方を出す。
-function reportStoredDup(rows: Row[], threshold: number) {
+// YAT-63: dup_similarity が付くようになった時点（dupSince）以降に積まれたのに、それでも
+// dup_similarity が無い行 = insert 時の embed に失敗した行。この列は backfill が embedding を
+// 埋めても NULL のまま残る（dup 判定はやり直されないため）＝ **embed 失敗の唯一の永続的な痕跡**。
+// ログは cron の GitHub Actions 分しか遡れず、オンデマンド（Vercel runtime log）は事後に列挙する
+// 手段が無いので、経路に依存しないこの件数を出す。dupSince=null のテーブル（card は 0007 から
+// この列を持つ）は境界が無いので出さない。
+function reportUnjudged(rows: Row[], dupSince: string | null) {
+  if (!dupSince) return;
+  const after = rows.filter((r) => r.created_at >= dupSince);
+  const unjudged = after.filter((r) => r.dup_similarity === null);
+  if (after.length === 0) return;
+  console.log(
+    `    dup 未判定（${dupSince.slice(0, 10)} 以降の ${after.length} 行中）: ${unjudged.length} 件` +
+      `（insert 時に embed 失敗 → dup 判定を受けないままプール入り）`,
+  );
+  if (unjudged.length > 0) {
+    console.log(
+      "      ※ 非ゼロなら embed 失敗が実際に起きている。YAT-63 は観測実績ゼロを根拠に" +
+        "backfill 後の dup 再判定を作らない判断をしたので、その前提が崩れている",
+    );
+  }
+}
+
+function reportStoredDup(rows: Row[], threshold: number, dupSince: string | null = null) {
   const flagged = rows.filter((r) => r.dup_flag === true).length;
   const sims = rows
     .map((r) => r.dup_similarity)
@@ -349,6 +376,7 @@ function reportStoredDup(rows: Row[], threshold: number) {
     `\n  dup_flag=true（ゲートが近重複と判定した行）: ${flagged} 件` +
       `（全 ${rows.length} 行中 ${pct(flagged, rows.length)}）`,
   );
+  reportUnjudged(rows, dupSince);
   if (sims.length === 0) {
     // card は 0007 の時点から dup_similarity を持つため、ここに来るのは生成が止まっている等が原因。
     // quiz は YAT-61 より前に積まれた行が該当する。テーブル非依存の言い方に留める。
@@ -445,7 +473,7 @@ async function main() {
       "この再計算スイープは現存プールの構造を見るためのもので、閾値較正には下の「保存済み" +
       "dup_similarity」を使うこと（弾いた候補が含まれるのはそちらだけ）。",
   );
-  reportStoredDup(quizActive, QUIZ_DEDUP_THRESHOLD);
+  reportStoredDup(quizActive, QUIZ_DEDUP_THRESHOLD, QUIZ_DUP_SINCE);
 
   const quizAll = quizRaw.map(toQuizRow);
   if (quizAll.length !== quizActive.length) {

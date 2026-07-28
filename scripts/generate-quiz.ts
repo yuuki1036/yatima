@@ -24,9 +24,13 @@ async function main() {
   // （素直に引くと「登録 0（うち出題可 -5）」になり、障害時に最も見たいログが壊れる）。
   const breakdown =
     r.inserted > 0 ? `（うち出題可 ${r.inserted - r.dupFlagged}）` : "";
+  // YAT-63: 候補 embed 側も backfill 側と同じくキー未設定を判別する。区別が無いと「Voyage の障害で
+  // 失敗した」と「キーが無くて一度も呼んでいない」がどちらも embed失敗=N に潰れ、設定漏れを
+  // API 障害として調べ始めることになる。
+  const embedNote = r.embedSkipped ? "（VOYAGE_API_KEY 未設定でスキップ）" : "";
   console.log(
     `不足カテゴリ ${r.deficitCategories} / 生成 ${r.generated} / grounding通過 ${r.passed}\n` +
-      `dup flag ${r.dupFlagged} / embed失敗 ${r.embedFailed} / 登録 ${r.inserted}${breakdown}\n` +
+      `dup flag ${r.dupFlagged} / embed失敗 ${r.embedFailed}${embedNote} / 登録 ${r.inserted}${breakdown}\n` +
       `embed 補完 ${r.backfill.succeeded}/${r.backfill.picked}` +
       `${r.backfill.skipped ? "（VOYAGE_API_KEY 未設定でスキップ）" : ""}`,
   );

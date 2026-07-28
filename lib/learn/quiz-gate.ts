@@ -59,6 +59,14 @@ export type QuizGenResult = {
   passed: number; // 形式＋grounding を通過した数
   inserted: QuizQuestion[]; // quiz_questions へ積んだ問題（dup_flag=true の行も含む）
   dupFlagged: number; // うち近重複として dup_flag を立てた数（出題プールには乗らない）
+  // YAT-63: embed に失敗し embedding=null で積んだ数。この行は dup 判定を受けず、後追いの
+  // backfill が embedding を埋めても判定はやり直されない＝近重複でも出題プールに残る（安全側に
+  // 倒した既知の穴）。embed 失敗そのものは quiz-gate:embedAndDedupQuizRows と llm/embed の
+  // チャンク失敗が元から warn を出していたので、ここで新たに得られるのは**件数**（何問が dup 未判定で
+  // プールに入ったか）であって、失敗の検知自体ではない。cron は QuizPoolResult.embedFailed で
+  // 持っていたが、オンデマンドは受け取っておきながら捨てていたため揃える。
+  embedFailed: number;
+  embedSkipped: boolean; // VOYAGE_API_KEY 未設定で embed を呼ばなかった（embedFailed の全件がこれ）
   skipped: boolean; // ANTHROPIC_API_KEY 未設定でスキップ
 };
 
@@ -332,6 +340,11 @@ export type QuizDedupResult = {
   rows: QuizInsertRow[]; // insert する行（全候補。dup も dup_flag=true で含む）
   dupFlagged: number; // 近重複として dup_flag を立てた数
   embedFailed: number; // embed できず embedding=null で積む数
+  // YAT-63: VOYAGE_API_KEY 未設定で embed を一度も呼ばなかった場合 true（このとき embedFailed は
+  // 候補全件になる）。これが無いと「API 障害で失敗した」と「キーが無くて呼んでいない」が同じ
+  // embedFailed=N に潰れ、ログの読み手が Voyage の障害を疑って設定漏れを見落とす。
+  // EmbedBatchResult.skipped と同じ役割（cron の backfill 側は元からこれを判別していた）。
+  embedSkipped: boolean;
 };
 
 // 候補行を母集団と cosine 照合し、dup_flag / dup_similarity / embedding を付与する。
@@ -353,7 +366,14 @@ export function markQuizDuplicates(
   vectors: (number[] | null)[],
   population: number[][],
 ): QuizDedupResult {
-  const result: QuizDedupResult = { rows: [], dupFlagged: 0, embedFailed: 0 };
+  // embedSkipped は embedder の有無を知る embedAndDedupQuizRows が上書きする（この関数は
+  // ベクタ配列しか受け取らず、null が「失敗」か「呼んでいない」かを区別できない）。
+  const result: QuizDedupResult = {
+    rows: [],
+    dupFlagged: 0,
+    embedFailed: 0,
+    embedSkipped: false,
+  };
   candidates.forEach((row, i) => {
     const vec = vectors[i];
     if (!vec) {
@@ -398,6 +418,8 @@ export async function embedAndDedupQuizRows(
 ): Promise<QuizDedupResult> {
   // 空なら embed も母集団取得もせず即返す。戻り値の形は markQuizDuplicates に作らせて
   // QuizDedupResult の初期値を 2 箇所で定義しない（フィールドが増えたときの取りこぼし防止）。
+  // ここは embedder を見ないので embedSkipped=false のまま返るが、候補ゼロ＝embedFailed も 0 で、
+  // 両経路のログは embedFailed > 0 でしか発火しないため観測上の差は出ない。
   if (candidates.length === 0) return markQuizDuplicates([], [], []);
 
   const embedder = opts.embedder === undefined ? createEmbedder() : opts.embedder;
@@ -416,7 +438,7 @@ export async function embedAndDedupQuizRows(
     }
   }
 
-  return markQuizDuplicates(candidates, vectors, population);
+  return { ...markQuizDuplicates(candidates, vectors, population), embedSkipped: !embedder };
 }
 
 // カテゴリの素材から count 問を目標に生成し、embed → dedup を通して quiz_questions へ積んで返す。
@@ -441,6 +463,8 @@ export async function generateQuizForCategory(
     passed: core.passed,
     inserted,
     dupFlagged: deduped.dupFlagged,
+    embedFailed: deduped.embedFailed,
+    embedSkipped: deduped.embedSkipped,
     skipped: core.skipped,
   };
 }
