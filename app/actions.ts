@@ -434,11 +434,24 @@ export async function startQuizSession(
         const count = Math.min(deficit, QUIZ_SESSION_SIZE);
         after(async () => {
           try {
-            await generateQuizForCategory(supabase, {
+            const r = await generateQuizForCategory(supabase, {
               category,
               count,
               maxSources: QUIZ_REFILL_MAX_SOURCES,
             });
+            // YAT-63: embed 失敗は「dup 判定を受けないまま出題プールに残る」既知の穴に直結するので
+            // 件数を出す（失敗そのものは embed 層が元から warn している。ここで足すのは件数だけ）。
+            // 常態はゼロなので非ゼロのときだけ出す（0 を毎セッション出すとノイズになる）。
+            // 件数は割合にしない: embedFailed は dedup 段で確定するのに対し inserted は insert 段の
+            // 値で、insert が丸ごと失敗すると `2/0` になる（scripts/generate-quiz.ts が同じ罠を
+            // 内訳の出し分けで回避している）。cron と同じくフラットな独立カウントで出す。
+            if (r.embedFailed > 0) {
+              console.warn(
+                r.embedSkipped
+                  ? `クイズ裏補充: VOYAGE_API_KEY 未設定で embed をスキップ（${r.embedFailed} 件が dup 未判定でプールに入る）`
+                  : `クイズ裏補充: embed 失敗 ${r.embedFailed} 件（dup 未判定のままプールに入る）`,
+              );
+            }
           } catch (e) {
             console.warn("クイズの裏補充に失敗:", e);
           }

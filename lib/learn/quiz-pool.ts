@@ -47,6 +47,9 @@ export type QuizPoolResult = {
   dupFlagged: number; // dedup で近重複として dup_flag を立てた数（insert はされるが出題しない）
   inserted: number; // quiz_questions へ insert した数
   embedFailed: number; // その場 embed に失敗し embedding=null で積んだ数
+  // YAT-63: VOYAGE_API_KEY 未設定で embed を呼ばなかった（embedFailed の全件がこれ）。backfill 側は
+  // 元から skipped でこれを判別していたのに、候補 embed 側は判別がなく embed失敗=N に潰れていた。
+  embedSkipped: boolean;
   backfill: { picked: number; succeeded: number; skipped: boolean }; // 補完 embed の結果
   skipped: boolean; // ANTHROPIC_API_KEY 未設定で生成スキップ
 };
@@ -111,6 +114,7 @@ export async function runQuizPool(
     dupFlagged: 0,
     inserted: 0,
     embedFailed: 0,
+    embedSkipped: false,
     backfill: { picked: 0, succeeded: 0, skipped: false },
     skipped: false,
   };
@@ -177,6 +181,7 @@ export async function runQuizPool(
   });
   result.dupFlagged = deduped.dupFlagged;
   result.embedFailed = deduped.embedFailed;
+  result.embedSkipped = deduped.embedSkipped;
   const rows = deduped.rows;
 
   // ⑥ 一括 insert（全行に embedding キーを付与済み＝PostgREST の bulk insert のキー整合を満たす）。
