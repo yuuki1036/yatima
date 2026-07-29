@@ -64,6 +64,14 @@ export function CurationDeck({
     () => new Set(cards.filter((c) => c.is_starred).map((c) => c.id)),
   );
 
+  // 着地演出はカード交代のときだけ再生し、初回描画では走らせない。key remount は初回にも
+  // 起きるため、素通しにすると TODAY を開いた直後にカード本体が opacity 0 から立ち上がり、
+  // 主コンテンツの初期表示が遅れて見える（YAT-64 self-review）。
+  // index は 0 から始まり advance で単調増加するだけなので、index > 0 が「1 枚以上送った後」
+  // ＝カード交代で来た、と同値になる。マウント判定用の ref を別に持つ必要はない
+  // （ref はレンダー中に読めない: react-hooks/refs）。SSR / hydration とも index=0 で一致する。
+  const animateEntrance = !reduced && index > 0;
+
   const current: CurationCard | undefined = deck[index];
   // 背後に薄く重ねる次の1枚（スタックプレビュー）。最後の1枚では undefined。
   const next: CurationCard | undefined = deck[index + 1];
@@ -216,23 +224,72 @@ export function CurationDeck({
       <div className="relative touch-pan-y select-none" {...pointerHandlers}>
         {/* idle のスタック覚き（z0）: 背後にずらした「白いカード枠」だけを下に覗かせる。
             本文を出さないので、カードの高さ・本文量が違ってもボタン側へはみ出さず常にクリーン。
-            送り出し中も残し、飛んだカードの下から次の1枚がせり上がる「土台」として見せる。 */}
+
+            YAT-64: 以前は送り出し中もこの枠を出しっぱなしにして「次の1枚がせり上がる土台」に
+            見立てていたが、実際には枠だけが見えている時間が長かった（枠のみ露出が EXIT_MS 分、
+            続いて新カードが半透明な間も枠が透ける。タイミングの詳細は globals.css の
+            stack-settle 側に集約）。最後の1枚は next が無く枠も出ないので、位置によって
+            挙動が非対称でもあった。そこで遷移中は伏せる方式に変える:
+              - flyOut 中: 外側で opacity 0（アニメでなく即時に消す）
+              - 着地中: key remount した内側が stack-settle で entrance 終盤まで伏せる
+
+            【この 2 段を 1 枚の div に畳んではいけない】stack-settle は fill-mode: both で
+            終了後も opacity: 1 を保持し、アニメーション由来の宣言は inline style より
+            カスケードが強い。同一要素に opacity を inline で書くと必ず負けて枠が伏せられず、
+            YAT-64 で直した症状がそのまま再発する。opacity は別の層に分けるのが必須。
+
+            なお土台として実体（次カードの中身）を出す案は採らない。それは YAT-19 の
+            z1 レイヤの再導入に等しく、YAT-25 が「切り替わる瞬間とタイミングがズレて弱い」
+            として撤去済みのため。 */}
         {next && (
           <div
             aria-hidden
-            className="pointer-events-none absolute inset-0 border border-border bg-surface"
+            className="pointer-events-none absolute inset-0"
             style={{
               zIndex: 0,
-              transformOrigin: "top",
-              transform: "translateY(6px) scale(0.985)",
+              // ドラッグ中も伏せる。カードが指について退くと、その分だけ背後の枠が
+              // 露出する（枠は左右 6px ほど内側にあるだけなので、90px もずらせば
+              // 中身のない面と縦のボーダーが出る＝報告された「枠線が残る」の一相）。
+              // flyOut と dragging は pointerup で入れ替わるため、両者を OR にすると
+              // ドラッグ→送り出しの間に隙間ができない。
+              opacity: flyOut || dragging ? 0 : 1,
+              // スナップバック（閾値未満で離す）では dragging が即 false に戻る一方、
+              // カードは EXIT_MS かけて定位置へ戻る。ここを即時に戻すと戻り中のカードの
+              // 背後で枠が再び露出するので、カードの復帰と同じ時間をかけて現れさせる。
+              transition: `opacity ${EXIT_MS}ms ease-out`,
             }}
-          />
+          >
+            <div
+              // current が変わるたび remount して stack-settle を一度だけ再生する
+              // （カードの key remount で entrance を再生するのと同じ手）。
+              key={current.id}
+              className={`h-full w-full border border-border bg-surface ${
+                animateEntrance ? "animate-stack-settle" : ""
+              }`}
+              style={{
+                transformOrigin: "top",
+                transform: "translateY(6px) scale(0.985)",
+              }}
+            />
+          </div>
         )}
 
         {/* current（z2・操作対象）。送り出しは exitTransform で飛ばし、飛び切って index が
-            進むと inner が current.id で remount され、entrance が一度だけ再生される。
+            進むと current.id で remount され、entrance が一度だけ再生される。
             「次が来た」感は exit と同時の裏ライズではなく、本物の新カードの着地で見せる。 */}
         <div
+          // key はこの外側（transform を持つ層）に置くこと。内側だけに付けると、この div は
+          // 同一 DOM ノードのまま再利用され、送り出しで exitTransform が与えた画面外の位置
+          // （左右 ±1000px / open は上 -900px）から、index 前進後に生きている
+          // `transition: transform EXIT_MS` が 0 へ**戻り**を補間する。つまり新カードが
+          // 画面外から滑り込んでくる形になり、カードが定位置に収まるまで送り出しと合わせて
+          // EXIT_MS の 2 倍かかるうえ、entrance の translateY はその数百 px の移動に埋もれる。
+          // key を持たせれば新ノードが translateX(0) から始まる（before-change style が無いので
+          // transition が発火しない）。同一カード内（ドラッグのスナップバック）は key が
+          // 変わらないため transition は温存される。
+          // 前提: setIndex / setFlyOut(null) が同一コミットにバッチされること。分割されると
+          // 新ノードが flyOut 残存のまま画面外で mount され、かえって悪化する。
+          key={current.id}
           className={`relative ${dragging ? "cursor-grabbing" : "cursor-grab"}`}
           style={{
             zIndex: 2,
@@ -243,9 +300,9 @@ export function CurationDeck({
             opacity: flyOut ? 0 : 1,
           }}
         >
-          {/* key で current ごとに remount → entrance を一度だけ再生。ドラッグ transform は
+          {/* 親の remount に連動して entrance を一度だけ再生。ドラッグ transform は
               外側 div が持つので、内側の着地アニメ（transform）とは合成され競合しない。 */}
-          <div key={current.id} className={reduced ? undefined : "animate-card-enter"}>
+          <div className={animateEntrance ? "animate-card-enter" : undefined}>
             <SwipeCard
               card={current}
               // カード上の通し番号もヘッダのカウンターと同じ基準にする（判定済み分をオフセット）。

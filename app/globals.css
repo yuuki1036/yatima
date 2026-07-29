@@ -62,11 +62,20 @@ body {
 
 /* 新カード着地の entrance（YAT-19 改善）。カード送り出し後、次の1枚が current に
    なった瞬間に一度だけ再生する。背後のスタック枠（translateY(6px) scale(0.985)）より
-   わずかに深い位置から浮き上がって着地させ、「下の1枚がせり上がって来た」感で"次きた"を伝える。 */
+   わずかに深い位置から浮き上がって着地させ、「下の1枚がせり上がって来た」感で"次きた"を伝える。
+   注意: key remount は初回マウントでも起きるので、素通しだとページ初回描画でも再生される。
+   初期表示が opacity 0 から始まって遅く見えるため、初回だけは JS 側（curation-deck の
+   animateEntrance = index > 0）で class を付けないようにしてある。
+   YAT-64 で強化: 始点を opacity 0.5→0・8px→14px にし、easing を減速の強い曲線へ変えた。
+   旧値が弱かった理由は 2 つ。opacity 0.5 スタートでは変化幅が半分しかないこと、そして
+   始点の translateY(8px) が背後 z0 枠の translateY(6px) とほぼ重なっており（差 2px）、
+   浮き上がりの軌道が枠と見分けられなかったこと。14px にして枠との差を確保している。
+   opacity 0 始点にできるのは、遷移中は z0 枠を伏せて（animate-stack-settle）
+   空枠が透けなくなったのが前提。 */
 @keyframes card-enter {
   from {
-    opacity: 0.5;
-    transform: translateY(8px) scale(0.975);
+    opacity: 0;
+    transform: translateY(14px) scale(0.97);
   }
   to {
     opacity: 1;
@@ -76,12 +85,43 @@ body {
 .animate-card-enter {
   /* transform-origin を z0 枠（top）にそろえ、拡大基点を一致させてせり上がり軌道を通す。 */
   transform-origin: top;
-  animation: card-enter 200ms ease-out both;
+  /* ease-out より終端の減速が強い曲線（easeOutQuint 相当）。勢いよく入って止まるので、
+     同じ距離でも「着地した」と読み取りやすい。 */
+  animation: card-enter 260ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
-/* OS の視差効果オフ時は演出を無効化（JS 側の reduced 分岐と二重に保険をかける）。 */
+/* 背後のスタック枠（z0）の遅延フェードイン（YAT-64）。
+   この枠は idle 時に「次がある」ことを示す覗きだが、常時描画すると送り出し〜着地の間ずっと
+   「中身のない枠線」として露出する。内訳は ①送り出し中（EXIT_MS）は current が opacity 0 に
+   なるので枠だけが見える ②着地中は新カードが entrance の途中まで半透明なので下の枠が透ける。
+   そこでカード交代のたびに remount して伏せ、entrance が終わる頃にだけ現れるようにする。 */
+@keyframes stack-settle {
+  0%,
+  60% {
+    opacity: 0;
+  }
+  100% {
+    opacity: 1;
+  }
+}
+.animate-stack-settle {
+  /* 【card-enter と暗黙に結合している】伏せる時間 = 320ms × 60% = 192ms は、
+     card-enter 260ms の 74% 地点（その時点のカード opacity ≒ 0.996）であることに依存する。
+     card-enter の duration **または easing** を変えるとこの前提が崩れ、カードがまだ
+     半透明のうちに枠が出て、YAT-64 で直した「空枠が透ける」症状が再発する
+     （例: easing を素の ease-out に戻すだけで 192ms 時点の opacity は 0.996→0.899 に落ちる）。
+     片方だけ変えないこと。 */
+  animation: stack-settle 320ms ease-out both;
+}
+
+/* OS の視差効果オフ時は演出を無効化（JS 側の reduced 分岐と二重に保険をかける）。
+   animation: none にするとアニメーション由来の宣言が一切適用されなくなり、opacity は
+   宣言なし＝初期値 1 に落ちる（fill-mode は関係ない。none にした時点で both でも forwards でも
+   同じ）。結果として枠は常時表示になる。reduced では flyOut を立てず即前進するので
+   露出時間もそもそも生じない。 */
 @media (prefers-reduced-motion: reduce) {
-  .animate-card-enter {
+  .animate-card-enter,
+  .animate-stack-settle {
     animation: none;
   }
 }
