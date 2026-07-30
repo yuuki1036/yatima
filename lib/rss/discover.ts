@@ -232,6 +232,11 @@ export async function loadExistingFeedDomains(
 }
 
 // feed_candidates の既存ドメイン集合（status 不問）。承認待ち・却下済みを問わず再登録しない。
+// 注意（YAT-65 で明文化）: **status で絞っていない**。pending / approved / rejected のいずれでも
+// 一度 feed_candidates に入ったドメインは恒久的に「既知」として扱われ、二度と再発見されない。
+// 意図は「人が一度判断したものを蒸し返さない」こと。副作用として **却下はドメインを永久に焼く**
+// ため、低価値な候補は「登録してから却下」ではなく発見側のゲート（MIN_DISTINCT_SOURCES）で
+// 落とすのが正しい（落とすだけなら known に入らず、次回以降また評価される）。
 export async function loadCandidateDomains(
   supabase: SupabaseClient,
 ): Promise<Set<string>> {

@@ -8,6 +8,7 @@ import { createAdminClient } from "../lib/supabase/admin";
 import {
   collectCandidatesFromArticles,
   discoverFromArticles,
+  type CandidateGateStats,
 } from "../lib/rss/discover-articles";
 import {
   discoverFromPreferences,
@@ -21,12 +22,26 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 // --dry-run では feed の探索も feed_candidates への登録もしない。両方式とも DB read のみで無料・
 // 安全に保つ（方式①は候補ドメイン、方式②は検索テーマと生成クエリまでを見せ、外部 API は叩かない）。
 
+// 登録ゲートの通過/棄却の内訳。棄却側は候補リストに残らないので、ここに出さないと
+// 「閾値が厳しすぎて良質な個人ブログを落とし始めた」ことに気づく手段が無くなる
+// （旧 MIN_DISTINCT_SOURCES = 1 は実質全通しで、dry-run 出力が全ドメインのダンプを兼ねていた。
+// YAT-65 で閾値を上げた時点でその観測面が消えるため、数字として明示的に残す）。
+// lowSignal が 0 に近いなら閾値が緩すぎ、blogEscape が 0 なら逃げ道が効いていない、が読み筋。
+function formatGateStats(g: CandidateGateStats): string {
+  return (
+    `ゲート: 検査 ${g.examinedDomains} / 通過 ${g.passed}` +
+    `（うちブログ形で救済 ${g.passedByBlogEscape}）` +
+    ` / 棄却 低シグナル ${g.droppedLowSignal}・参照元0媒体 ${g.droppedNoSource}`
+  );
+}
+
 async function runArticles(supabase: SupabaseClient, dryRun: boolean) {
   console.log("== 方式① 記事リンク発掘 ==");
   if (dryRun) {
-    const { inputs, scannedArticles } =
+    const { inputs, scannedArticles, gateStats } =
       await collectCandidatesFromArticles(supabase);
     console.log(`走査記事: ${scannedArticles} 件 / 候補ドメイン: ${inputs.length} 件`);
+    console.log(`  ${formatGateStats(gateStats)}`);
     for (const i of inputs) {
       console.log(`  ${i.siteUrl}  (${i.discoveredFrom})`);
     }
@@ -37,6 +52,7 @@ async function runArticles(supabase: SupabaseClient, dryRun: boolean) {
   const r = await discoverFromArticles(supabase);
   console.log(
     `走査記事 ${r.scannedArticles} / 候補 ${r.candidateDomains} / 検査 ${r.examined}\n` +
+      `${formatGateStats(r.gateStats)}\n` +
       `feed 検出 ${r.discovered} / 新規登録 ${r.inserted} / ` +
       `既存feedで除外 ${r.skippedExisting} / 既存候補で除外 ${r.skippedCandidate}`,
   );

@@ -32,6 +32,11 @@ export const CREDIBILITY_LABELS: Record<CredibilityLevel, string> = {
 export const discoverySourceCount = parseArticleLinksSourceCount;
 
 // 参照元ソース数が 2 以上なら「複数の独立ソースが参照」＝相対的に強いシグナルとして強調する。
+// 発見側の登録ゲート MIN_DISTINCT_SOURCES（lib/rss/discover-articles.ts）と同じ閾値・同じ語彙。
+// 層が違うため定数は共有せず、相互参照のみ張っている。
+// YAT-65 以降のバッジ分布: ゲートは「2 媒体以上 **または** ブログ形」なので 1 媒体の候補も通り、
+// 実測では新規候補の多数が 1 媒体（＝非強調）になる。つまり強調は「原則すべて立つ」ではなく
+// **少数の強シグナルを際立たせる側に役割が反転した**。強調の情報量は失われていない。
 export const NOTABLE_SOURCE_COUNT = 2;
 
 // 方式②（嗜好ベース提案・YAT-38）候補の発見経路ラベルを返す。discovered_from が方式②の
