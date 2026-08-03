@@ -164,7 +164,11 @@ export type CandidateGateStats = {
   examinedDomains: number; // blocklist 通過後・ゲート適用前のドメイン数
   passed: number; // ゲートを通った数
   droppedNoSource: number; // 参照元が 0 媒体（articles.url が解決できず size=0）
-  droppedLowSignal: number; // 1 媒体だがブログ形でもない（＝今回厳しくした分の本体）
+  droppedLowSignal: number; // 1 媒体だがブログ形でもない（＝YAT-65 で厳しくした分の本体）
+  // 棄却された候補の blogScore 分布。閾値を動かすかを判断する唯一の材料になる
+  // （YAT-66 で「逃げ道を 1 まで緩めたら何件増えるか」を測るために追加し、緩和自体は
+  // 実測の結果ぶんどりが無く不採用にしたが、この観測面は残す）。
+  droppedByBlogScore: Record<number, number>;
   passedByBlogEscape: number; // 1 媒体だがブログ形で救済された数
 };
 
@@ -370,6 +374,13 @@ export async function collectCandidatesFromArticles(
     passedByBlogEscape: passed.filter(
       (c) => c.sourceDomains.size < MIN_DISTINCT_SOURCES,
     ).length,
+    droppedByBlogScore: all
+      .filter((c) => c.sourceDomains.size >= 1 && !passesCandidateGate(c))
+      .reduce<Record<number, number>>((acc, c) => {
+        const k = blogScore(c);
+        acc[k] = (acc[k] ?? 0) + 1;
+        return acc;
+      }, {}),
   };
 
   // スコア = 人気度（異なりソース数）×3 + ブログ的シグナル。人気度を主軸に、ブログらしさで微調整。

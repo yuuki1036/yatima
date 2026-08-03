@@ -31,7 +31,8 @@ function formatGateStats(g: CandidateGateStats): string {
   return (
     `ゲート: 検査 ${g.examinedDomains} / 通過 ${g.passed}` +
     `（うちブログ形で救済 ${g.passedByBlogEscape}）` +
-    ` / 棄却 低シグナル ${g.droppedLowSignal}・参照元0媒体 ${g.droppedNoSource}`
+    ` / 棄却 低シグナル ${g.droppedLowSignal}・参照元0媒体 ${g.droppedNoSource}` +
+    ` / 棄却の blogScore 分布 ${JSON.stringify(g.droppedByBlogScore)}`
   );
 }
 
