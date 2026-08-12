@@ -14,6 +14,12 @@ import {
 } from "../lib/ranking/feed-health";
 import { loadSourcePrefs, FEEDBACK_WEIGHT } from "../lib/ranking/preferences";
 import { parseEmbedding } from "../lib/ranking/dedup";
+import {
+  fetchWindowArticles,
+  WINDOW_DAYS,
+  MIN_OWN_ARTICLES,
+  FETCH_CAP,
+} from "../lib/ranking/near-dup-window";
 import { padEndWide } from "./_report-format";
 import type { Feed } from "../lib/types";
 
@@ -33,12 +39,10 @@ import type { Feed } from "../lib/types";
 // 注意: dead 日数と near_dup_rate は上書き型で履歴が無く、過去に遡った較正が原理的にできない。
 // このスクリプトを入れてから定期的に回して分布を貯めるのが前提（YAT-55 の調査結果 B）。
 
-const WINDOW_DAYS = 30; // near_dup_rate 算出の対象窓（compute-dedup-rate.ts と揃える）
-const MIN_OWN_ARTICLES = 5; // 母数不足の判定（compute-dedup-rate.ts と揃える）
-const FETCH_LIMIT = 5000; // articles 取得の安全弁（compute-dedup-rate.ts と揃える）
+// WINDOW_DAYS / MIN_OWN_ARTICLES / 取得クエリは near-dup-window から取る。以前はここに同値の
+// 定数を置いて「compute-dedup-rate.ts と揃える」とコメントしていたが、揃っていたのは定数だけで
+// クエリ（行数上限）はズレていた。母集団ごと共有して drift の余地を消す。
 const DAY_MS = 86_400_000;
-
-type ArticleRow = { feed_id: string; embedding: unknown; published_at: string | null };
 
 // feed ごとの記事状況。near_dup_rate=null の理由を切り分けるために数える。
 type ArticleStats = { inWindow: number; withEmbedding: number; total: number; nullPublished: number };
@@ -88,24 +92,9 @@ async function main() {
   }));
 
   // ── articles（near_dup_rate=null の内訳用）──────────────────────────────
-  // compute-dedup-rate.ts と同じ条件で数える: 直近 WINDOW_DAYS・embedding 非 null。
-  // parseEmbedding 失敗分まで揃えるため embedding 本体も引く。
-  const since = new Date(now - WINDOW_DAYS * DAY_MS).toISOString();
-  // compute-dedup-rate.ts と同じクエリ形（窓と embedding をサーバ側で絞ってから limit）にする。
-  // JS 側で絞ると 5000 件の予算を窓外・embedding 無しの行に食われ、母数が実際より小さく出る
-  // ＝ near_dup_rate=null の内訳（このスクリプトの主目的）が狂う。
-  const { data: artData, error: artErr } = await supabase
-    .from("articles")
-    .select("feed_id, embedding, published_at")
-    .gte("published_at", since)
-    .not("embedding", "is", null)
-    .order("published_at", { ascending: false })
-    .limit(FETCH_LIMIT);
-  if (artErr) {
-    console.error("articles の取得に失敗:", artErr);
-    process.exit(1);
-  }
-  const articles = (artData ?? []) as unknown as ArticleRow[];
+  // 母集団は compute-dedup-rate.ts と共有する（near-dup-window）。ここが 1 行でもズレると
+  // 「なぜ null なのか」の内訳が算出側の実態と食い違い、診断の意味が無くなる。
+  const { rows: articles, truncated } = await fetchWindowArticles(supabase, now);
   const stats = new Map<string, ArticleStats>();
   for (const a of articles) {
     const s = stats.get(a.feed_id) ?? { inWindow: 0, withEmbedding: 0, total: 0, nullPublished: 0 };
@@ -115,28 +104,41 @@ async function main() {
     if (parseEmbedding(a.embedding)) s.withEmbedding += 1;
     stats.set(a.feed_id, s);
   }
-  if (articles.length >= FETCH_LIMIT) {
+  if (truncated) {
     console.warn(
-      `⚠ articles の取得が上限 ${FETCH_LIMIT} 件に達した。古い記事が切れており、` +
+      `⚠ 窓内の記事が安全弁 ${FETCH_CAP} 件に達した。古い記事が切れており、` +
         `feed 別の embedding 件数が実態より小さく出る（母数不足の誤判定につながる）`,
     );
   }
 
   // 窓外・embedding 無しも含めた feed 別の記事有無。「記事そのものが無い」と
-  // 「記事はあるが窓/embedding の条件で落ちた」を切り分けるために別クエリで取る。
-  const { data: anyArtData } = await supabase
-    .from("articles")
-    .select("feed_id, published_at")
-    .order("fetched_at", { ascending: false })
-    .limit(FETCH_LIMIT);
-  const anyArticles = (anyArtData ?? []) as unknown as { feed_id: string; published_at: string | null }[];
+  // 「記事はあるが窓/embedding の条件で落ちた」を切り分けるために別途数える。
+  //
+  // 以前はここも articles を一括 select して JS 側で数えていたが、articles は 3 万行あり
+  // PostgREST の db-max-rows（1000）で新着 1000 件に切られていた。結果、最近記事の無い feed が
+  // 軒並み「記事そのものが無い」に誤分類されていた。件数しか要らないので head+count で feed ごとに
+  // 引く（33 feed 程度なら往復コストより正確さが勝つ。行数上限に原理的に左右されない）。
   const hasAnyArticle = new Map<string, { total: number; nullPublished: number }>();
-  for (const a of anyArticles) {
-    const s = hasAnyArticle.get(a.feed_id) ?? { total: 0, nullPublished: 0 };
-    s.total += 1;
+  for (const input of inputs) {
+    const { count: total, error: cErr } = await supabase
+      .from("articles")
+      .select("id", { count: "exact", head: true })
+      .eq("feed_id", input.id);
+    if (cErr) {
+      console.error("articles の件数取得に失敗:", cErr);
+      process.exit(1);
+    }
     // published_at が null の記事は compute-dedup-rate の 30d 窓（gte）から構造的に漏れる。
-    if (a.published_at === null) s.nullPublished += 1;
-    hasAnyArticle.set(a.feed_id, s);
+    const { count: nullPublished, error: nErr } = await supabase
+      .from("articles")
+      .select("id", { count: "exact", head: true })
+      .eq("feed_id", input.id)
+      .is("published_at", null);
+    if (nErr) {
+      console.error("articles の件数取得に失敗:", nErr);
+      process.exit(1);
+    }
+    hasAnyArticle.set(input.id, { total: total ?? 0, nullPublished: nullPublished ?? 0 });
   }
 
   // ── 評価（filter せず全 active feed）────────────────────────────────────
@@ -241,7 +243,10 @@ async function main() {
   // ── near_dup_rate = null の内訳 ────────────────────────────────────────
   const nullRows = rows.filter((r) => r.input.near_dup_rate === null);
   const nonNull = rows.length - nullRows.length;
-  console.log(`\n--- near_dup_rate = null の内訳（${nullRows.length} / ${rows.length} feed）---`);
+  console.log(
+    `\n--- near_dup_rate = null の内訳（${nullRows.length} / ${rows.length} feed）` +
+      `｜母集団: 直近 ${WINDOW_DAYS}d の embedding 付き記事 ${articles.length} 件 ---`,
+  );
   if (nonNull === 0 && rows.length > 0) {
     console.log(
       "  ⚠ active feed の全件が null。compute-dedup-rate の cron が一度も回っていない可能性が高い",
@@ -252,11 +257,14 @@ async function main() {
   let onlyNullPublished = 0;
   let noEmbed = 0;
   let tooFew = 0;
-  let enoughButNull = 0; // 母数は足りているのに null ＝ cron 未実行 / 途中失敗
+  // 母数は足りているのに null ＝ cron 未実行 / 途中失敗。件数だけでは「直近追加の feed だから
+  // まだ月曜 cron を通っていない（無害）」と「update が途中で落ちた（要調査）」を切り分けられない
+  // ので、該当 feed を名前・embedding 件数・feed 齢つきで挙げる。
+  const enoughButNullRows: typeof nullRows = [];
   for (const r of nullRows) {
     const withEmbed = r.stat?.withEmbedding ?? 0;
     const any = hasAnyArticle.get(r.input.id);
-    if (withEmbed >= MIN_OWN_ARTICLES) enoughButNull += 1;
+    if (withEmbed >= MIN_OWN_ARTICLES) enoughButNullRows.push(r);
     else if (withEmbed > 0) tooFew += 1;
     else if (!any || any.total === 0) noArticle += 1;
     // 記事は存在するが published_at が全て null → 30d 窓（gte）に構造的に入らない。
@@ -267,12 +275,26 @@ async function main() {
   console.log(`  記事はあるが published_at が全て null : ${onlyNullPublished}`);
   console.log(`  窓内に記事はあるが embedding が 0 件  : ${noEmbed}`);
   console.log(`  embedding 1〜${MIN_OWN_ARTICLES - 1} 件（母数不足）       : ${tooFew}`);
-  console.log(`  embedding ${MIN_OWN_ARTICLES} 件以上あるのに null      : ${enoughButNull}`);
-  if (enoughButNull > 0) {
+  console.log(`  embedding ${MIN_OWN_ARTICLES} 件以上あるのに null      : ${enoughButNullRows.length}`);
+  if (enoughButNullRows.length > 0) {
+    for (const r of enoughButNullRows) {
+      // created_at は null 許容。齢が出せないと「直近追加か否か」の切り分けができないので明示する。
+      const age = Number.isFinite(r.ageMs)
+        ? `feed 齢 ${(r.ageMs / DAY_MS).toFixed(1)}d（作成 ${r.input.created_at?.slice(0, 10)}）`
+        : "feed 齢 不明（created_at が null）";
+      console.log(
+        `    - ${pad(r.input.title ?? r.input.url, 27)} embedding ${r.stat?.withEmbedding ?? 0} 件 / ${age}`,
+      );
+    }
     console.log(
       `  ⚠ 母数は足りているので「MIN_OWN_ARTICLES を下げる」は対処にならない。` +
-        `compute-dedup-rate は週次（月曜）なので、直近に追加した feed か、` +
-        `update 失敗でループが途中終了した可能性を先に疑うこと`,
+        `疑う順は ①算出側を直した直後で cron がまだ回っていない ②直近に追加した feed ` +
+        `③update 失敗でループが途中終了、の順`,
+    );
+    console.log(
+      `    （near_dup_rate は DB に保存された値、母数はいま数えた値なので、両者は算出時点の` +
+        `母集団がズレていれば食い違う。まず \`npm run compute-dedup-rate\` を回して` +
+        `再測定し、それでも残る feed だけが本当の異常）`,
     );
   }
   if (onlyNullPublished > 0) {
