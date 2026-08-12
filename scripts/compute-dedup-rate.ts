@@ -5,22 +5,33 @@ config({ path: ".env.local" });
 
 import { createAdminClient } from "../lib/supabase/admin";
 import { parseEmbedding, cosineSim, DEDUP_THRESHOLD } from "../lib/ranking/dedup";
+import {
+  fetchWindowArticles,
+  WINDOW_DAYS,
+  MIN_OWN_ARTICLES,
+  FETCH_CAP,
+} from "../lib/ranking/near-dup-window";
 
 // feed ごとの「重複量産率」を事前算出して feeds.near_dup_rate に書き込む週次ジョブ（YAT-20）。
 // 削除推奨の near-dup シグナル。新規 embedding は発生せず、既存ベクタの cosine 集計のみ。
 // /feeds 表示時に pgvector NN を多数叩かないための事前算出。learn.yml（週次）から回す。
 //
 // 算出: active feed A について「A の直近30日記事（最大100件）」の各記事が、
-// 「他 feed の直近30日記事（最大1000件）」のいずれかと cosine >= 0.86 で近重複になる割合。
+// 「他 feed の直近30日記事（窓内全件）」のいずれかと cosine >= 0.86 で近重複になる割合。
 // 母数（embedding を持つ A の直近記事）が MIN_OWN_ARTICLES 件未満なら null（未算出）に倒す
 // — 小サンプルでは 1 件のマッチだけで率が 1.0 に振れ、良質だが低頻度の feed を誤って
 // 推奨へ上げてしまうため（YAT-36）。
 
-const WINDOW_DAYS = 30;
+// WINDOW_DAYS / MIN_OWN_ARTICLES / 取得クエリは near-dup-window に集約した
+// （diagnose-feed-health.ts と母集団を共有するため。定数コメントでの手動同期は drift した）。
 const PER_FEED_LIMIT = 100; // 自 feed 側の評価対象（直近）
-const COMPARE_LIMIT = 1000; // 他 feed 側の比較プール（直近）
-const FETCH_LIMIT = 5000; // 取得する直近記事の上限（安全弁）
-const MIN_OWN_ARTICLES = 5; // 近重複率を算出する最小母数（未満は小サンプル膨張を避け未算出）
+
+// 比較プールにはかつて COMPARE_LIMIT=1000（他 feed の新着 1000 件）を掛けていたが撤廃した。
+// 母集団の取りこぼしを直して own が窓全体に広がった結果、own（30日）と others（新着1000件＝
+// 実測で約5日）の時間帯が噛み合わなくなり、own の古い記事が「比較相手のいない期間」と突き合わ
+// されて近重複が原理的に検出されなくなった（実測: near_dup_rate が軒並み低下し、最大でも 0.40 と
+// 閾値 0.5 に届かずシグナルが死んだ）。窓全体と比較すれば定義どおりになる。
+// コストは許容範囲: 総実行時間はほぼ embedding の fetch 待ちで、cosine は CPU 数秒しか使わない。
 
 type Art = { feedId: string; vec: number[] };
 
@@ -39,16 +50,14 @@ async function main() {
     return;
   }
 
-  // ── 直近30日・embedding ありの記事をまとめて取得（新しい順）。
-  const since = new Date(Date.now() - WINDOW_DAYS * 86_400_000).toISOString();
-  const { data: arts, error: aErr } = await supabase
-    .from("articles")
-    .select("feed_id, embedding, published_at")
-    .gte("published_at", since)
-    .not("embedding", "is", null)
-    .order("published_at", { ascending: false })
-    .limit(FETCH_LIMIT);
-  if (aErr) throw aErr;
+  // ── 直近30日・embedding ありの記事をまとめて取得（新しい順・.range() で全件）。
+  const { rows: arts, truncated } = await fetchWindowArticles(supabase, Date.now());
+  if (truncated) {
+    console.warn(
+      `⚠ 窓内の記事が安全弁 ${FETCH_CAP} 件に達した。古い側が切れており窓が実質縮んでいる。` +
+        `低頻度 feed が母数不足（<${MIN_OWN_ARTICLES}）に倒れて near_dup_rate が null になる方向に偏る`,
+    );
+  }
 
   // feed_id ごとにパース済みベクタを束ねる（新しい順を維持）。
   const byFeed = new Map<string, Art[]>();
@@ -72,16 +81,17 @@ async function main() {
     if (own.length < MIN_OWN_ARTICLES) {
       rate = null; // embedding を持つ記事が母数未満 → 小サンプル膨張を避けて未算出
     } else {
-      // 比較プールは「他 feed 横断の新着 COMPARE_LIMIT 件」。高頻度 feed が新着上位を占めると
-      // 低頻度 feed の重複が過小評価される方向に偏る（安全側＝推奨を出しすぎない）。feed が
-      // 大規模化したら own の published_at 近傍で others を引く設計に寄せて偏りを減らす。
-      const others = all
-        .filter((x) => x.feedId !== feedId)
-        .slice(0, COMPARE_LIMIT);
+      // 比較プールは窓内の他 feed 記事の全件。自 feed を除く判定はループ内で行い、feed ごとに
+      // 6000 件規模の配列を作り直さない。一致が見つかった時点で打ち切る（元の .some() と同じ）。
       let dup = 0;
       for (const a of own) {
-        if (others.some((o) => cosineSim(a.vec, o.vec) >= DEDUP_THRESHOLD))
-          dup += 1;
+        for (const o of all) {
+          if (o.feedId === feedId) continue;
+          if (cosineSim(a.vec, o.vec) >= DEDUP_THRESHOLD) {
+            dup += 1;
+            break;
+          }
+        }
       }
       rate = dup / own.length;
     }
@@ -94,7 +104,7 @@ async function main() {
   }
 
   console.log(
-    `active feed ${feedIds.length} / 記事 ${all.length} / near_dup_rate 更新 ${updated}`,
+    `active feed ${feedIds.length} / 記事 ${all.length}（直近 ${WINDOW_DAYS}d）/ near_dup_rate 更新 ${updated}`,
   );
 }
 
