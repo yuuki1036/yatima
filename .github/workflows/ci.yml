@@ -44,6 +44,11 @@ jobs:
 
       # 後続の check は前段が落ちても実行する。1 つ目の失敗で打ち切ると「lint も test も
       # 落ちている」のに lint しか見えず、直しては再実行の往復が増えるため。
+      #
+      # lint は package.json 側で --max-warnings=0 を付けている。eslint は既定で warning では
+      # exit 0 を返すため、それが無いと warning がゲートを素通りする（実測: 意図的に入れた
+      # no-unused-vars 違反で run 全体は赤くなったが lint ステップだけ success だった）。
+      # CI 側でなく npm script に付けるのは、ローカルと CI で同じ判定にするため。
       - name: lint
         run: npm run lint
       - name: test
