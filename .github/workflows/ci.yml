@@ -1,0 +1,54 @@
+name: ci
+
+# PR とマージ後の main で lint / test / typecheck を回す（YAT-69）。
+#
+# YAT-46 で vitest を入れて以降 240 件までテストを育てたが、CI で実行するものが無く
+# 「ローカルで叩いた人がいるか」に品質が依存していた。PR で自動的に回っていたのは
+# Vercel のビルドだけ。
+#
+# typecheck は Vercel の next build が実質カバーしている（typescript.ignoreBuildErrors は
+# 既定 false、tsconfig の include が **/*.ts で scripts/ や *.test.ts も対象）。それでも
+# ここで二重に回す: Vercel 側の設定変更・プロジェクト切断・後から ignoreBuildErrors を
+# 足す変更のいずれでも静かに失われる依存であり、正しさのゲートを外部サービスの設定に
+# 委ねたままにしたくないため。所要は数十秒で、重複のコストより取りこぼしの方が高い。
+#
+# lint が CI に無かったのは Next 16 の破壊的変更が効いている。v16 で next lint が削除され
+# next build は lint を実行しなくなった（node_modules/next/dist/docs 内の
+# 01-app/02-guides/upgrading/version-16.md を参照）。build 経由のカバレッジが失われていた。
+#
+# secrets は不要。テストは全て純関数で、process.env / supabase / fetch のいずれにも触れない
+# （vitest.config.mts の environment: "node"。DB もネットワークも使わない）。
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# 同一 PR で push が続いたら古い run は捨てる（cron 系と違い、途中経過に価値が無いため
+# ingest.yml 等の cancel-in-progress: false とは逆の設定にする）。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+
+      # 後続の check は前段が落ちても実行する。1 つ目の失敗で打ち切ると「lint も test も
+      # 落ちている」のに lint しか見えず、直しては再実行の往復が増えるため。
+      - name: lint
+        run: npm run lint
+      - name: test
+        if: ${{ !cancelled() }}
+        run: npm test
+      - name: typecheck
+        if: ${{ !cancelled() }}
+        run: npx tsc --noEmit
