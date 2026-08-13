@@ -9,9 +9,20 @@ export type IngestResult = {
   feedUrl: string;
   inserted: number;
   error?: string;
+  // 継続失敗の判定に使う feed 側の生値（YAT-68）。**この run で更新する前**の値である点が重要で、
+  // 成功した feed も古い last_fetched_at を持つ。判定側は error の有無で先に絞ること。
+  title: string | null;
+  lastFetchedAt: string | null;
+  createdAt: string | null;
 };
 
-type FeedRow = { id: string; url: string; title: string | null };
+type FeedRow = {
+  id: string;
+  url: string;
+  title: string | null;
+  last_fetched_at: string | null;
+  created_at: string | null;
+};
 
 // 1 フィードを取得して articles に upsert する
 async function ingestOneFeed(
@@ -60,15 +71,26 @@ async function ingestOneFeed(
       })
       .eq("id", feed.id);
 
-    return { feedId: feed.id, feedUrl: feed.url, inserted };
+    return { feedId: feed.id, feedUrl: feed.url, inserted, ...meta(feed) };
   } catch (e) {
     return {
       feedId: feed.id,
       feedUrl: feed.url,
       inserted: 0,
       error: e instanceof Error ? e.message : String(e),
+      ...meta(feed),
     };
   }
+}
+
+// 成功・失敗の両方に同じ生値を載せるための小さなヘルパー（片側に付け忘れると
+// 継続失敗の判定が静かに空振りするため、1 箇所に寄せる）。
+function meta(feed: FeedRow) {
+  return {
+    title: feed.title,
+    lastFetchedAt: feed.last_fetched_at,
+    createdAt: feed.created_at,
+  };
 }
 
 // active な全フィードを順に取得して保存する
@@ -77,7 +99,7 @@ export async function ingestAllFeeds(
 ): Promise<IngestResult[]> {
   const { data: feeds, error } = await supabase
     .from("feeds")
-    .select("id, url, title")
+    .select("id, url, title, last_fetched_at, created_at")
     .eq("active", true);
   if (error) throw error;
   if (!feeds || feeds.length === 0) return [];
