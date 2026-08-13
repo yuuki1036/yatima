@@ -34,6 +34,11 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # checkout と npm しか行わないので read のみ。リポジトリ既定も現状 read だが、
+    # 設定変更で静かに広がる依存にしたくないのでワークフロー側に明示する
+    # （typecheck を Vercel と二重に回しているのと同じ理由）。
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
