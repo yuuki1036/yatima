@@ -6,6 +6,11 @@ config({ path: ".env.local" });
 
 import { createAdminClient } from "../lib/supabase/admin";
 import { ingestAllFeeds } from "../lib/rss/ingest";
+import {
+  findStaleFeeds,
+  formatStale,
+  STALE_ALERT_HOURS,
+} from "../lib/rss/ingest-health";
 import { enrichMissingBodies } from "../lib/rss/enrich";
 import { annotateMissing } from "../lib/llm/summarize-batch";
 import { embedMissing } from "../lib/rss/embed";
@@ -61,8 +66,29 @@ async function main() {
     console.warn("キュレーション失敗:", e);
   }
 
-  // 全フィード失敗時は CI を赤くする
-  if (results.length > 0 && failed === results.length) process.exit(1);
+  // ── 失敗の可視化（YAT-68）─────────────────────────────────────────────
+  // 単発の失敗は上の console.error に出るだけで、毎時 24 回のログに埋もれる。恒常的に
+  // 落ちている feed は exit(1) で CI を赤くして気付けるようにする（Import AI が 15 日間
+  // 403 で落ち続けたのを退役推奨で知る、という遅すぎる検知が起票の理由）。
+  const stale = findStaleFeeds(results);
+  if (stale.length > 0) {
+    console.error(
+      `\n⚠ ${STALE_ALERT_HOURS} 時間以上ずっと取得に失敗している feed が ${stale.length} 件:`,
+    );
+    for (const s of stale) {
+      console.error(
+        `  - ${s.title ?? s.feedUrl}（最後の成功から ${formatStale(s.staleMs)}）: ${s.error}`,
+      );
+      console.error(`    ${s.feedUrl}`);
+    }
+    console.error(
+      `  feed 側が死んだのか、取得元の環境が弾かれているのかはローカルからの取得と見比べること`,
+    );
+  }
+
+  // 全フィード失敗は「6 時間待たずに今すぐ赤くすべき」別の障害モードなので併存させる。
+  const allFailed = results.length > 0 && failed === results.length;
+  if (allFailed || stale.length > 0) process.exit(1);
 }
 
 main().catch((e) => {
