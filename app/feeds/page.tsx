@@ -2,6 +2,7 @@ import { createSupabaseServerClient } from "@/lib/supabase/server";
 import { loadSourcePrefs } from "@/lib/ranking/preferences";
 import {
   computeRetireSuggestions,
+  FEED_HEALTH_THRESHOLDS,
   type RetireSuggestion,
 } from "@/lib/ranking/feed-health";
 import type { Feed, FeedCandidate } from "@/lib/types";
@@ -25,7 +26,7 @@ export default async function FeedsPage() {
 
   try {
     const supabase = await createSupabaseServerClient();
-    const [feedsRes, candRes, sourcePrefs] = await Promise.all([
+    const [feedsRes, candRes, sourcePrefs, recentPublished] = await Promise.all([
       supabase
         .from("feeds")
         .select("*")
@@ -38,6 +39,32 @@ export default async function FeedsPage() {
         .order("created_at", { ascending: false }),
       // 削除推奨のソース嗜好シグナル用。推奨はベストエフォートなので失敗は空 Map に倒す。
       loadSourcePrefs(supabase).catch(() => new Map<string, number>()),
+      // dead シグナル用の「feed ごとの直近記事の公開日」（YAT-70 の RPC）。最新値と投稿間隔の
+      // 中央値の両方をここから導く。失敗時は空 Map ではなく **null** を返す。空 Map に倒すと
+      // 「記事が 1 件も無い」と区別が付かず、migration 未適用や一時障害のときに全 feed が
+      // 一斉に dead へ倒れる。
+      (async (): Promise<Map<string, string[]> | null> => {
+        try {
+          const { data, error } = await supabase.rpc("feed_recent_published", {
+            sample_size: FEED_HEALTH_THRESHOLDS.CADENCE_SAMPLE,
+          });
+          if (error) return null;
+          const rows = (data ?? []) as {
+            feed_id: string;
+            published_at: string;
+          }[];
+          // RPC は feed_id ごとに published_at 降順で返す。その順序を保って束ねる。
+          const m = new Map<string, string[]>();
+          for (const r of rows) {
+            const l = m.get(r.feed_id);
+            if (l) l.push(r.published_at);
+            else m.set(r.feed_id, [r.published_at]);
+          }
+          return m;
+        } catch {
+          return null;
+        }
+      })(),
     ]);
     if (feedsRes.error) throw feedsRes.error;
     // 候補の取得失敗は致命ではない（feeds 一覧は出す）。枠だけ畳む。
@@ -53,7 +80,11 @@ export default async function FeedsPage() {
           title: f.title,
           url: f.url,
           created_at: f.created_at,
-          last_fetched_at: f.last_fetched_at,
+          // RPC が取れなかった場合は undefined を渡して dead 判定を見送らせる
+          // （空配列は「記事ゼロ」の意味なので畳んではいけない。feed-health.ts の注釈を参照）。
+          recentPublishedAt: recentPublished
+            ? (recentPublished.get(f.id) ?? [])
+            : undefined,
           credibility: f.credibility,
           near_dup_rate: f.near_dup_rate,
           sourcePref: sourcePrefs.get(f.id) ?? 0,
