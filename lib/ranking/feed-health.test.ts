@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   evaluateFeedHealth,
+  deadThresholdMs,
   computeRetireSuggestions,
   FEED_HEALTH_THRESHOLDS,
   RETIRE_SIGNAL_WEIGHTS,
@@ -22,7 +23,8 @@ const healthy = (over: Partial<FeedHealthInput> = {}): FeedHealthInput => ({
   title: "健全フィード",
   url: "https://example.com/feed.xml",
   created_at: daysAgo(30),
-  latestPublishedAt: daysAgo(0),
+  // 既定は日刊ペース（間隔の中央値 1d）で沈黙 0d ＝ 健全。
+  recentPublishedAt: [daysAgo(0), daysAgo(1), daysAgo(2), daysAgo(3)],
   credibility: 0,
   near_dup_rate: null,
   sourcePref: 0,
@@ -36,6 +38,8 @@ describe("閾値・加重の現在値", () => {
   it("FEED_HEALTH_THRESHOLDS の現在値を固定する", () => {
     expect(FEED_HEALTH_THRESHOLDS).toEqual({
       DEAD_DAYS: 14,
+      DEAD_STALL_MULTIPLIER: 2.5,
+      CADENCE_SAMPLE: 15,
       NEW_FEED_GRACE_DAYS: 3,
       LOW_CREDIBILITY: -0.3,
       LOW_PREF: -2.0,
@@ -75,7 +79,7 @@ describe("evaluateFeedHealth: dead シグナル（YAT-70 で発信停滞へ再�
 
   it("記事が 1 件も無い feed は猶予明けなら dead", () => {
     const r = evaluateFeedHealth(
-      healthy({ created_at: daysAgo(10), latestPublishedAt: null }),
+      healthy({ created_at: daysAgo(10), recentPublishedAt: [] }),
       NOW,
     );
     expect(r.reasons).toEqual(["dead"]);
@@ -85,7 +89,7 @@ describe("evaluateFeedHealth: dead シグナル（YAT-70 で発信停滞へ再�
     const r = evaluateFeedHealth(
       healthy({
         created_at: daysAgo(FEED_HEALTH_THRESHOLDS.NEW_FEED_GRACE_DAYS - 1),
-        latestPublishedAt: null,
+        recentPublishedAt: [],
       }),
       NOW,
     );
@@ -96,7 +100,7 @@ describe("evaluateFeedHealth: dead シグナル（YAT-70 で発信停滞へ再�
     const r = evaluateFeedHealth(
       healthy({
         created_at: daysAgo(FEED_HEALTH_THRESHOLDS.NEW_FEED_GRACE_DAYS),
-        latestPublishedAt: null,
+        recentPublishedAt: [],
       }),
       NOW,
     );
@@ -105,7 +109,7 @@ describe("evaluateFeedHealth: dead シグナル（YAT-70 で発信停滞へ再�
 
   it("発信境界: ちょうど DEAD_DAYS では dead にしない（strict 比較）", () => {
     const r = evaluateFeedHealth(
-      healthy({ latestPublishedAt: daysAgo(FEED_HEALTH_THRESHOLDS.DEAD_DAYS) }),
+      healthy({ recentPublishedAt: [daysAgo(FEED_HEALTH_THRESHOLDS.DEAD_DAYS)] }),
       NOW,
     );
     expect(r.reasons).toEqual([]);
@@ -115,20 +119,20 @@ describe("evaluateFeedHealth: dead シグナル（YAT-70 で発信停滞へ再�
     const quiet = new Date(
       NOW - FEED_HEALTH_THRESHOLDS.DEAD_DAYS * DAY_MS - 1,
     ).toISOString();
-    const r = evaluateFeedHealth(healthy({ latestPublishedAt: quiet }), NOW);
+    const r = evaluateFeedHealth(healthy({ recentPublishedAt: [quiet] }), NOW);
     expect(r.reasons).toEqual(["dead"]);
   });
 
   it("取得が止まっていても発信が新しければ dead にしない（旧定義との違い）", () => {
     // 旧定義ではここが dead になっていた。取得失敗は YAT-68 の findStaleFeeds が別途検知する。
-    const r = evaluateFeedHealth(healthy({ latestPublishedAt: daysAgo(1) }), NOW);
+    const r = evaluateFeedHealth(healthy({ recentPublishedAt: [daysAgo(1)] }), NOW);
     expect(r.reasons).toEqual([]);
   });
 
-  it("latestPublishedAt が undefined（取得できなかった）なら dead 判定を見送る", () => {
+  it("recentPublishedAt が undefined（取得できなかった）なら dead 判定を見送る", () => {
     // null に畳むと migration 未適用や RPC 障害で全 feed が一斉に dead へ倒れる。
     const r = evaluateFeedHealth(
-      healthy({ created_at: daysAgo(100), latestPublishedAt: undefined }),
+      healthy({ created_at: daysAgo(100), recentPublishedAt: undefined }),
       NOW,
     );
     expect(r.reasons).toEqual([]);
@@ -136,14 +140,14 @@ describe("evaluateFeedHealth: dead シグナル（YAT-70 で発信停滞へ再�
 
   it("undefined は他シグナルの判定までは止めない", () => {
     const r = evaluateFeedHealth(
-      healthy({ latestPublishedAt: undefined, credibility: -0.9 }),
+      healthy({ recentPublishedAt: undefined, credibility: -0.9 }),
       NOW,
     );
     expect(r.reasons).toEqual(["low_credibility"]);
   });
 
   it("パースできない日付では dead を立てない（安全側）", () => {
-    const r = evaluateFeedHealth(healthy({ latestPublishedAt: "not-a-date" }), NOW);
+    const r = evaluateFeedHealth(healthy({ recentPublishedAt: ["not-a-date"] }), NOW);
     expect(r.reasons).toEqual([]);
   });
 });
@@ -205,7 +209,7 @@ describe("evaluateFeedHealth: near_dup シグナル", () => {
 describe("evaluateFeedHealth: score と加重", () => {
   it("単一シグナルの score はそのシグナルの加重に一致する", () => {
     const r = evaluateFeedHealth(
-      healthy({ created_at: daysAgo(10), latestPublishedAt: null }),
+      healthy({ created_at: daysAgo(10), recentPublishedAt: [] }),
       NOW,
     );
     expect(r.score).toBe(RETIRE_SIGNAL_WEIGHTS.dead);
@@ -215,7 +219,7 @@ describe("evaluateFeedHealth: score と加重", () => {
     const r = evaluateFeedHealth(
       healthy({
         created_at: daysAgo(10),
-        latestPublishedAt: null, // dead
+        recentPublishedAt: [], // dead
         credibility: -0.5, // low_credibility
         sourcePref: -3, // low_pref
         near_dup_rate: 0.8, // near_dup
@@ -239,7 +243,7 @@ describe("computeRetireSuggestions", () => {
     const inputs: FeedHealthInput[] = [
       healthy({ id: "ok" }),
       healthy({ id: "pref-only", sourcePref: -3 }), // score 2.0
-      healthy({ id: "dead-and-dup", created_at: daysAgo(10), latestPublishedAt: null, near_dup_rate: 0.9 }), // score 5.5
+      healthy({ id: "dead-and-dup", created_at: daysAgo(10), recentPublishedAt: [], near_dup_rate: 0.9 }), // score 5.5
     ];
     const r = computeRetireSuggestions(inputs, NOW);
     expect(r.map((s) => s.id)).toEqual(["dead-and-dup", "pref-only"]);
@@ -248,4 +252,72 @@ describe("computeRetireSuggestions", () => {
   it("全 feed 健全なら空配列", () => {
     expect(computeRetireSuggestions([healthy()], NOW)).toEqual([]);
   });
+});
+
+describe("deadThresholdMs: 投稿間隔ベースの適応閾値（YAT-70）", () => {
+  const DEAD_FLOOR_MS = FEED_HEALTH_THRESHOLDS.DEAD_DAYS * DAY_MS;
+  // 間隔が gapDays 一定の feed を、新しい順の公開日リストとして作る。
+  const cadence = (gapDays: number, count = 6) =>
+    Array.from({ length: count }, (_, i) => daysAgo(i * gapDays));
+
+  it("高頻度 feed では DEAD_DAYS が下限として効く", () => {
+    // 中央値 1d × 2.5 = 2.5d だが、1 回の休載で dead にしないよう 14d まで引き上げる。
+    expect(deadThresholdMs(cadence(1))).toBe(DEAD_FLOOR_MS);
+  });
+
+  it("低頻度 feed では中央値 × 倍率まで閾値が伸びる", () => {
+    // 中央値 25d × 2.5 = 62.5d（Ahead of AI 相当）。
+    expect(deadThresholdMs(cadence(25))).toBe(25 * 2.5 * DAY_MS);
+  });
+
+  it("サンプルが 1 件だけなら間隔が取れないので DEAD_DAYS だけで判定する", () => {
+    expect(deadThresholdMs([daysAgo(0)])).toBe(DEAD_FLOOR_MS);
+  });
+
+  it("記事ゼロでも DEAD_DAYS を返す（呼び出し側が Infinity と比較して dead にする）", () => {
+    expect(deadThresholdMs([])).toBe(DEAD_FLOOR_MS);
+  });
+
+  it("外れ値の休載 1 回では閾値が引きずられない（平均でなく中央値を使う）", () => {
+    // 間隔は [7, 7, 200, 7]。中央値は 7d なので閾値は 17.5d。
+    // 平均（55.25d）を使っていたら 138d まで伸び、その後の停滞を 4 ヶ月見逃すことになる。
+    const recent = [daysAgo(0), daysAgo(7), daysAgo(14), daysAgo(214), daysAgo(221)];
+    expect(deadThresholdMs(recent)).toBe(7 * 2.5 * DAY_MS);
+    expect(deadThresholdMs(recent)).toBeGreaterThan(DEAD_FLOOR_MS);
+  });
+
+  it("パースできない日付は間隔の算出から除く", () => {
+    const recent = ["not-a-date", daysAgo(0), daysAgo(25), daysAgo(50)];
+    expect(deadThresholdMs(recent)).toBe(25 * 2.5 * DAY_MS);
+  });
+
+  it("CADENCE_SAMPLE を超える分は見ない（過去の刊行ペースを引きずらない）", () => {
+    // 直近 15 件は日刊、その先は月刊。中央値は日刊側で決まる → 下限 14d。
+    const recent = [
+      ...Array.from({ length: 15 }, (_, i) => daysAgo(i)),
+      ...Array.from({ length: 5 }, (_, i) => daysAgo(100 + i * 30)),
+    ];
+    expect(deadThresholdMs(recent)).toBe(DEAD_FLOOR_MS);
+  });
+});
+
+describe("dead 判定: 実測 4 feed の回帰（YAT-70。固定 14d では 2 件が誤検知だった）", () => {
+  // 2026-08-13 の実測値。適応閾値がこの 4 件を分離することを固定する。
+  const cases = [
+    { name: "Berkeley BAIR", gap: 38.0, quiet: 15.2, dead: false },
+    { name: "Ahead of AI", gap: 25.0, quiet: 26.1, dead: false },
+    { name: "VentureBeat AI", gap: 3.0, quiet: 27.8, dead: true },
+    { name: "PFN Tech Blog", gap: 7.9, quiet: 27.6, dead: true },
+  ];
+
+  for (const c of cases) {
+    it(`${c.name}（中央値 ${c.gap}d / 沈黙 ${c.quiet}d）→ ${c.dead ? "dead" : "健全"}`, () => {
+      // 沈黙 quiet 日の時点から、それ以前は gap 日間隔で発信していた feed を組み立てる。
+      const recent = Array.from({ length: 6 }, (_, i) =>
+        daysAgo(c.quiet + i * c.gap),
+      );
+      const r = evaluateFeedHealth(healthy({ recentPublishedAt: recent }), NOW);
+      expect(r.reasons.includes("dead")).toBe(c.dead);
+    });
+  }
 });

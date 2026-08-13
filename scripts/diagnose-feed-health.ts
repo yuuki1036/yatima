@@ -7,6 +7,7 @@ import { createAdminClient } from "../lib/supabase/admin";
 import {
   evaluateFeedHealth,
   FEED_HEALTH_THRESHOLDS as TH,
+  deadThresholdMs,
   RETIRE_SIGNAL_WEIGHTS,
   RETIRE_REASON_LABELS,
   type FeedHealthInput,
@@ -84,26 +85,30 @@ async function main() {
 
   // dead シグナル用（YAT-70 で last_fetched_at から差し替え）。診断では「RPC が取れなかった」を
   // 黙って通すと dead 列が全て空欄になり健全と誤読されるので、失敗を明示して落とす。
-  const { data: latestRows, error: lpErr } = await supabase.rpc("feed_latest_published");
+  const { data: recentRows, error: lpErr } = await supabase.rpc(
+    "feed_recent_published",
+    { sample_size: TH.CADENCE_SAMPLE },
+  );
   if (lpErr) {
     console.error(
-      "feed_latest_published の取得に失敗（migration 0014 未適用の可能性）:",
+      "feed_recent_published の取得に失敗（migration 0014 未適用の可能性）:",
       lpErr,
     );
     process.exit(1);
   }
-  const latestPublished = new Map(
-    ((latestRows ?? []) as { feed_id: string; latest_published_at: string | null }[]).map(
-      (r) => [r.feed_id, r.latest_published_at],
-    ),
-  );
+  const recentPublished = new Map<string, string[]>();
+  for (const r of (recentRows ?? []) as { feed_id: string; published_at: string }[]) {
+    const l = recentPublished.get(r.feed_id);
+    if (l) l.push(r.published_at);
+    else recentPublished.set(r.feed_id, [r.published_at]);
+  }
 
   const inputs: FeedHealthInput[] = active.map((f) => ({
     id: f.id,
     title: f.title,
     url: f.url,
     created_at: f.created_at,
-    latestPublishedAt: latestPublished.get(f.id) ?? null,
+    recentPublishedAt: recentPublished.get(f.id) ?? [],
     credibility: f.credibility,
     near_dup_rate: f.near_dup_rate,
     sourcePref: sourcePrefs.get(f.id) ?? 0,
@@ -164,11 +169,11 @@ async function main() {
     const result = evaluateFeedHealth(input, now);
     const ageMs = now - Date.parse(input.created_at);
     // 発信停滞（最新記事の公開からの経過）。記事ゼロは Infinity＝「未発信」として扱う。
-    const quietMs =
-      input.latestPublishedAt == null
-        ? Infinity
-        : now - Date.parse(input.latestPublishedAt);
-    return { input, result, ageMs, quietMs, stat: stats.get(input.id) };
+    const recent = input.recentPublishedAt ?? [];
+    const quietMs = recent.length === 0 ? Infinity : now - Date.parse(recent[0]);
+    // 適応閾値（feed ごとの投稿間隔の中央値ベース）。固定 14d と別物なので併記する。
+    const deadMs = deadThresholdMs(recent);
+    return { input, result, ageMs, quietMs, deadMs, stat: stats.get(input.id) };
   });
   rows.sort((a, b) => b.result.score - a.result.score);
 
@@ -178,7 +183,7 @@ async function main() {
       ` / 推奨 ${rows.filter((r) => r.result.recommend).length}`,
   );
   console.log(
-    `閾値: dead(発信停滞)>${TH.DEAD_DAYS}d（新規猶予 ${TH.NEW_FEED_GRACE_DAYS}d） / credibility<${TH.LOW_CREDIBILITY}` +
+    `閾値: dead(発信停滞)>max(${TH.DEAD_DAYS}d, ${TH.DEAD_STALL_MULTIPLIER}×投稿間隔中央値)（新規猶予 ${TH.NEW_FEED_GRACE_DAYS}d） / credibility<${TH.LOW_CREDIBILITY}` +
       ` / pref<${TH.LOW_PREF} / near_dup>=${TH.NEAR_DUP_RATE}`,
   );
   console.log(
@@ -190,7 +195,7 @@ async function main() {
 
   console.log("\n--- 全 active feed のシグナル値（score 降順・推奨は ★）---");
   console.log(
-    `${pad("feed", 28)} ${"score".padStart(5)} ${"沈黙".padStart(7)} ${"cred".padStart(6)} ${"pref".padStart(6)} ${"ndup".padStart(6)}  理由`,
+    `${pad("feed", 28)} ${"score".padStart(5)} ${"沈黙".padStart(7)} ${"dead閾値".padStart(8)} ${"cred".padStart(6)} ${"pref".padStart(6)} ${"ndup".padStart(6)}  理由`,
   );
   for (const r of rows) {
     const mark = r.result.recommend ? "★" : " ";
@@ -198,7 +203,7 @@ async function main() {
     const reasons = r.result.reasons.map((x) => RETIRE_REASON_LABELS[x]).join(",") || "―";
     console.log(
       `${mark}${pad(r.input.title ?? r.input.url, 27)} ${r.result.score.toFixed(1).padStart(5)}` +
-        ` ${fmtDays(r.quietMs).padStart(7)} ${r.input.credibility.toFixed(2).padStart(6)}` +
+        ` ${fmtDays(r.quietMs).padStart(7)} ${fmtDays(r.deadMs).padStart(8)} ${r.input.credibility.toFixed(2).padStart(6)}` +
         ` ${r.input.sourcePref.toFixed(2).padStart(6)} ${nd.padStart(6)}  ${reasons}`,
     );
   }
@@ -219,7 +224,7 @@ async function main() {
       // dead は evaluateFeedHealth が新規猶予中は判定自体をスキップする。ここもそれに揃えないと
       // 追加直後で未取得（staleMs=Infinity）の feed が「dead 到達済」と出てスコア表と矛盾する。
       const isNew = r.ageMs < graceMs;
-      const staleGap = isNew ? null : (TH.DEAD_DAYS * DAY_MS - r.quietMs) / DAY_MS;
+      const staleGap = isNew ? null : (r.deadMs - r.quietMs) / DAY_MS;
       // まだ立っていないシグナルの中で最も閾値に近い距離。全部立っていれば対象外。
       const pending = [credGap, prefGap, staleGap].filter(
         (g): g is number => g !== null && g >= 0,
