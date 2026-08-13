@@ -19,11 +19,20 @@ export const RETIRE_REASON_LABELS: Record<RetireReason, string> = {
 
 // 閾値（暫定値・運用で調整）。
 export const FEED_HEALTH_THRESHOLDS = {
-  // dead: last_fetched_at がこの日数より古い（ingest は毎時・成功時のみ更新するため、
-  // この長さ放置 = 取得失敗の継続を強く示唆）。
+  // dead: 最新記事の公開からこの日数より古い ＝ 発信が止まっている（YAT-70 で再定義）。
+  //
+  // 旧定義は last_fetched_at ベースだったが、この列は ingest の「取得成功時」に更新されるため
+  // 測れるのは「こちらが取得できているか」であって「発信元が止まったか」ではなかった。実測でも
+  // active 34 feed すべてが取得停滞 0.0d（＝誰にも立たない）である一方、発信が 14 日以上
+  // 止まっている feed が 4 件あり、そのすべてを取り逃していた。取得失敗の検知は YAT-68 で
+  // ingest 側（6 時間で CI を赤くする）に移したので、ここは発信停滞に専念する。
+  //
+  // 14 日を据え置いたのは実測の分布による: >14d が 4 件（15〜28d）で 5 番目が 6.5d と
+  // ギャップがあり、現データでは分離点として機能する。低頻度が正常な媒体（週刊ニュースレター等）
+  // と本当に止まった feed を一律閾値で分けられない問題は残る（YAT-55 の較正へ持ち越し）。
   DEAD_DAYS: 14,
-  // 新規 feed の誤検知ガード: 追加から猶予日数（ingest 約 72 回分）が経つまで dead 判定しない。
-  // 追加直後で last_fetched_at=null の feed を「死亡」と誤らないため。
+  // 新規 feed の誤検知ガード: 追加から猶予日数が経つまで dead 判定しない。
+  // 追加直後でまだ記事が 1 件も入っていない feed を「死亡」と誤らないため。
   NEW_FEED_GRACE_DAYS: 3,
   // 信頼度がこの値未満（汎用アグリゲータ下限域。0=中立 / -0.8=最低）。
   LOW_CREDIBILITY: -0.3,
@@ -47,7 +56,23 @@ export type FeedHealthInput = {
   title: string | null;
   url: string;
   created_at: string;
-  last_fetched_at: string | null;
+  /**
+   * この feed の最新記事の公開日（YAT-70 で last_fetched_at から差し替え）。
+   *
+   * 三状態を意図的に区別する:
+   *   - `string` … 最新記事の公開日。dead は「これが DEAD_DAYS より古いか」で判定する
+   *   - `null`   … 記事が 1 件も無い。新規猶予を過ぎていれば dead
+   *   - `undefined` … **取得できなかった（未知）**。dead 判定自体をスキップする
+   *
+   * undefined が要るのは、供給元が RPC（feed_latest_published）で失敗しうるため。ここで
+   * null に畳むと「記事が無い」と同じ扱いになり、RPC 未適用・一時障害のときに **全 feed が
+   * 一斉に dead へ倒れる**。シグナルを黙らせる方が、全件を誤って退役推奨に出すより安全。
+   *
+   * この三状態の扱いは **型で強制されている**: 判定側の undefined チェックを外すと
+   * `Date.parse(string | undefined)` が TS2345 で落ちる（ミューテーションで確認済み。
+   * テストでは殺せないが tsc が殺す）。
+   */
+  latestPublishedAt: string | null | undefined;
   credibility: number;
   near_dup_rate: number | null; // null = 未算出
   sourcePref: number; // preferences(kind='source', key=id).weight、未登録は 0
@@ -73,15 +98,17 @@ export function evaluateFeedHealth(
   const t = FEED_HEALTH_THRESHOLDS;
   const reasons: RetireReason[] = [];
 
-  // dead: 新規ガードを通過した上で、last_fetched_at が無い or DEAD_DAYS より古い。
+  // dead: 新規ガードを通過した上で、最新記事の公開が DEAD_DAYS より古い（記事ゼロも含む）。
+  // latestPublishedAt が undefined（＝取得できなかった）ときは判定自体を見送る。詳細は型定義の注釈。
   const ageMs = now - Date.parse(input.created_at);
   const isNew = ageMs < t.NEW_FEED_GRACE_DAYS * DAY_MS;
-  if (!isNew) {
-    const staleMs =
-      input.last_fetched_at === null
-        ? Infinity
-        : now - Date.parse(input.last_fetched_at);
-    if (staleMs > t.DEAD_DAYS * DAY_MS) reasons.push("dead");
+  if (!isNew && input.latestPublishedAt !== undefined) {
+    const quietMs =
+      input.latestPublishedAt === null
+        ? Infinity // 記事が 1 件も無い（猶予は上で通過済み）
+        : now - Date.parse(input.latestPublishedAt);
+    // Date.parse 不能な値は NaN になり、比較が false になって dead を立てない（安全側）。
+    if (quietMs > t.DEAD_DAYS * DAY_MS) reasons.push("dead");
   }
 
   if (input.credibility < t.LOW_CREDIBILITY) reasons.push("low_credibility");

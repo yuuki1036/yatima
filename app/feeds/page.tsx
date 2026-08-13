@@ -25,7 +25,7 @@ export default async function FeedsPage() {
 
   try {
     const supabase = await createSupabaseServerClient();
-    const [feedsRes, candRes, sourcePrefs] = await Promise.all([
+    const [feedsRes, candRes, sourcePrefs, latestPublished] = await Promise.all([
       supabase
         .from("feeds")
         .select("*")
@@ -38,6 +38,22 @@ export default async function FeedsPage() {
         .order("created_at", { ascending: false }),
       // 削除推奨のソース嗜好シグナル用。推奨はベストエフォートなので失敗は空 Map に倒す。
       loadSourcePrefs(supabase).catch(() => new Map<string, number>()),
+      // dead シグナル用の「feed ごとの最新記事の公開日」（YAT-70 の RPC）。
+      // 失敗時は空 Map ではなく **null** を返す。空 Map に倒すと「記事が 1 件も無い」と
+      // 区別が付かず、migration 未適用や一時障害のときに全 feed が一斉に dead へ倒れる。
+      (async (): Promise<Map<string, string | null> | null> => {
+        try {
+          const { data, error } = await supabase.rpc("feed_latest_published");
+          if (error) return null;
+          const rows = (data ?? []) as {
+            feed_id: string;
+            latest_published_at: string | null;
+          }[];
+          return new Map(rows.map((r) => [r.feed_id, r.latest_published_at]));
+        } catch {
+          return null;
+        }
+      })(),
     ]);
     if (feedsRes.error) throw feedsRes.error;
     // 候補の取得失敗は致命ではない（feeds 一覧は出す）。枠だけ畳む。
@@ -53,7 +69,11 @@ export default async function FeedsPage() {
           title: f.title,
           url: f.url,
           created_at: f.created_at,
-          last_fetched_at: f.last_fetched_at,
+          // RPC が取れなかった場合は undefined を渡して dead 判定を見送らせる
+          // （null は「記事ゼロ」の意味なので畳んではいけない。feed-health.ts の注釈を参照）。
+          latestPublishedAt: latestPublished
+            ? (latestPublished.get(f.id) ?? null)
+            : undefined,
           credibility: f.credibility,
           near_dup_rate: f.near_dup_rate,
           sourcePref: sourcePrefs.get(f.id) ?? 0,
