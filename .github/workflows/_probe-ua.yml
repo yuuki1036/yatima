@@ -1,0 +1,55 @@
+name: _probe-ua
+
+# 一時的な調査用ワークフロー（YAT-68 / 対処案 B）。PR を出す前に削除する。
+#
+# Import AI（Substack）の feed が ubuntu-latest からだけ HTTP 403 になる。同じ UA で
+# ローカル（家庭 IP）からは 200 が返るため、UA が原因なのか IP が原因なのかを切り分けたい。
+# ローカルでは再現しないので、Actions の runner から UA を振って実測する。
+#
+# DB にも LLM にも触らない。外部 feed への GET のみ。
+
+on:
+  push:
+    branches: ["fix/YAT-68-*"]
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: probe feed with several UAs
+        run: |
+          node -e '
+          const TARGETS = [
+            ["Import AI (対象)", "https://importai.substack.com/feed"],
+            ["Latent.Space (対照・別 Substack)", "https://www.latent.space/feed"],
+            ["OpenAI News (対照・非 Substack)", "https://openai.com/news/rss.xml"],
+          ];
+          const UAS = [
+            ["現行", "Mozilla/5.0 (compatible; yatima/1.0; +personal use)"],
+            ["UA なし", null],
+            ["Chrome デスクトップ", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"],
+            ["feedfetcher 風", "Feedly/1.0 (+http://www.feedly.com/fetcher.html; like FeedFetcher-Google)"],
+            ["curl", "curl/8.7.1"],
+          ];
+          (async () => {
+            for (const [tname, url] of TARGETS) {
+              console.log("\n=== " + tname + " ===");
+              console.log("    " + url);
+              for (const [uname, ua] of UAS) {
+                const headers = { accept: "application/rss+xml, application/xml;q=0.9, */*;q=0.8" };
+                if (ua) headers["user-agent"] = ua;
+                try {
+                  const r = await fetch(url, { headers, redirect: "follow", signal: AbortSignal.timeout(15000) });
+                  const body = await r.text();
+                  const isXml = body.trimStart().startsWith("<?xml") || body.includes("<rss");
+                  console.log("  " + uname.padEnd(20) + " -> HTTP " + r.status +
+                              " / " + (r.headers.get("content-type") || "-") +
+                              " / " + body.length + "B / xml=" + isXml);
+                } catch (e) {
+                  console.log("  " + uname.padEnd(20) + " -> ERROR " + (e && e.message));
+                }
+              }
+            }
+          })();
+          '
