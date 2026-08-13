@@ -51,6 +51,13 @@ export function findStaleFeeds(
 
     // 起点が読めない（両方 null / パース不能）feed は判定を諦めて見送る。ここで
     // Infinity に倒すと、created_at の欠けた行が毎回 CI を赤くして本物の障害を埋める。
+    //
+    // 注意: この guard は下の `staleMs >= thresholdMs` の下では**冗長**（NaN との比較は
+    // 常に false なので、guard が無くても見送りになる）。実際ミューテーションでこの行を
+    // 消してもテストは 13 件とも通る。dead code に見えるが消さないこと — 比較を否定形
+    // （`!(staleMs < thresholdMs)`）に書き換えるリファクタが入ると NaN が true 側へ倒れ、
+    // 起点の無い feed が毎回 CI を赤くする。その改変に対してこの guard だけが効く
+    // （guard が無い場合はテスト 2 件が落ちて検出する、という別の守り方になる）。
     const anchor = r.lastFetchedAt ?? r.createdAt;
     const anchorMs = anchor === null ? NaN : Date.parse(anchor);
     if (!Number.isFinite(anchorMs)) continue;
