@@ -16,8 +16,9 @@ name: ci
 # next build は lint を実行しなくなった（node_modules/next/dist/docs 内の
 # 01-app/02-guides/upgrading/version-16.md を参照）。build 経由のカバレッジが失われていた。
 #
-# secrets は不要。テストは全て純関数で、process.env / supabase / fetch のいずれにも触れない
-# （vitest.config.mts の environment: "node"。DB もネットワークも使わない）。
+# lint / test / typecheck に secrets は不要。テストは全て純関数で、process.env / supabase / fetch の
+# いずれにも触れない（vitest.config.mts の environment: "node"。DB もネットワークも使わない）。
+# 末尾の secrets 照合ステップだけが secrets コンテキストを読む（値ではなく名前だけを使う）。
 
 on:
   pull_request:
@@ -62,3 +63,63 @@ jobs:
       - name: typecheck
         if: ${{ !cancelled() }}
         run: npx tsc --noEmit
+
+      # workflow が参照している secret が実際に登録されているかを照合する。
+      #
+      # 経緯: TAVILY_API_KEY が未登録のまま discover.yml が参照しており、GitHub は未登録の secret を
+      # 空文字に展開するため、方式②（YAT-38）が fail-soft でスキップされ続けていた。週次 run は
+      # 方式① が動くので success のままで、約 1 ヶ月誰も気付かなかった。
+      # knowledge ingest-continuous-failure-detection の「全滅ガードは 1 本の恒常故障を隠す」の再発。
+      #
+      # 独立した job にしていないのは意図的。job を足すと branch protection の required contexts にも
+      # 別途足す必要があり、その登録漏れは本チェックが防ごうとしている失敗と同じ形になる。
+      # check の中の step なら既存の required check にそのまま乗る。
+      #
+      # gh secret list は使えない（GITHUB_TOKEN に secrets 読み取り権限が無く、PAT を置くと
+      # 「secret を守るために secret を増やす」ことになる）。名前を列挙する手段は toJSON(secrets)
+      # だけなので、それを env に受けて jq の keys だけ読む。値は参照しないしログにも出さない
+      # （GitHub 側でもマスクされる）。
+      #
+      # fork からの PR には secrets が渡らず全件 missing に見えるため、その場合はスキップする。
+      - name: secrets 照合
+        if: ${{ !cancelled() && github.event.pull_request.head.repo.fork != true }}
+        env:
+          SECRETS_JSON: ${{ toJSON(secrets) }}
+        run: |
+          set -euo pipefail
+
+          # 参照側: .github/workflows/ 内の secrets 参照を集める。
+          # 先に "${{ ... }}" の式だけを切り出してから中を見る。素朴に全文を走査すると、
+          # このステップ自身の説明文や下の optional-secrets.txt というファイル名
+          # （"secrets.txt" に一致してしまう）まで secret 名として拾う。
+          # 実際この 2 つを最初の実装で誤検知した。
+          grep -rhoE '\$\{\{[^}]*\}\}' .github/workflows/ \
+            | grep -oE 'secrets\.[A-Za-z_][A-Za-z0-9_]*' \
+            | sed 's/^secrets\.//' | sort -u > /tmp/referenced.txt || true
+
+          # 登録側: このジョブで解決できる secret 名（GITHUB_TOKEN も含む）
+          printf '%s' "$SECRETS_JSON" | jq -r 'keys[]' | sort -u > /tmp/available.txt
+
+          # 任意扱いの除外リスト（1 行 1 名・# 以降はコメント）
+          if [ -f .github/optional-secrets.txt ]; then
+            sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' \
+              .github/optional-secrets.txt | sort -u > /tmp/optional.txt
+          else
+            : > /tmp/optional.txt
+          fi
+
+          comm -23 /tmp/referenced.txt /tmp/available.txt > /tmp/missing_all.txt
+          comm -23 /tmp/missing_all.txt /tmp/optional.txt > /tmp/missing.txt
+
+          if [ -s /tmp/missing.txt ]; then
+            echo "::error::workflow が参照しているのに登録されていない secret があります"
+            while read -r name; do
+              echo "  - ${name}  （参照: $(grep -rl "secrets\.${name}\b" .github/workflows/ | tr '\n' ' ')）"
+            done < /tmp/missing.txt
+            echo ""
+            echo "対処: gh secret set <NAME>"
+            echo "意図的に任意なら .github/optional-secrets.txt に理由付きで追記してください。"
+            exit 1
+          fi
+
+          echo "参照 $(wc -l < /tmp/referenced.txt) 件すべて登録済み"
