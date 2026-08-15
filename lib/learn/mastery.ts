@@ -251,19 +251,62 @@ export async function selectSessionQuestions(
   return picked;
 }
 
-// 出題を確定した concept の last_served_at を now に更新する（既存 row のみ。空 row は作らない）。
+// 出題を確定した concept の last_served_at を now に更新する。
 // 失敗は握り潰さず throw（呼び出し側が fail-soft で warn する）。
+//
+// YAT-71: 以前は「既存 row のみ UPDATE・空 row は作らない」だったが、これが「同じ問題ばかり出る」の
+// 原因だった。topic_mastery の row は recordQuizAttempt（＝回答時）でしか作られないため、
+// **一度も回答していない concept は row が無く last_served_at を書く先が無い**。一方 scoreQuestion は
+// row の無い concept を interval=1（間隔ボーナス最大）として扱う。さらに isEligible は未回答の設問を
+// 常に eligible とする。結果、出題しても順位が下がらず、答えずに飛ばした設問ほど毎セッション
+// 選ばれ続けるループになっていた（実測: 未回答 29 問中 27 問がこの状態）。
+//
+// 「出した」という事実は回答の有無と独立に記録する必要があるので、row が無ければ作る。
+export type ServedConcept = {
+  concept_key: string;
+  concept_label: string;
+  category: string;
+};
+
 export async function markConceptsServed(
   supabase: SupabaseClient,
-  conceptKeys: string[],
+  served: ServedConcept[],
 ): Promise<void> {
-  const keys = [...new Set(conceptKeys)];
+  const byKey = new Map<string, ServedConcept>();
+  for (const s of served) if (s.concept_key) byKey.set(s.concept_key, s);
+  const keys = [...byKey.keys()];
   if (keys.length === 0) return;
-  // Supabase の update はクエリ失敗を throw せず error に入れるため明示的に throw する
-  // （呼び出し側は throw を前提に fail-soft で warn する）。
+
+  const nowIso = new Date().toISOString();
+
+  // ① 行が無い concept だけ作る。ignoreDuplicates=true なので既存行は一切触らない
+  // （mastery / attempts / updated_at を出題で壊さない。updated_at は quiz-gate の
+  // loadExistingConcepts が並び順に使うため、出題では動かさないのが正しい）。
+  // select→insert の 2 段にしないのは、その間に回答が入ると衝突するため。
+  //
+  // attempts=0 のまま入れるのが要点。recordQuizAttempt は attempts===0 を「事前値 MASTERY_PRIOR から
+  // 開始」と解釈するので、初回回答時の EWMA は row の有無に関わらず同じ結果になる。
+  const { error: insErr } = await supabase.from("topic_mastery").upsert(
+    keys.map((k) => {
+      const s = byKey.get(k)!;
+      return {
+        concept_key: s.concept_key,
+        concept_label: s.concept_label,
+        category: s.category,
+        mastery: MASTERY_PRIOR,
+        attempts: 0,
+        last_served_at: nowIso,
+      };
+    }),
+    { onConflict: "concept_key", ignoreDuplicates: true },
+  );
+  if (insErr) throw insErr;
+
+  // ② 既存・新規まとめて last_served_at を now にする。
+  // Supabase の update はクエリ失敗を throw せず error に入れるため明示的に throw する。
   const { error } = await supabase
     .from("topic_mastery")
-    .update({ last_served_at: new Date().toISOString() })
+    .update({ last_served_at: nowIso })
     .in("concept_key", keys);
   if (error) throw error;
 }
@@ -328,7 +371,12 @@ export async function loadCategoryMastery(
   const { data, error } = await supabase
     .from("topic_mastery")
     .select("concept_key, concept_label, category, mastery, attempts")
-    .like("category", "tech/%");
+    .like("category", "tech/%")
+    // YAT-71: 未回答（attempts=0）の行を除く。markConceptsServed が出題時に row を作るように
+    // なったため、絞らないと**一度も答えていない concept が MASTERY_PRIOR のまま弱点として並び**、
+    // カテゴリ平均もその値に引かれる。弱点は測定値であって初期値ではない。
+    // 従来は回答時にしか row ができず全行が attempts>=1 だったので、この条件は当時の挙動と同じ。
+    .gt("attempts", 0);
   if (error) throw error;
   return buildCategoryMastery((data ?? []) as unknown as MasteryConceptRow[]);
 }

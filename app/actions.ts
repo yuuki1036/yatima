@@ -409,11 +409,17 @@ export async function startQuizSession(
     });
 
     // 出題した concept の last_served_at を更新（間隔ボーナス用）。失敗しても出題は成立させる。
+    // YAT-71: concept_key だけでなく label/category も渡す。markConceptsServed が未回答 concept の
+    // 行を新規作成するようになり、topic_mastery の NOT NULL 列を埋めるのに必要なため。
     if (questions.length > 0) {
       try {
         await markConceptsServed(
           supabase,
-          questions.map((q) => q.concept_key),
+          questions.map((q) => ({
+            concept_key: q.concept_key,
+            concept_label: q.concept_label,
+            category: q.category,
+          })),
         );
       } catch (e) {
         console.warn("last_served_at の更新に失敗:", e);
