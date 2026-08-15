@@ -89,10 +89,15 @@ jobs:
           set -euo pipefail
 
           # 参照側: .github/workflows/ 内の secrets 参照を集める。
-          # 先に "${{ ... }}" の式だけを切り出してから中を見る。素朴に全文を走査すると、
+          # 先に式展開の波括弧ブロックだけを切り出してから中を見る。素朴に全文を走査すると、
           # このステップ自身の説明文や下の optional-secrets.txt というファイル名
           # （"secrets.txt" に一致してしまう）まで secret 名として拾う。
           # 実際この 2 つを最初の実装で誤検知した。
+          #
+          # なお、この run ブロック内に式展開の開き波括弧を literal で書いてはいけない。
+          # GitHub は run の中身も式として評価するため、説明目的で書いただけでも
+          # workflow ファイル全体が invalid になり job が 1 つも起動しない
+          # （実際に踏んだ: jobs 0 件で conclusion=failure になり、step ログも残らない）。
           grep -rhoE '\$\{\{[^}]*\}\}' .github/workflows/ \
             | grep -oE 'secrets\.[A-Za-z_][A-Za-z0-9_]*' \
             | sed 's/^secrets\.//' | sort -u > /tmp/referenced.txt || true
