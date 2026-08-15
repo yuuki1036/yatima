@@ -16,8 +16,9 @@ name: ci
 # next build は lint を実行しなくなった（node_modules/next/dist/docs 内の
 # 01-app/02-guides/upgrading/version-16.md を参照）。build 経由のカバレッジが失われていた。
 #
-# secrets は不要。テストは全て純関数で、process.env / supabase / fetch のいずれにも触れない
-# （vitest.config.mts の environment: "node"。DB もネットワークも使わない）。
+# lint / test / typecheck に secrets は不要。テストは全て純関数で、process.env / supabase / fetch の
+# いずれにも触れない（vitest.config.mts の environment: "node"。DB もネットワークも使わない）。
+# 末尾の secrets 照合ステップだけが secrets コンテキストを読む（値ではなく名前だけを使う）。
 
 on:
   pull_request:
@@ -62,3 +63,96 @@ jobs:
       - name: typecheck
         if: ${{ !cancelled() }}
         run: npx tsc --noEmit
+
+      # workflow が参照している secret が実際に登録されているかを照合する。
+      #
+      # 経緯: TAVILY_API_KEY が未登録のまま discover.yml が参照しており、GitHub は未登録の secret を
+      # 空文字に展開するため、方式②（YAT-38）が fail-soft でスキップされ続けていた。週次 run は
+      # 方式① が動くので success のままで、約 1 ヶ月誰も気付かなかった。
+      # knowledge ingest-continuous-failure-detection の「全滅ガードは 1 本の恒常故障を隠す」の再発。
+      #
+      # 独立した job にしていないのは意図的。job を足すと branch protection の required contexts にも
+      # 別途足す必要があり、その登録漏れは本チェックが防ごうとしている失敗と同じ形になる。
+      # check の中の step なら既存の required check にそのまま乗る。
+      #
+      # 実装上の制約が 2 つある。
+      #
+      # 1. gh secret list は使えない。GITHUB_TOKEN に secrets 読み取り権限が無く、PAT を置くと
+      #    「secret を守るために secret を増やす」ことになる。
+      # 2. toJSON(secrets) も使ってはいけない。全 secret を一括で env に流す形は秘密の持ち出しと
+      #    区別が付かず、GitHub のヒューリスティックが workflow を "may be malicious" と判定して
+      #    run 全体を承認待ち（conclusion=action_required・job 0 件）で止める。実際に踏んだ。
+      #    ここを approve で通すのは、警告に慣れる悪癖と引き換えに lint を得る取引なので採らない。
+      #
+      # そこで「登録されているはずの secret」を DECLARED に明示列挙し、
+      #   (a) 全 workflow の参照集合が DECLARED に収まっているか（静的・秘密不要）
+      #   (b) DECLARED の各値が空でないか（＝実際に登録されているか）
+      # の 2 段で見る。secret は 1 つずつ名前を指定して env に取るので、通常の使い方と同じ形になる。
+      #
+      # fork からの PR には secrets が渡らず全件 missing に見えるため、その場合はスキップする。
+      - name: secrets 照合
+        if: ${{ !cancelled() && github.event.pull_request.head.repo.fork != true }}
+        env:
+          # 参照集合と一致しているかは (a) が検証するので、workflow に secret を足したら
+          # ここにも足すことになる。足し忘れは (a) が「未宣言」として落とす。
+          DECLARED: "ANTHROPIC_API_KEY NEXT_PUBLIC_SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY TAVILY_API_KEY VOYAGE_API_KEY"
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          # 参照側: 式展開の波括弧ブロックだけを切り出してから中の secrets.X を拾う。
+          # 素朴に全文を走査すると、このステップ自身の説明文や optional-secrets.txt という
+          # ファイル名（"secrets.txt" に一致）まで secret 名として拾う。初回実装で誤検知した。
+          #
+          # なお、この run ブロック内に式展開の開き波括弧を literal で書いてはいけない。
+          # GitHub は run の中身も式として評価するため、説明目的で書いただけでも workflow が
+          # invalid になり job が 1 つも起動しない（実際に踏んだ。step ログすら残らない）。
+          # 下の grep が文字クラスで書いてあるのはそのため。
+          grep -rhoE '\$[{][{][^}]*[}][}]' .github/workflows/ \
+            | grep -oE 'secrets\.[A-Za-z_][A-Za-z0-9_]*' \
+            | sed 's/^secrets\.//' | sort -u > /tmp/referenced.txt || true
+
+          printf '%s\n' $DECLARED | sort -u > /tmp/declared.txt
+
+          # 任意扱いの除外リスト（1 行 1 名・# 以降はコメント）。(b) にのみ効く。
+          if [ -f .github/optional-secrets.txt ]; then
+            sed -e 's/#.*//' -e 's/[[:space:]]//g' -e '/^$/d' \
+              .github/optional-secrets.txt | sort -u > /tmp/optional.txt
+          else
+            : > /tmp/optional.txt
+          fi
+
+          # (a) workflow が参照しているのに DECLARED に無い
+          comm -23 /tmp/referenced.txt /tmp/declared.txt > /tmp/undeclared.txt
+          if [ -s /tmp/undeclared.txt ]; then
+            echo "::error::このステップが見ていない secret を workflow が参照しています"
+            while read -r name; do
+              echo "  - ${name}  （参照: $(grep -rl "secrets[.]${name}" .github/workflows/ | tr '\n' ' ')）"
+            done < /tmp/undeclared.txt
+            echo ""
+            echo "対処: ci.yml の secrets 照合ステップの DECLARED と env の両方に追記してください。"
+            exit 1
+          fi
+
+          # (b) DECLARED にあるが値が空＝未登録（または env への配線漏れ）
+          : > /tmp/empty.txt
+          for name in $DECLARED; do
+            [ -n "${!name-}" ] || echo "$name" >> /tmp/empty.txt
+          done
+          sort -u -o /tmp/empty.txt /tmp/empty.txt
+          comm -23 /tmp/empty.txt /tmp/optional.txt > /tmp/missing.txt
+
+          if [ -s /tmp/missing.txt ]; then
+            echo "::error::値が空の secret があります（未登録、または env への配線漏れ）"
+            while read -r name; do echo "  - ${name}"; done < /tmp/missing.txt
+            echo ""
+            echo "対処: gh secret set <NAME>"
+            echo "意図的に任意なら .github/optional-secrets.txt に理由付きで追記してください。"
+            exit 1
+          fi
+
+          echo "参照 $(wc -l < /tmp/referenced.txt) 件・宣言 $(wc -l < /tmp/declared.txt) 件、すべて登録済み"
