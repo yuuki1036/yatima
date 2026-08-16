@@ -301,9 +301,11 @@ const SELECT_PAGE = 1000;
 //
 // **YAT-61 で母集団の有界性が失われた。** 旧 skip 方式では近重複が insert されず、active 行数＝
 // 出題可能数だったため「deficit 収束により目標深度×カテゴリ数（≈100 問）で頭打ち」が成立し、
-// それが全件ロードの根拠だった。dup_flag 方式では dup 行も active として残る一方、countActive は
-// それを充足に数えない（＝deficit を埋めない）ので、行数は頭打ちしない。増加ペースは週次 cron の
-// MAX_NEW_PER_RUN=24 とセッション補充が上限なので緩やかだが、単調に増える。
+// それが全件ロードの根拠だった。dup_flag 方式では dup 行も active として残る一方、充足数え
+// （YAT-72 以降は countUnseen）はそれを数えない（＝deficit を埋めない）ので、行数は頭打ちしない。
+// **YAT-72 でこの傾向はさらに強まった**: 充足を未回答数で測るようになり、解いた分だけ deficit が
+// 開くため、行数は使用量に比例して伸び続ける（在庫でなく流量。意図した挙動）。
+// 増加ペースは週次 cron の MAX_NEW_PER_RUN=24 とセッション補充が上限なので緩やかだが、単調に増える。
 // 較正が済んで dup_similarity の標本が不要になったら、dup 行の retire か母集団の窓（直近 N 件）
 // 切りを入れること。全件ロードのまま放置すると O(候補数×母集団) の cosine が効いてくる。
 export async function loadQuizDedupPopulation(

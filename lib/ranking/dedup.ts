@@ -39,7 +39,8 @@ export const CARD_DEDUP_THRESHOLD = 0.86;
 //
 // YAT-61: **観測手段は用意した。** skip をやめて dup_flag を立てて insert する方式へ移行し
 // （quiz-gate の markQuizDuplicates）、選定側の除外（mastery の selectSessionQuestions）と
-// 充足数え側の除外（quiz-pool の countActive）も揃えた。生の類似度は dup_similarity 列に残す。
+// 充足数え側の除外（quiz-pool の countUnseen。YAT-72 以前は countActive）も揃えた。
+// 生の類似度は dup_similarity 列に残す。
 // **ただし移行前に積まれた行は dup_similarity を持たないため、標本は移行後の生成が貯まるまで 0 件。**
 // 較正の再開は `npm run diagnose-dedup` の「保存済み dup_similarity」スイープを見てから。
 // 現存プールの再計算スイープは通過した側しか含まないので、そちらでは判断しないこと。

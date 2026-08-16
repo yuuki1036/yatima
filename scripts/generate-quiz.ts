@@ -8,7 +8,7 @@ import { createAdminClient } from "../lib/supabase/admin";
 import { runQuizPool } from "../lib/learn/quiz-pool";
 
 // 適応クイズのコアプール生成 cron（YAT-29）。週次 cron（learn.yml）と手動実行から呼ぶ。
-// 旧カード生成（generate-cards）を差し替えたエントリ。カテゴリ別 active プールの不足分を生成し、
+// 旧カード生成（generate-cards）を差し替えたエントリ。カテゴリ別の未回答バッファの不足分を生成し、
 // その場 embed → dedup（近重複は dup_flag=true で積む。YAT-61）→ quiz_questions(active) に積む。
 // その場 embed に失敗して embedding=null で残った行は、先頭でバックフィルしてから dedup 母集団に載せる。
 async function main() {
