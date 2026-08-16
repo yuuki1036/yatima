@@ -25,7 +25,10 @@ import { hasApprovedLearnSources } from "@/lib/learn/learn-sources";
 
 // 保守的な起点値（tunable）。予算根拠は下記コメント参照。Voyage 無料枠 3 RPM / 10K TPM・cron の
 // timeout 20 分に収める。支払い登録でレート緩和されたら上げてよい。
-const POOL_TARGET_PER_CATEGORY = 12; // カテゴリ別 active プールの目標深度（QUIZ_SESSION_SIZE×約2.4セッション分）
+// YAT-72: 目標は「持っている数」ではなく「まだ解いていない数」で測る（countUnseen 参照）。
+// 6 = QUIZ_SESSION_SIZE(5) をやや上回る＝解き切っても常に 1 セッション分は新作が残る、が狙い。
+// 旧 POOL_TARGET_PER_CATEGORY=12 は active 総数の目標で、回答済みが在庫を占めて生成が止まっていた。
+const UNSEEN_TARGET_PER_CATEGORY = 6;
 const MAX_NEW_PER_CATEGORY = 6; // 1 run のカテゴリ別生成上限（LLM 呼び出し数を抑える）
 const MAX_NEW_PER_RUN = 24; // 1 run の総候補上限（Voyage の embed 量と timeout に効く）
 const CRON_CANDIDATE_SOURCES = 4; // cron の素材ソース上限（オンデマンドの 8 より絞る＝呼び出し数上限）
@@ -54,44 +57,101 @@ export type QuizPoolResult = {
   skipped: boolean; // ANTHROPIC_API_KEY 未設定で生成スキップ
 };
 
-// 出題可能な active 件数を数える（head:true で行本体は取らない軽量 count）。category=null は全カテゴリ合算。
-// YAT-61: dup_flag=true を除く。selectSessionQuestions が出題しない行を deficit の充足に数えると、
-// 近重複が積まれるほどプールが満ちたと誤認して補充が止まり、出題可能な問題が枯れる。
-// 「数える母集団」と「出題する母集団」は同じ条件で引くこと。
-// 失敗は 0 扱い＝deficit を大きく見積もって生成側に倒す（プールが空に見えても生成上限で頭打ちに
-// なるため安全）。
-async function countActive(
+// PostgREST の db-max-rows（既定 1000）は .limit() を上書きするため、全件走査は必ず .range() で
+// ページングする（knowledge supabase-range-pagination-needs-unique-sort / YAT-67 で実際に踏んだ罠）。
+const PAGE = 1000;
+const FETCH_CAP = 50_000; // 安全弁。到達時のみ警告（1 ページ上限より十分大きい実値で判定する）
+
+// id 昇順で全件を取り切る。id は PK＝ユニークなので全順序が確定し、境界での取りこぼしが無い。
+async function fetchAllIds(
+  build: (from: number, to: number) => PromiseLike<{
+    data: { id: string }[] | null;
+    error: unknown;
+  }>,
+  label: string,
+): Promise<string[] | null> {
+  const ids: string[] = [];
+  for (let from = 0; from < FETCH_CAP; from += PAGE) {
+    const { data, error } = await build(from, from + PAGE - 1);
+    if (error) {
+      console.warn(`${label} の取得に失敗:`, error);
+      return null;
+    }
+    const batch = data ?? [];
+    ids.push(...batch.map((r) => r.id));
+    if (batch.length < PAGE) return ids;
+  }
+  console.warn(`${label} が FETCH_CAP(${FETCH_CAP}) に到達。以降を切り詰めた`);
+  return ids;
+}
+
+// 一度でも回答された question_id の集合。
+async function loadAnsweredQuestionIds(
+  supabase: SupabaseClient,
+): Promise<Set<string> | null> {
+  const ids = await fetchAllIds(
+    (from, to) =>
+      supabase
+        .from("quiz_attempts")
+        .select("id:question_id")
+        .not("question_id", "is", null)
+        .order("question_id", { ascending: true })
+        .range(from, to),
+    "quiz_attempts",
+  );
+  return ids ? new Set(ids) : null;
+}
+
+// 「まだ一度も回答していない」出題可能設問の件数。category=null は全カテゴリ合算。
+//
+// YAT-72: 以前は active 件数（回答済みを含む）で充足を測っていた。設問は退役しないため、
+// 一度そのカテゴリを解き切ると **回答済みだけで在庫が満ち、生成が永久に止まる**。
+// 実際 tech/web は 12 問すべて回答済みで不足 0 と判定され、9 問がクールダウン中のため
+// 出題可能な concept が 2 しか残らず、同じ設問が出続けていた。
+// 在庫（持っている数）ではなく流量（まだ解いていない数）で測る。
+//
+// 失敗は 0 扱い＝deficit を大きく見積もって生成側に倒す（生成上限で頭打ちになるため安全）。
+async function countUnseen(
   supabase: SupabaseClient,
   category: TagSlug | null,
 ): Promise<number> {
-  let query = supabase
-    .from("quiz_questions")
-    .select("id", { count: "exact", head: true })
-    .eq("status", "active")
-    .eq("dup_flag", false);
-  if (category) query = query.eq("category", category);
-  const { count, error } = await query;
-  if (error) {
-    console.warn(`active 件数の取得に失敗 [${category ?? "all"}]:`, error);
-    return 0;
-  }
-  return count ?? 0;
+  const answered = await loadAnsweredQuestionIds(supabase);
+  if (!answered) return 0;
+
+  const ids = await fetchAllIds((from, to) => {
+    let q = supabase
+      .from("quiz_questions")
+      .select("id")
+      .eq("status", "active")
+      // YAT-61: dup_flag=true を除く。selectSessionQuestions が出題しない行を充足に数えると、
+      // 近重複が積まれるほど満ちたと誤認して補充が止まる。
+      // 「数える母集団」と「出題する母集団」は同じ条件で引くこと。
+      .eq("dup_flag", false);
+    if (category) q = q.eq("category", category);
+    return q.order("id", { ascending: true }).range(from, to);
+  }, `quiz_questions[${category ?? "all"}]`);
+  if (!ids) return 0;
+
+  return ids.filter((id) => !answered.has(id)).length;
 }
 
-// プール目標に対する不足数を返す（0 以上）。セッション開始の裏補充（after）が目標を超えて生成しない
-// よう gate する用途（YAT-31）。カテゴリ指定はそのカテゴリの目標、おまかせ(null)は cron 対象カテゴリ
-// 合算の目標で測る。cron の deficit と同義（active < target なら補充）。これにより「短いセッション」の
-// 原因が SRS クールダウン（正解済みが eligible から外れる）のときは deficit=0 で補充が発火せず、
-// プールが POOL_TARGET を超えて青天井に増殖するのを防ぐ。
+// 未回答バッファの目標に対する不足数を返す（0 以上）。セッション開始の裏補充（after）が目標を超えて
+// 生成しないよう gate する用途（YAT-31）。カテゴリ指定はそのカテゴリの目標、おまかせ(null)は cron
+// 対象カテゴリ合算の目標で測る。cron の deficit と同義（未回答 < target なら補充）。
+//
+// YAT-72 でこの gate の意味が変わった点に注意。以前は「短いセッションの原因が SRS クールダウンなら
+// 補充しない」ためのものだったが、その判定は active 総数で行われており、**解き切った状態と
+// クールダウン中の状態を区別できていなかった**。未回答で測れば両者が分かれる:
+// 未回答が残っているのに短い＝クールダウンが原因（補充しない）／未回答ゼロで短い＝素材切れ（補充する）。
 export async function quizPoolDeficit(
   supabase: SupabaseClient,
   category: TagSlug | null,
 ): Promise<number> {
   const target = category
-    ? POOL_TARGET_PER_CATEGORY
-    : POOL_TARGET_PER_CATEGORY * CRON_CATEGORIES.length;
-  const active = await countActive(supabase, category);
-  return Math.max(0, target - active);
+    ? UNSEEN_TARGET_PER_CATEGORY
+    : UNSEEN_TARGET_PER_CATEGORY * CRON_CATEGORIES.length;
+  const unseen = await countUnseen(supabase, category);
+  return Math.max(0, target - unseen);
 }
 
 // コアプール生成の本体。
@@ -140,13 +200,14 @@ export async function runQuizPool(
     skipped: backfill.skipped,
   };
 
-  // ② deficit ベース生成: カテゴリ別 active 件数を数え、目標深度への不足分だけ生成する。
-  // プールが満ちたカテゴリは生成ゼロ（cron が無作業に収束）。総候補は MAX_NEW_PER_RUN で頭打ち。
+  // ② deficit ベース生成: カテゴリ別の**未回答**件数を数え、目標への不足分だけ生成する（YAT-72）。
+  // 未回答バッファが満ちたカテゴリは生成ゼロ（cron が無作業に収束）。解き進めた分だけ不足が開くので、
+  // 使えば使うほど補充される＝在庫でなく流量になる。総候補は MAX_NEW_PER_RUN で頭打ち。
   const candidates: QuizInsertRow[] = [];
   for (const category of CRON_CATEGORIES) {
     if (candidates.length >= MAX_NEW_PER_RUN) break;
-    const active = await countActive(supabase, category);
-    const deficit = POOL_TARGET_PER_CATEGORY - active;
+    const unseen = await countUnseen(supabase, category);
+    const deficit = UNSEEN_TARGET_PER_CATEGORY - unseen;
     if (deficit <= 0) continue;
     // 在庫ゲート（YAT-32）: 承認済みソースが無いカテゴリは生成しても素材が無く空振りなので skip。
     // deficit にも数えない（埋めようがない不足なので cron ログを汚さない。/learn がソース登録を促す）。
