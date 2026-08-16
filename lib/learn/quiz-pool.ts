@@ -11,7 +11,7 @@ import {
 } from "@/lib/learn/quiz-gate";
 import { hasApprovedLearnSources } from "@/lib/learn/learn-sources";
 
-// YAT-29: 適応クイズのコアプール生成 cron。カテゴリ別の active プール深度を目標値まで満たすよう
+// YAT-29: 適応クイズのコアプール生成 cron。カテゴリ別の未回答バッファを目標値まで満たすよう
 // 不足分（deficit）だけ生成し、その場 embed → 既存 active プール＋バッチ内既採用との cosine dedup
 // を通してから quiz_questions(active) へ積む。オンデマンド（quiz-gate の generateQuizForCategory）
 // はプール不足時のトップアップに縮退する。card-gate.ts の runCardGate（母集団照合→その場 embed→
@@ -20,14 +20,14 @@ import { hasApprovedLearnSources } from "@/lib/learn/learn-sources";
 // 出題プールから外す）へ変更。skip では弾いた候補が DB に残らず閾値を較正できなかったため。
 // 0011_quiz.sql が予約したまま使われていなかった dup_flag 列をここで使い始める（当初想定は
 // 「cron が後追いで立てる」だったが、実際は cron / オンデマンドの両経路が insert 時に立てる）。
-// これに伴い deficit の充足数え（countActive）と出題プール取得（selectSessionQuestions）の双方が
+// これに伴い deficit の充足数え（countUnseen）と出題プール取得（selectSessionQuestions）の双方が
 // dup_flag=false で絞る。
+// YAT-72: 充足の測り方を active 総数（在庫）から未回答数（流量）へ変更。詳細は countUnseen 参照。
 
 // 保守的な起点値（tunable）。予算根拠は下記コメント参照。Voyage 無料枠 3 RPM / 10K TPM・cron の
 // timeout 20 分に収める。支払い登録でレート緩和されたら上げてよい。
-// YAT-72: 目標は「持っている数」ではなく「まだ解いていない数」で測る（countUnseen 参照）。
+// YAT-72: 目標は未回答数で測る（理由は countUnseen 参照）。
 // 6 = QUIZ_SESSION_SIZE(5) をやや上回る＝解き切っても常に 1 セッション分は新作が残る、が狙い。
-// 旧 POOL_TARGET_PER_CATEGORY=12 は active 総数の目標で、回答済みが在庫を占めて生成が止まっていた。
 const UNSEEN_TARGET_PER_CATEGORY = 6;
 const MAX_NEW_PER_CATEGORY = 6; // 1 run のカテゴリ別生成上限（LLM 呼び出し数を抑える）
 const MAX_NEW_PER_RUN = 24; // 1 run の総候補上限（Voyage の embed 量と timeout に効く）
@@ -62,14 +62,24 @@ export type QuizPoolResult = {
 const PAGE = 1000;
 const FETCH_CAP = 50_000; // 安全弁。到達時のみ警告（1 ページ上限より十分大きい実値で判定する）
 
-// id 昇順で全件を取り切る。id は PK＝ユニークなので全順序が確定し、境界での取りこぼしが無い。
+// 切り詰めの有無を呼び出し側が判定できるようにする。ids だけを返すと「全件取れた」と
+// 「CAP で打ち切った部分集合」が同じ型になり、後者を完全な集合として使ってしまう。
+type PagedIds = { ids: string[]; truncated: boolean };
+
+// build が返すクエリを .range() でページングして取り切る。
+//
+// **全順序の担保は build 側の責務**。非ユニークな列だけで order すると、同値行がページ境界を
+// またいだときに取りこぼす／二重に出る（knowledge supabase-range-pagination-needs-unique-sort）。
+// 必ず最終ソートキーに PK 等のユニーク列を置くこと。ここでは強制できないので、
+// 呼び出し側のクエリを読むときはこの点を確認する。
 async function fetchAllIds(
   build: (from: number, to: number) => PromiseLike<{
-    data: { id: string }[] | null;
+    data: Record<string, unknown>[] | null;
     error: unknown;
   }>,
+  pick: (row: Record<string, unknown>) => unknown,
   label: string,
-): Promise<string[] | null> {
+): Promise<PagedIds | null> {
   const ids: string[] = [];
   for (let from = 0; from < FETCH_CAP; from += PAGE) {
     const { data, error } = await build(from, from + PAGE - 1);
@@ -78,28 +88,38 @@ async function fetchAllIds(
       return null;
     }
     const batch = data ?? [];
-    ids.push(...batch.map((r) => r.id));
-    if (batch.length < PAGE) return ids;
+    for (const row of batch) {
+      const v = pick(row);
+      if (typeof v === "string") ids.push(v);
+    }
+    if (batch.length < PAGE) return { ids, truncated: false };
   }
   console.warn(`${label} が FETCH_CAP(${FETCH_CAP}) に到達。以降を切り詰めた`);
-  return ids;
+  return { ids, truncated: true };
 }
 
 // 一度でも回答された question_id の集合。
+//
+// **カテゴリに依存しないので、カテゴリ別ループの外で 1 回だけ呼ぶこと**（YAT-72 セルフレビュー）。
+// ループ内で呼ぶと cron 1 run で CRON_CATEGORIES 件ぶん（現状 8 回）全件走査が走る。
 async function loadAnsweredQuestionIds(
   supabase: SupabaseClient,
-): Promise<Set<string> | null> {
-  const ids = await fetchAllIds(
+): Promise<PagedIds | null> {
+  return fetchAllIds(
     (from, to) =>
       supabase
         .from("quiz_attempts")
-        .select("id:question_id")
+        .select("question_id")
         .not("question_id", "is", null)
+        // question_id は非ユニーク（同じ設問への複数回答は SRS の前提）。id(PK) を最終キーに
+        // 置いて全順序を確定させる。列の別名（id:question_id）は使わない——
+        // order が別名で解決されうるため「第2キーを足したのに直っていない」状態になる。
         .order("question_id", { ascending: true })
+        .order("id", { ascending: true })
         .range(from, to),
+    (row) => row.question_id,
     "quiz_attempts",
   );
-  return ids ? new Set(ids) : null;
 }
 
 // 「まだ一度も回答していない」出題可能設問の件数。category=null は全カテゴリ合算。
@@ -111,28 +131,49 @@ async function loadAnsweredQuestionIds(
 // 在庫（持っている数）ではなく流量（まだ解いていない数）で測る。
 //
 // 失敗は 0 扱い＝deficit を大きく見積もって生成側に倒す（生成上限で頭打ちになるため安全）。
+// 母集団が切り詰められた場合も同じ扱いにする——回答済みを取りこぼすと未回答を過大に数え、
+// **生成が止まる側**（＝この Issue が直した症状の再発）へ倒れるため、部分集合は信用しない。
 async function countUnseen(
   supabase: SupabaseClient,
   category: TagSlug | null,
+  answered: Set<string>,
 ): Promise<number> {
+  const page = await fetchAllIds(
+    (from, to) => {
+      let q = supabase
+        .from("quiz_questions")
+        .select("id")
+        .eq("status", "active")
+        // YAT-61: dup_flag=true を除く。selectSessionQuestions が出題しない行を充足に数えると、
+        // 近重複が積まれるほど満ちたと誤認して補充が止まる。
+        // 「数える母集団」と「出題する母集団」は同じ条件で引くこと。
+        .eq("dup_flag", false);
+      if (category) q = q.eq("category", category);
+      // id は PK なのでこれ 1 本で全順序が確定する。
+      return q.order("id", { ascending: true }).range(from, to);
+    },
+    (row) => row.id,
+    `quiz_questions[${category ?? "all"}]`,
+  );
+  if (!page) return 0;
+
+  return page.ids.filter((id) => !answered.has(id)).length;
+}
+
+// answered を 1 回だけ取り、信用できなければ null を返す共通の入口。
+// null は「未回答数が測れない」＝呼び出し側で deficit 最大（生成側）に倒す合図。
+async function loadTrustedAnswered(
+  supabase: SupabaseClient,
+): Promise<Set<string> | null> {
   const answered = await loadAnsweredQuestionIds(supabase);
-  if (!answered) return 0;
-
-  const ids = await fetchAllIds((from, to) => {
-    let q = supabase
-      .from("quiz_questions")
-      .select("id")
-      .eq("status", "active")
-      // YAT-61: dup_flag=true を除く。selectSessionQuestions が出題しない行を充足に数えると、
-      // 近重複が積まれるほど満ちたと誤認して補充が止まる。
-      // 「数える母集団」と「出題する母集団」は同じ条件で引くこと。
-      .eq("dup_flag", false);
-    if (category) q = q.eq("category", category);
-    return q.order("id", { ascending: true }).range(from, to);
-  }, `quiz_questions[${category ?? "all"}]`);
-  if (!ids) return 0;
-
-  return ids.filter((id) => !answered.has(id)).length;
+  if (!answered) return null;
+  if (answered.truncated) {
+    console.warn(
+      "quiz_attempts が切り詰められたため未回答数を信用しない（deficit を最大に倒す）",
+    );
+    return null;
+  }
+  return new Set(answered.ids);
 }
 
 // 未回答バッファの目標に対する不足数を返す（0 以上）。セッション開始の裏補充（after）が目標を超えて
@@ -150,7 +191,9 @@ export async function quizPoolDeficit(
   const target = category
     ? UNSEEN_TARGET_PER_CATEGORY
     : UNSEEN_TARGET_PER_CATEGORY * CRON_CATEGORIES.length;
-  const unseen = await countUnseen(supabase, category);
+  const answered = await loadTrustedAnswered(supabase);
+  if (!answered) return target; // 測れないので生成側へ倒す（生成上限で頭打ちになる）
+  const unseen = await countUnseen(supabase, category, answered);
   return Math.max(0, target - unseen);
 }
 
@@ -201,12 +244,19 @@ export async function runQuizPool(
   };
 
   // ② deficit ベース生成: カテゴリ別の**未回答**件数を数え、目標への不足分だけ生成する（YAT-72）。
-  // 未回答バッファが満ちたカテゴリは生成ゼロ（cron が無作業に収束）。解き進めた分だけ不足が開くので、
-  // 使えば使うほど補充される＝在庫でなく流量になる。総候補は MAX_NEW_PER_RUN で頭打ち。
+  // 未回答バッファが満ちたカテゴリは生成ゼロ（cron が無作業に収束）。解き進めた分だけ不足が開く。
+  // 総候補は MAX_NEW_PER_RUN で頭打ち。
+  //
+  // 回答済み集合はカテゴリに依存しないのでループ**外**で 1 回だけ取る。ループ内で取ると
+  // quiz_attempts の全件走査が CRON_CATEGORIES 件ぶん走る（YAT-72 セルフレビュー指摘 3）。
+  // 取れなければ未回答数が測れないので、全カテゴリを目標満額の不足として扱う（生成側へ倒す）。
+  const answered = await loadTrustedAnswered(supabase);
   const candidates: QuizInsertRow[] = [];
   for (const category of CRON_CATEGORIES) {
     if (candidates.length >= MAX_NEW_PER_RUN) break;
-    const unseen = await countUnseen(supabase, category);
+    const unseen = answered
+      ? await countUnseen(supabase, category, answered)
+      : 0;
     const deficit = UNSEEN_TARGET_PER_CATEGORY - unseen;
     if (deficit <= 0) continue;
     // 在庫ゲート（YAT-32）: 承認済みソースが無いカテゴリは生成しても素材が無く空振りなので skip。

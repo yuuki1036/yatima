@@ -430,8 +430,11 @@ export async function startQuizSession(
     // （after）。ユーザーは待たされず、生成分は次回以降のセッションに効く。ただし「短いセッション」の
     // 原因は SRS クールダウン（正解済みが eligible から外れる）とプール枯渇の両方があり、前者では
     // 生成すべきでない。そこで発火判定はセッションの不足数ではなくプール目標に対する deficit で行い、
-    // cron と同じ「target 未満なら補充」に揃える（目標超えの青天井増殖を防ぐ。YAT-31）。deficit は
-    // 軽量 count なので同期で先に測り、note の出し分け（枯渇=準備中／クールダウン=間隔案内）にも使う。
+    // cron と同じ「target 未満なら補充」に揃える（目標超えの青天井増殖を防ぐ。YAT-31）。note の
+    // 出し分け（枯渇=準備中／クールダウン=間隔案内）にも使うため同期で先に測る。
+    // **YAT-72 で「軽量 count」ではなくなった**: 未回答数は quiz_attempts との差集合なので単発 count
+    // では出せず、両テーブルの全件走査になる。現状の行数（〜100）では無視できるが、累積回答数に比例して
+    // セッション開始のレイテンシに乗る。効いてきたら RPC で DB 側に寄せること。
     let note: string | null = null;
     if (questions.length < QUIZ_SESSION_SIZE) {
       const deficit = await quizPoolDeficit(supabase, category);
