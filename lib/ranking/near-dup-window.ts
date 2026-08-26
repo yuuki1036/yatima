@@ -16,7 +16,17 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 // （[[supabase-range-pagination-needs-unique-sort]] / card-gate・diagnose-dedup と同じ作法）。
 
 export const WINDOW_DAYS = 30; // near_dup_rate 算出の対象窓
-export const MIN_OWN_ARTICLES = 5; // 近重複率を算出する最小母数（未満は小サンプル膨張を避け未算出）
+// 近重複率を算出する最小母数（未満は小サンプル膨張を避けて未算出＝null）。
+//
+// 20 なのは閾値の粒度に合わせるため（YAT-55 決定 4-D / 観測 ⑥）。元は 5 だったが、これは
+// NEAR_DUP_RATE が 0.5 だった頃の値で、有向化して閾値が 0.2 になった今は粗すぎる:
+// own=5 だと 1 記事が率を 0.20 動かす＝**1 記事で閾値をまたぐ**。own=20 なら 0.05（閾値の 1/4）。
+//
+// 実測（2026-08-26・active 33 feed）では 5→20 で算出対象が 24→19 に減るが、外れる 5 feed
+// （DeepMind 5 / Nature 5 / HuggingFace 11 / MIT Tech Review 16 / G-gen 17）は**全て ndup 0.00**
+// なので、生きているシグナルは 1 つも失わない。決定 4-D の候補 20〜30 の保守側を採った
+// （25 以上にすると Latent.Space 0.18 / Publickey 0.19 / Claude Help 20 が落ちて実際に信号を失う）。
+export const MIN_OWN_ARTICLES = 20;
 const SELECT_PAGE = 1000; // PostgREST 既定の 1 ページ上限。これを超える取得は .range() で回す
 
 // 窓内の記事を全件取ると重い（1 行に 1024 次元の embedding 文字列 ≒12KB）ため上限を置く。
