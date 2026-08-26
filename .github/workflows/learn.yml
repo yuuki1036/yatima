@@ -32,9 +32,28 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
+      # ここから下は feed 側（YAT-20 / YAT-55）で、クイズ生成とは別サブシステム。
+      # !cancelled() を付けるのは generate-quiz の失敗で巻き添えにしないため。YAT-73 で
+      # generate-quiz は「作れるはずなのに 1 件も作れなかった」ときに exit 1 するようになったが、
+      # 既定では後続ステップが skip されるので、LLM 障害のたびに feed の near_dup と観測が
+      # 静かに止まる。**障害中こそ観測が要る**（今回の較正が詰まった原因がまさにこれで、
+      # 要約全滅の窓で撮られた値だと後から気付けなかった）。
+      # 失敗したステップは残るので job 自体は赤いまま＝YAT-73 の検知は殺していない。
+
       # feed 削除推奨の near-dup シグナル（YAT-20）。既存 embedding の cosine 集計のみで
-      # 新規 API 呼び出しが無いため LLM/embed の secret は不要。クイズ生成の後に回す。
+      # 新規 API 呼び出しが無いため LLM/embed の secret は不要。
       - run: npm run compute-dedup-rate
+        if: ${{ !cancelled() }}
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      # 退役スコアリングの観測を feed_health_snapshots に貯める（YAT-55）。
+      # compute-dedup-rate の**直後**に置くこと: near_dup_rate は上書き列で、この週次実行が
+      # 唯一の書き手。ここで撮らないと、次の実行まで誰も見ないまま値が踏み潰される
+      # （有向 near_dup で唯一クリーンだった 2026-08-17 の値は、実際にこうして失われた）。
+      # 読み取り＋insert のみで LLM/embed の secret は不要。
+      - run: npm run snapshot-feed-health
+        if: ${{ !cancelled() }}
         env:
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}

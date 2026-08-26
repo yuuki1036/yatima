@@ -22,6 +22,7 @@
     "diagnose-feed-health": "tsx scripts/diagnose-feed-health.ts",
     "diagnose-mastery": "tsx scripts/diagnose-mastery.ts",
     "compute-dedup-rate": "tsx scripts/compute-dedup-rate.ts",
+    "snapshot-feed-health": "tsx scripts/snapshot-feed-health.ts",
     "migrate": "tsx scripts/migrate.ts",
     "resummarize": "tsx scripts/resummarize.ts",
     "retag": "tsx scripts/retag.ts",
