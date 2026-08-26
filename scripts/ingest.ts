@@ -41,7 +41,8 @@ async function main() {
     `本文補完: 取得 ${en.enriched} / 失敗 ${en.failed}（対象 ${en.thin} 件）`,
   );
 
-  // 取得後にバッチ要約+タグ付け（summary IS NULL を埋める）。fail-soft なのでここで CI は赤くしない。
+  // 取得後にバッチ要約+タグ付け（summary IS NULL を埋める）。個々の失敗は fail-soft で流し、
+  // 全滅だけ末尾でまとめて赤くする（YAT-73。判定は下の「失敗の可視化」節）。
   const s = await annotateMissing(supabase);
   console.log(
     `要約+タグ: 成功 ${s.succeeded} / 失敗 ${s.failed}${s.skipped ? " (ANTHROPIC_API_KEY 未設定でスキップ)" : ""}`,
@@ -86,9 +87,29 @@ async function main() {
     );
   }
 
+  // 要約の全滅（YAT-73）: 対象があったのに 1 件も成功しなかった＝ LLM 側の恒常障害。
+  // 取得の継続失敗は上で検知できるのに要約の全滅は素通りする、という非対称を埋める。
+  // 要約が付かない記事はキュレーションに乗らないので、放置すると TODAY デッキが空のまま緑で流れる
+  // （2026-08-26 に実際に発生。クレジット切れで 20 件全滅・デッキ 0 件だったが、
+  // その run が赤かったのは別要因の feed 継続失敗が同時に出ていたからにすぎない）。
+  //
+  // 対象ゼロ（succeeded も failed も 0）は正常なので判定に入れない。
+  const annotateDead = !s.skipped && s.failed > 0 && s.succeeded === 0;
+  if (annotateDead) {
+    console.error(
+      `\n⚠ 要約+タグが ${s.failed} 件すべて失敗している（成功 0）`,
+    );
+    console.error(
+      `  LLM 呼び出しが全滅している可能性が高い（API キー・クレジット残高・レート制限を確認）`,
+    );
+    console.error(
+      `  要約が付かない記事はキュレーションに乗らないため、放置すると TODAY デッキが空になる`,
+    );
+  }
+
   // 全フィード失敗は「6 時間待たずに今すぐ赤くすべき」別の障害モードなので併存させる。
   const allFailed = results.length > 0 && failed === results.length;
-  if (allFailed || stale.length > 0) process.exit(1);
+  if (allFailed || stale.length > 0 || annotateDead) process.exit(1);
 }
 
 main().catch((e) => {

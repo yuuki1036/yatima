@@ -34,6 +34,28 @@ async function main() {
       `embed 補完 ${r.backfill.succeeded}/${r.backfill.picked}` +
       `${r.backfill.skipped ? "（VOYAGE_API_KEY 未設定でスキップ）" : ""}`,
   );
+
+  // ── LLM 全滅の検知（YAT-73）─────────────────────────────────────────────
+  // 「補充対象があるのに 1 問も生成できなかった」は fail-soft で流してよい状態ではない。
+  // カテゴリ単位の LLM 失敗は generateGatedQuizRows が握るため、放置すると 0 問のまま緑で流れる。
+  // 実際 2026-08-22 に Anthropic のクレジット切れで生成 0 になったが run は success だった
+  // （気付けたのは手動実行してログを見たからで、cron 任せなら何週も気付かなかった）。
+  //
+  // deficitCategories は在庫ゲート（承認済み learn_sources の有無）を通過した後にインクリメント
+  // される。したがって素材待ちで skip したカテゴリはこの判定に入らず、
+  // **作れるはずなのに作れなかった**場合だけが残る。
+  //
+  // passed（grounding 通過）は見ない。生成はできたが全部落ちたのは素材の質の問題でありうるので、
+  // 同列に扱うと誤検知が増える。まず generated === 0 だけを見る。
+  if (r.deficitCategories > 0 && r.generated === 0) {
+    console.error(
+      `\n⚠ 補充対象が ${r.deficitCategories} カテゴリあるのに 1 問も生成できていない`,
+    );
+    console.error(
+      `  LLM 呼び出しが全滅している可能性が高い（API キー・クレジット残高・レート制限を確認）`,
+    );
+    process.exit(1);
+  }
 }
 
 main().catch((e) => {
