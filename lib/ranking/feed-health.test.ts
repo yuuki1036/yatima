@@ -7,6 +7,7 @@ import {
   RETIRE_SIGNAL_WEIGHTS,
   type FeedHealthInput,
 } from "@/lib/ranking/feed-health";
+import { MIN_OWN_ARTICLES } from "@/lib/ranking/near-dup-window";
 
 // YAT-55: 閾値・加重の較正前に「現在の判定挙動」を境界値で固定する安全網。
 // ここでのアサーションは現状の仕様の記述であって妥当性の保証ではない。特に比較演算子の
@@ -41,9 +42,9 @@ describe("閾値・加重の現在値", () => {
       DEAD_STALL_MULTIPLIER: 2.5,
       CADENCE_SAMPLE: 15,
       NEW_FEED_GRACE_DAYS: 3,
-      LOW_CREDIBILITY: -0.3,
+      LOW_CREDIBILITY: -0.4,
       LOW_PREF: -2.0,
-      NEAR_DUP_RATE: 0.5,
+      NEAR_DUP_RATE: 0.2,
     });
   });
 
@@ -153,11 +154,11 @@ describe("evaluateFeedHealth: dead シグナル（YAT-70 で発信停滞へ再�
 });
 
 describe("evaluateFeedHealth: low_credibility シグナル", () => {
-  // 【既知の問題・YAT-55 指摘 F】判定は credibility < LOW_CREDIBILITY の strict 比較で、
-  // シード値がちょうど -0.3 の feed（実データで 3 件確認: vLLM Blog / タグ「AI」を検索 /
-  // VentureBeat AI）はフラグが立たない。境界を含めるかどうかは較正時の決定事項。
-  // このテストは現在の「立たない」挙動を固定している（較正で変えるなら仕様変更として書き換える）。
-  it("境界: ちょうど LOW_CREDIBILITY(-0.3) ではフラグが立たない（strict 比較）", () => {
+  // 判定は credibility < LOW_CREDIBILITY の strict 比較。YAT-55 指摘 F は「シード値 -0.3 が
+  // 閾値 -0.3 とちょうど一致して 6 feed が判定を漏れる」問題だったが、閾値を -0.4（シード値の
+  // 段 -0.5 と -0.3 の間・feed が 1 つも無い区間）へ寄せて決着させた。挙動は変わらない
+  // （-0.5 / -0.8 は立つ、-0.3 は立たない）が、等号ひとつで結果が反転する状態ではなくなった。
+  it("境界: ちょうど LOW_CREDIBILITY ではフラグが立たない（strict 比較）", () => {
     const r = evaluateFeedHealth(
       healthy({ credibility: FEED_HEALTH_THRESHOLDS.LOW_CREDIBILITY }),
       NOW,
@@ -166,9 +167,21 @@ describe("evaluateFeedHealth: low_credibility シグナル", () => {
   });
 
   it("LOW_CREDIBILITY を下回ればフラグが立つ", () => {
-    const r = evaluateFeedHealth(healthy({ credibility: -0.31 }), NOW);
+    const r = evaluateFeedHealth(
+      healthy({ credibility: FEED_HEALTH_THRESHOLDS.LOW_CREDIBILITY - 0.01 }),
+      NOW,
+    );
     expect(r.reasons).toEqual(["low_credibility"]);
   });
+
+  // 閾値を -0.4 に寄せた狙いそのもの: シード値の段が閾値と重ならないこと。
+  // 閾値をシード値ちょうど（-0.3 や -0.5）へ戻すとこのテストが落ちる。
+  it.each([-0.5, -0.3])(
+    "シード値の段 %s は閾値と一致しない（境界の曖昧さが無い）",
+    (seed) => {
+      expect(seed).not.toBe(FEED_HEALTH_THRESHOLDS.LOW_CREDIBILITY);
+    },
+  );
 });
 
 describe("evaluateFeedHealth: low_pref シグナル", () => {
@@ -192,7 +205,7 @@ describe("evaluateFeedHealth: near_dup シグナル", () => {
     expect(r.reasons).toEqual([]);
   });
 
-  it("境界: ちょうど NEAR_DUP_RATE(0.5) でフラグが立つ（>= の inclusive 比較。credibility/pref と非対称）", () => {
+  it("境界: ちょうど NEAR_DUP_RATE でフラグが立つ（>= の inclusive 比較。credibility/pref と非対称）", () => {
     const r = evaluateFeedHealth(
       healthy({ near_dup_rate: FEED_HEALTH_THRESHOLDS.NEAR_DUP_RATE }),
       NOW,
@@ -201,8 +214,28 @@ describe("evaluateFeedHealth: near_dup シグナル", () => {
   });
 
   it("NEAR_DUP_RATE 未満はフラグが立たない", () => {
-    const r = evaluateFeedHealth(healthy({ near_dup_rate: 0.49 }), NOW);
+    const r = evaluateFeedHealth(
+      healthy({ near_dup_rate: FEED_HEALTH_THRESHOLDS.NEAR_DUP_RATE - 0.01 }),
+      NOW,
+    );
     expect(r.reasons).toEqual([]);
+  });
+
+  // YAT-70 で near_dup を有向化した際、決定 4-C（閾値を有向スケールへ下げる）が実装から落ち、
+  // 無向時代の 0.5 が残って 12 日間シグナルが沈黙していた（YAT-55 観測 ⑥）。
+  // 有向 near_dup の実測レンジは 0.00〜0.21 なので、閾値がこの範囲の外に出たら再発とみなす。
+  it("閾値が有向 near_dup の実測レンジ（0.00〜0.21）の内側にある", () => {
+    expect(FEED_HEALTH_THRESHOLDS.NEAR_DUP_RATE).toBeGreaterThan(0);
+    expect(FEED_HEALTH_THRESHOLDS.NEAR_DUP_RATE).toBeLessThanOrEqual(0.21);
+  });
+
+  // NEAR_DUP_RATE と MIN_OWN_ARTICLES は独立に決められない（YAT-55 決定 4-C / 4-D）。
+  // own = MIN_OWN_ARTICLES の feed では 1 記事が率を 1/MIN_OWN 動かす。これが閾値以上だと
+  // **たった 1 記事でフラグが立つ**＝率として意味を成さない。実際 MIN_OWN=5 / 閾値 0.2 の
+  // 組み合わせがちょうどそれで、Google DeepMind News は own=7 で 0.67 を叩き出していた。
+  it("MIN_OWN_ARTICLES は 1 記事で閾値をまたげない粒度になっている", () => {
+    const perArticle = 1 / MIN_OWN_ARTICLES;
+    expect(perArticle).toBeLessThan(FEED_HEALTH_THRESHOLDS.NEAR_DUP_RATE);
   });
 });
 
