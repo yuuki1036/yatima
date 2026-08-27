@@ -7,8 +7,11 @@ import {
   type RetireSuggestion,
 } from "./feed-health";
 import { loadSourcePrefs } from "./preferences";
-import { parseEmbedding } from "./dedup";
-import { fetchWindowArticles, WINDOW_DAYS } from "./near-dup-window";
+import {
+  fetchWindowFeedCounts,
+  WINDOW_DAYS,
+  PER_FEED_LIMIT,
+} from "./near-dup-window";
 import type { Feed } from "../types";
 
 // 退役スコアリングの「観測 1 回分」を組み立てる共有モジュール（YAT-55 観測 ⑥）。
@@ -20,7 +23,21 @@ import type { Feed } from "../types";
 //
 // 読み取り専用。この module は DB を書き換えない（書き込みは呼び出し側の責務）。
 
-const DAY_MS = 86_400_000;
+export const DAY_MS = 86_400_000;
+
+/**
+ * PostgrestError を message だけに潰さずに包む。
+ *
+ * `${err.message}` で文字列化すると `code` / `details` / `hint` が落ちる。Supabase の
+ * PostgrestError はこの 3 つに原因の大半が入る（RLS 拒否・列名違い・migration 未適用など）ので、
+ * 週次 cron が落ちたときにログから復元できなくなる。`cause` に原本を残し、message には
+ * 人が読める要約を出す。
+ */
+function wrap(label: string, err: unknown): Error {
+  const e = err as { message?: string; code?: string; details?: string; hint?: string };
+  const parts = [e?.message, e?.code && `code=${e.code}`, e?.details, e?.hint].filter(Boolean);
+  return new Error(`${label}: ${parts.join(" / ") || String(err)}`, { cause: err });
+}
 
 /** feed 1 本ぶんの観測。 */
 export type FeedObservation = {
@@ -32,10 +49,19 @@ export type FeedObservation = {
   quietMs: number;
   /** その feed の投稿間隔から出した dead の適応閾値（YAT-70）。固定 14d とは別物。 */
   deadMs: number;
-  /** 窓内で embedding 列が非 null の自 feed 記事数。 */
-  inWindow: number;
-  /** うち parseEmbedding に成功した件数（compute-dedup-rate が実際に使う母数）。 */
-  withEmbedding: number;
+  /**
+   * 窓内で embedding を持つ自 feed 記事の**実数**（clamp なし）。
+   * near_dup_rate が null の理由が「母数不足」なのかを切り分けるのに使う。
+   */
+  windowOwnEmbedded: number;
+  /**
+   * near_dup_rate の**実分母** = `min(windowOwnEmbedded, PER_FEED_LIMIT)`。
+   *
+   * compute-dedup-rate は自 feed 側を新しい順 PER_FEED_LIMIT 件に切ってから
+   * `rate = dup / own.length` を計算する。較正で「1 記事が率をどれだけ動かすか」を読むときは
+   * 実数ではなくこちらを使うこと（実数を使うと 100 超の feed で安定性を過大評価する）。
+   */
+  ownArticles: number;
 };
 
 /**
@@ -67,10 +93,11 @@ export type FeedHealthObservation = {
   rows: FeedObservation[];
   window: ObservationWindow;
   /**
-   * preferences の取得に失敗したか。true なら pref は全て 0 で、low_pref 判定は無意味。
-   * 黙って 0 に倒すと「嗜好シグナルが健全」と誤読されるので呼び出し側が必ず提示すること。
+   * preferences の取得に失敗したときの例外。null なら成功。
+   * 非 null なら pref は全て 0 で low_pref 判定は無意味。黙って 0 に倒すと「嗜好シグナルが健全」と
+   * 誤読されるので、呼び出し側が**理由まで**提示すること。
    */
-  prefsFailed: boolean;
+  prefsError: unknown;
 };
 
 /**
@@ -87,13 +114,16 @@ export async function collectFeedHealthObservation(
     .from("feeds")
     .select("*")
     .order("created_at", { ascending: false });
-  if (feedErr) throw new Error(`feeds の取得に失敗: ${feedErr.message}`);
+  if (feedErr) throw wrap("feeds の取得に失敗", feedErr);
   const feeds = (feedData ?? []) as Feed[];
   const active = feeds.filter((f) => f.active);
 
-  let prefsFailed = false;
-  const sourcePrefs = await loadSourcePrefs(supabase).catch(() => {
-    prefsFailed = true;
+  // preferences の失敗は致命ではない（pref 以外のシグナルは観測できる）ので続行するが、
+  // **理由は捨てない**。呼び出し側がログ粒度を決められるよう戻り値に載せる
+  // （knowledge: 共有プリミティブの失敗は理由を返り値で配り、ログ粒度は呼び出し側が決める）。
+  let prefsError: unknown = null;
+  const sourcePrefs = await loadSourcePrefs(supabase).catch((e: unknown) => {
+    prefsError = e;
     return new Map<string, number>();
   });
 
@@ -104,8 +134,9 @@ export async function collectFeedHealthObservation(
     { sample_size: FEED_HEALTH_THRESHOLDS.CADENCE_SAMPLE },
   );
   if (lpErr)
-    throw new Error(
-      `feed_recent_published の取得に失敗（migration 0014 未適用の可能性）: ${lpErr.message}`,
+    throw wrap(
+      "feed_recent_published の取得に失敗（migration 0014 未適用の可能性）",
+      lpErr,
     );
   const recentPublished = new Map<string, string[]>();
   for (const r of (recentRows ?? []) as {
@@ -128,41 +159,35 @@ export async function collectFeedHealthObservation(
     sourcePref: sourcePrefs.get(f.id) ?? 0,
   }));
 
-  // 母集団は compute-dedup-rate と共有する（near-dup-window）。
+  // 母集団は compute-dedup-rate と共有する（near-dup-window）。ここは件数しか要らないので
+  // embedding 本体を落とさない軽量経路を使う（差分は fetchWindowFeedCounts の doc を参照）。
   const {
-    rows: windowRows,
+    byFeed: perFeed,
+    embedded,
     truncated,
     since,
-  } = await fetchWindowArticles(supabase, now);
-  const perFeed = new Map<string, { inWindow: number; withEmbedding: number }>();
-  for (const a of windowRows) {
-    const s = perFeed.get(a.feed_id) ?? { inWindow: 0, withEmbedding: 0 };
-    s.inWindow += 1;
-    // compute-dedup-rate は parseEmbedding 失敗行も捨てるので、そこまで揃える。
-    if (parseEmbedding(a.embedding)) s.withEmbedding += 1;
-    perFeed.set(a.feed_id, s);
-  }
+  } = await fetchWindowFeedCounts(supabase, now);
 
-  // 窓内の記事「総数」。fetchWindowArticles は embedding 非 null しか返さないので別途数える。
+  // 窓内の記事「総数」。窓の取得は embedding 非 null に絞っているので別途数える。
   // これが無いと「窓が痩せている」と「そもそも記事が少ない」を区別できない。
   const { count: windowTotal, error: wErr } = await supabase
     .from("articles")
     .select("id", { count: "exact", head: true })
     .gte("published_at", since);
-  if (wErr) throw new Error(`窓内の記事数の取得に失敗: ${wErr.message}`);
+  if (wErr) throw wrap("窓内の記事数の取得に失敗", wErr);
   const articlesTotal = windowTotal ?? 0;
 
   const rows: FeedObservation[] = inputs.map((input) => {
     const recent = input.recentPublishedAt ?? [];
-    const stat = perFeed.get(input.id) ?? { inWindow: 0, withEmbedding: 0 };
+    const own = perFeed.get(input.id) ?? 0;
     return {
       input,
       result: evaluateFeedHealth(input, now),
       ageMs: now - Date.parse(input.created_at),
       quietMs: recent.length === 0 ? Infinity : now - Date.parse(recent[0]),
       deadMs: deadThresholdMs(recent),
-      inWindow: stat.inWindow,
-      withEmbedding: stat.withEmbedding,
+      windowOwnEmbedded: own,
+      ownArticles: Math.min(own, PER_FEED_LIMIT),
     };
   });
   rows.sort((a, b) => b.result.score - a.result.score);
@@ -175,21 +200,24 @@ export async function collectFeedHealthObservation(
     window: {
       since,
       articles: articlesTotal,
-      embedded: windowRows.length,
-      coverage: articlesTotal === 0 ? 0 : windowRows.length / articlesTotal,
+      embedded,
+      coverage: articlesTotal === 0 ? 0 : embedded / articlesTotal,
       truncated,
     },
-    prefsFailed,
+    prefsError,
   };
 }
 
-/** 窓の健全性を 1 行で説明する（診断の見出しと snapshot の警告で共用）。 */
+/**
+ * 窓の健全性を 1 行で説明する（診断の見出しと snapshot の共用）。
+ *
+ * `truncated` はここでは出さない。呼び出し側が「何が起きるか」まで書いた専用の警告を持っており、
+ * 両方出すと同じ事実が 2 回並ぶ。
+ */
 export function describeWindow(w: ObservationWindow): string {
   return (
     `窓 ${WINDOW_DAYS}d: 記事 ${w.articles} 件 / embedding 付き ${w.embedded} 件` +
-    `（網羅率 ${(w.coverage * 100).toFixed(1)}%）` +
-    (w.truncated ? " ⚠ 安全弁に達して古い側を切り捨て" : "")
+    `（網羅率 ${(w.coverage * 100).toFixed(1)}%）`
   );
 }
 
-export { DAY_MS };

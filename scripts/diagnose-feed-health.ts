@@ -14,6 +14,7 @@ import { FEEDBACK_WEIGHT } from "../lib/ranking/preferences";
 import {
   collectFeedHealthObservation,
   describeWindow,
+  DAY_MS,
 } from "../lib/ranking/feed-health-observation";
 import { WINDOW_DAYS, MIN_OWN_ARTICLES, FETCH_CAP } from "../lib/ranking/near-dup-window";
 import { padEndWide } from "./_report-format";
@@ -38,7 +39,6 @@ import { padEndWide } from "./_report-format";
 // WINDOW_DAYS / MIN_OWN_ARTICLES / 取得クエリは near-dup-window から取る。以前はここに同値の
 // 定数を置いて「compute-dedup-rate.ts と揃える」とコメントしていたが、揃っていたのは定数だけで
 // クエリ（行数上限）はズレていた。母集団ごと共有して drift の余地を消す。
-const DAY_MS = 86_400_000;
 
 // embedding 網羅率がこれを下回る観測は較正に使わない。平常時は 40〜50%（要約予算が credibility で
 // リランクされるため全記事は要約されない）で、2026-08-26 の要約全滅時は 33.6% まで落ちていた。
@@ -59,13 +59,10 @@ async function main() {
 
   // 収集は snapshot-feed-health と共有する（feed-health-observation）。ここを別実装にすると
   // 「診断で見た値」と「較正に貯める値」が別物になり、較正そのものが成立しない。
-  const obs = await collectFeedHealthObservation(supabase, now).catch(
-    (e: unknown) => {
-      console.error(e instanceof Error ? e.message : e);
-      process.exit(1);
-    },
-  );
-  const { feeds, active, rows, window: win, prefsFailed } = obs;
+  // 収集の失敗は末尾の main().catch に任せる（オブジェクトごと出す既存スクリプトの作法。
+  // ここで message だけに潰すと PostgrestError の code / details / hint が消える）。
+  const obs = await collectFeedHealthObservation(supabase, now);
+  const { feeds, active, rows, window: win, prefsError } = obs;
   const inputs = rows.map((r) => r.input);
   if (win.truncated) {
     console.warn(
@@ -117,8 +114,9 @@ async function main() {
   console.log(
     `加重: ${(Object.keys(RETIRE_SIGNAL_WEIGHTS) as RetireReason[]).map((k) => `${k}=${RETIRE_SIGNAL_WEIGHTS[k]}`).join(" / ")}`,
   );
-  if (prefsFailed) {
+  if (prefsError) {
     console.log("⚠ preferences 取得失敗のため pref 列と low_pref 判定は無効（全て 0 扱い）");
+    console.warn("  原因:", prefsError);
   }
 
   // 窓の健全性を見出しに出す。near_dup は「窓に何が入っていたか」で値が変わるので、
@@ -228,7 +226,7 @@ async function main() {
   // ので、該当 feed を名前・embedding 件数・feed 齢つきで挙げる。
   const enoughButNullRows: typeof nullRows = [];
   for (const r of nullRows) {
-    const withEmbed = r.withEmbedding;
+    const withEmbed = r.windowOwnEmbedded;
     const any = hasAnyArticle.get(r.input.id);
     if (withEmbed >= MIN_OWN_ARTICLES) enoughButNullRows.push(r);
     else if (withEmbed > 0) tooFew += 1;
@@ -249,7 +247,7 @@ async function main() {
         ? `feed 齢 ${(r.ageMs / DAY_MS).toFixed(1)}d（作成 ${r.input.created_at?.slice(0, 10)}）`
         : "feed 齢 不明（created_at が null）";
       console.log(
-        `    - ${pad(r.input.title ?? r.input.url, 27)} embedding ${r.withEmbedding} 件 / ${age}`,
+        `    - ${pad(r.input.title ?? r.input.url, 27)} embedding ${r.windowOwnEmbedded} 件 / ${age}`,
       );
     }
     console.log(

@@ -9,6 +9,7 @@ import {
   fetchWindowArticles,
   WINDOW_DAYS,
   MIN_OWN_ARTICLES,
+  PER_FEED_LIMIT,
   FETCH_CAP,
 } from "../lib/ranking/near-dup-window";
 
@@ -21,7 +22,7 @@ import {
 // cosine >= 0.86 で近重複になる割合（YAT-70 で有向化。それ以前は向きを見ていなかったため、
 // 転載された一次ソース側が「重複量産」と誤判定されていた）。
 // 母数（embedding を持つ A の直近記事）が MIN_OWN_ARTICLES 件未満なら null（未算出）に倒す
-// — 小サンプルでは 1 件のマッチだけで率が 1.0 に振れ、良質だが低頻度の feed を誤って
+// — 小サンプルでは 1 件のマッチが率を 1/母数 ぶん動かしてしまい、良質だが低頻度の feed を誤って
 // 推奨へ上げてしまうため（YAT-36）。
 //
 // 既知の偏り（有向化で新たに生じたもの・未対処）: 窓の**古い端**にある記事は「自分より早い記事」の
@@ -31,15 +32,17 @@ import {
 // 過小評価（＝退役推奨を出しすぎない安全側）。直すなら others 側だけ窓を広げて取る必要があり、
 // 取得コストが増えるので較正時に判断する（YAT-55）。
 
-// WINDOW_DAYS / MIN_OWN_ARTICLES / 取得クエリは near-dup-window に集約した
+// WINDOW_DAYS / MIN_OWN_ARTICLES / PER_FEED_LIMIT / 取得クエリは near-dup-window に集約した
 // （diagnose-feed-health.ts と母集団を共有するため。定数コメントでの手動同期は drift した）。
-const PER_FEED_LIMIT = 100; // 自 feed 側の評価対象（直近）
+
 
 // 比較プールにはかつて COMPARE_LIMIT=1000（他 feed の新着 1000 件）を掛けていたが撤廃した。
 // 母集団の取りこぼしを直して own が窓全体に広がった結果、own（30日）と others（新着1000件＝
 // 実測で約5日）の時間帯が噛み合わなくなり、own の古い記事が「比較相手のいない期間」と突き合わ
-// されて近重複が原理的に検出されなくなった（実測: near_dup_rate が軒並み低下し、最大でも 0.40 と
-// 閾値 0.5 に届かずシグナルが死んだ）。窓全体と比較すれば定義どおりになる。
+// されて近重複が原理的に検出されなくなった（実測: near_dup_rate が軒並み低下し、最大でも 0.40。
+// 当時の閾値 0.5（無向スケール）に届かずシグナルが死んだ。**この 0.5 は現行値ではない** —
+// YAT-70 の有向化に合わせて 0.2 に下げてあるので、0.40 は今なら余裕でフラグが立つ）。
+// 窓全体と比較すれば定義どおりになる。
 // コストは許容範囲: 総実行時間はほぼ embedding の fetch 待ちで、cosine は CPU 数秒しか使わない。
 
 type Art = { feedId: string; vec: number[]; publishedAt: number };

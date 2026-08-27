@@ -7,7 +7,10 @@ import {
   RETIRE_SIGNAL_WEIGHTS,
   type FeedHealthInput,
 } from "@/lib/ranking/feed-health";
-import { MIN_OWN_ARTICLES } from "@/lib/ranking/near-dup-window";
+import {
+  MIN_OWN_ARTICLES,
+  PER_FEED_LIMIT,
+} from "@/lib/ranking/near-dup-window";
 
 // YAT-55: 閾値・加重の較正前に「現在の判定挙動」を境界値で固定する安全網。
 // ここでのアサーションは現状の仕様の記述であって妥当性の保証ではない。特に比較演算子の
@@ -236,6 +239,12 @@ describe("evaluateFeedHealth: near_dup シグナル", () => {
   it("MIN_OWN_ARTICLES は 1 記事で閾値をまたげない粒度になっている", () => {
     const perArticle = 1 / MIN_OWN_ARTICLES;
     expect(perArticle).toBeLessThan(FEED_HEALTH_THRESHOLDS.NEAR_DUP_RATE);
+  });
+
+  // 率の実分母は min(窓内件数, PER_FEED_LIMIT)。最小母数がこの上限を超えると、どの feed も
+  // 母数条件を満たせず near_dup_rate が全件 null になる（シグナルが別の理由で死ぬ）。
+  it("MIN_OWN_ARTICLES は実分母の上限 PER_FEED_LIMIT を超えない", () => {
+    expect(MIN_OWN_ARTICLES).toBeLessThanOrEqual(PER_FEED_LIMIT);
   });
 });
 

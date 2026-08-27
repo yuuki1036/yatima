@@ -7,7 +7,14 @@ import { createAdminClient } from "../lib/supabase/admin";
 import {
   collectFeedHealthObservation,
   describeWindow,
+  DAY_MS,
 } from "../lib/ranking/feed-health-observation";
+import { FEED_HEALTH_THRESHOLDS } from "../lib/ranking/feed-health";
+import {
+  MIN_OWN_ARTICLES,
+  PER_FEED_LIMIT,
+  WINDOW_DAYS,
+} from "../lib/ranking/near-dup-window";
 
 // YAT-55: 退役スコアリングの観測を feed_health_snapshots に貯める（週次 cron）。
 //
@@ -28,12 +35,16 @@ import {
 // 直前の compute-dedup-rate がいつ走ったかで判断すること。
 // LLM 呼び出しは無いので課金は発生しない。
 
-const DAY_MS = 86_400_000;
-
 async function main() {
   const supabase = createAdminClient();
   const now = Date.now();
   const capturedAt = new Date(now).toISOString();
+
+  // 同じ run で compute-dedup-rate が成功したか（learn.yml が steps.<id>.outcome を渡す）。
+  // 未設定＝手動実行とみなして false に倒す。near_dup_rate は上書き列なので、算出が落ちた週に
+  // 撮ると最大 1 週間前の値が今週の観測として入る。それを行から見分けられるようにする。
+  const nearDupFresh = process.env.NEAR_DUP_FRESH === "true";
+  const runKind = process.env.GITHUB_ACTIONS === "true" ? "cron" : "manual";
 
   const obs = await collectFeedHealthObservation(supabase, now);
 
@@ -43,15 +54,41 @@ async function main() {
     `active ${obs.active.length} feed / 推奨 ${obs.rows.filter((r) => r.result.recommend).length} 件`,
   );
   console.log(describeWindow(obs.window));
+  if (obs.window.truncated) {
+    console.warn(
+      "⚠ 窓が安全弁に達して古い側を切り捨てた。window_embedded だけが頭打ちになるため網羅率は実態より低く出る",
+    );
+  }
+  if (!nearDupFresh) {
+    console.warn(
+      "⚠ この run で compute-dedup-rate が成功していない。near_dup_rate は最大 1 週間古い値なので near_dup_fresh=false で記録する",
+    );
+  }
 
   // preferences が取れていない観測は pref シグナルが全て 0 になり、low_pref 判定が無意味になる。
   // それを黙って貯めると「嗜好シグナルが健全だった週」として後から誤読されるので、記録しない。
-  if (obs.prefsFailed) {
+  if (obs.prefsError) {
     console.error(
-      "✗ preferences の取得に失敗した。pref が全て 0 の観測は較正に使えないので記録しない",
+      "✗ preferences の取得に失敗した。pref が全て 0 の観測は較正に使えないので記録しない:",
+      obs.prefsError,
     );
     process.exit(1);
   }
+
+  // active feed が 0 件なら insert する行が無い。compute-dedup-rate と同じく明示的に抜ける
+  // （`✓ 0 行を記録した` は成功に見えてしまう）。
+  if (obs.rows.length === 0) {
+    console.log("active feed が無いため記録するものが無い");
+    return;
+  }
+
+  // 撮影時に効いていた閾値一式。較正で閾値を動かした後、系列の前後を比較するのに要る。
+  const thresholds = {
+    ...FEED_HEALTH_THRESHOLDS,
+    MIN_OWN_ARTICLES,
+    PER_FEED_LIMIT,
+    WINDOW_DAYS,
+  };
 
   const rows = obs.rows.map((r) => ({
     captured_at: capturedAt,
@@ -60,17 +97,22 @@ async function main() {
     score: r.result.score,
     reasons: r.result.reasons,
     recommended: r.result.recommend,
+    thresholds,
     // Infinity は JSON にできないので null に倒す（＝記事が 1 件も無い＝未発信）。
     // null と「沈黙 0 日」は別物なので、読み出し側は null を除外して集計すること。
     silence_days: Number.isFinite(r.quietMs) ? r.quietMs / DAY_MS : null,
     dead_threshold_days: Number.isFinite(r.deadMs) ? r.deadMs / DAY_MS : null,
+    feed_age_days: r.ageMs / DAY_MS,
     credibility: r.input.credibility,
     source_pref: r.input.sourcePref,
     near_dup_rate: r.input.near_dup_rate,
-    own_articles: r.withEmbedding,
+    near_dup_fresh: nearDupFresh,
+    own_articles: r.ownArticles,
+    window_own_embedded: r.windowOwnEmbedded,
     window_articles: obs.window.articles,
     window_embedded: obs.window.embedded,
     window_truncated: obs.window.truncated,
+    run_kind: runKind,
   }));
 
   const { error } = await supabase.from("feed_health_snapshots").insert(rows);
@@ -88,13 +130,17 @@ async function main() {
   // 「貯めているつもりで貯まっていない」状態で、これは今回直した不具合そのもの。
   const { count, error: cErr } = await supabase
     .from("feed_health_snapshots")
-    .select("captured_at", { count: "exact", head: true });
-  if (!cErr && count !== null) {
-    console.log(`  累計 ${count} 行（${obs.active.length} 行/回）`);
+    .select("id", { count: "exact", head: true });
+  if (cErr) {
+    console.warn("  累計行数の取得に失敗（記録自体は成功している）:", cErr.message);
+  } else if (count === null) {
+    console.warn("  累計行数が取れなかった（記録自体は成功している）");
+  } else {
+    console.log(`  累計 ${count} 行（今回 ${rows.length} 行）`);
   }
 }
 
-main().catch((e: unknown) => {
-  console.error(e instanceof Error ? e.message : e);
+main().catch((e) => {
+  console.error(e);
   process.exit(1);
 });
