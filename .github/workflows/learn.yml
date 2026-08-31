@@ -18,7 +18,12 @@ concurrency:
 jobs:
   learn:
     runs-on: ubuntu-latest
-    timeout-minutes: 20 # 生成 + Voyage embed（候補+補完・2問/チャンク・21s 間隔）のレート制限を見込む
+    # 生成 + Voyage embed（候補+補完・2問/チャンク・21s 間隔）のレート制限に加え、
+    # feed 側 2 ステップ（窓のページング取得を各 1 回）ぶんの余白を持たせる。
+    # job の timeout 超過は GitHub 側では **cancel** で、!cancelled() が false になり feed 側が
+    # skip される。重い generate-quiz にはステップ側の timeout を置いて failure に倒し、
+    # job の timeout はその外側の保険として働かせる。
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -26,15 +31,48 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+        id: deps
       - run: npm run generate-quiz
+        # 超過を job cancel でなくステップの failure にする（上の timeout-minutes のコメント参照）。
+        timeout-minutes: 20
         env:
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
+      # ここから下は feed 側（YAT-20 / YAT-55）で、クイズ生成とは別サブシステム。
+      # 条件を付けるのは generate-quiz の失敗で巻き添えにしないため。YAT-73 で generate-quiz は
+      # 「作れるはずなのに 1 件も作れなかった」ときに exit 1 するようになったが、既定では後続が
+      # skip されるので、LLM 障害のたびに feed の near_dup と観測が静かに止まる。
+      # **障害中こそ観測が要る**（今回の較正が詰まった原因がまさにこれで、要約全滅の窓で
+      # 撮られた値だと後から気付けなかった）。
+      #
+      # 通したいのは「生成の失敗」だけで、環境構築の失敗まで通す必要はない。!cancelled() だけだと
+      # 暗黙の success() が外れて npm ci の失敗も素通しになり、node_modules 不在で tsx が動かず
+      # 赤いステップが 3 つ並ぶ（YAT-73 が検知したいシグナルが run 一覧で埋もれる）。
+      # steps.deps の成否で足切りする。
+      # 失敗したステップは残るので job 自体は赤いまま＝YAT-73 の検知は殺していない。
+
       # feed 削除推奨の near-dup シグナル（YAT-20）。既存 embedding の cosine 集計のみで
-      # 新規 API 呼び出しが無いため LLM/embed の secret は不要。クイズ生成の後に回す。
+      # 新規 API 呼び出しが無いため LLM/embed の secret は不要。
       - run: npm run compute-dedup-rate
+        id: dedup
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
         env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      # 退役スコアリングの観測を feed_health_snapshots に貯める（YAT-55）。
+      # compute-dedup-rate の**直後**に置くこと: near_dup_rate は上書き列で、この週次実行が
+      # 唯一の書き手。ここで撮らないと、次の実行まで誰も見ないまま値が踏み潰される
+      # （有向 near_dup で唯一クリーンだった 2026-08-17 の値は、実際にこうして失われた）。
+      #
+      # NEAR_DUP_FRESH で「この run の near_dup_rate が算出し直されたか」を渡す。dedup が落ちた週も
+      # 観測は撮る（撮らないと系列が欠ける）が、その行の near_dup_rate は最大 1 週間前の値なので
+      # near_dup_fresh=false として記録し、較正から外せるようにする。
+      # 読み取り＋insert のみで LLM/embed の secret は不要。
+      - run: npm run snapshot-feed-health
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        env:
+          NEAR_DUP_FRESH: ${{ steps.dedup.outcome == 'success' }}
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}

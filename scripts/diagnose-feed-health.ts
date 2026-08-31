@@ -5,24 +5,19 @@ config({ path: ".env.local" });
 
 import { createAdminClient } from "../lib/supabase/admin";
 import {
-  evaluateFeedHealth,
   FEED_HEALTH_THRESHOLDS as TH,
-  deadThresholdMs,
   RETIRE_SIGNAL_WEIGHTS,
   RETIRE_REASON_LABELS,
-  type FeedHealthInput,
   type RetireReason,
 } from "../lib/ranking/feed-health";
-import { loadSourcePrefs, FEEDBACK_WEIGHT } from "../lib/ranking/preferences";
-import { parseEmbedding } from "../lib/ranking/dedup";
+import { FEEDBACK_WEIGHT } from "../lib/ranking/preferences";
 import {
-  fetchWindowArticles,
-  WINDOW_DAYS,
-  MIN_OWN_ARTICLES,
-  FETCH_CAP,
-} from "../lib/ranking/near-dup-window";
+  collectFeedHealthObservation,
+  describeWindow,
+  DAY_MS,
+} from "../lib/ranking/feed-health-observation";
+import { WINDOW_DAYS, MIN_OWN_ARTICLES, FETCH_CAP } from "../lib/ranking/near-dup-window";
 import { padEndWide } from "./_report-format";
-import type { Feed } from "../lib/types";
 
 // YAT-60: feed 引退推奨スコアリングの較正用診断スクリプト。
 // /feeds の RETIRE SUGGESTIONS は computeRetireSuggestions が recommend=true で filter するため、
@@ -44,10 +39,10 @@ import type { Feed } from "../lib/types";
 // WINDOW_DAYS / MIN_OWN_ARTICLES / 取得クエリは near-dup-window から取る。以前はここに同値の
 // 定数を置いて「compute-dedup-rate.ts と揃える」とコメントしていたが、揃っていたのは定数だけで
 // クエリ（行数上限）はズレていた。母集団ごと共有して drift の余地を消す。
-const DAY_MS = 86_400_000;
 
-// feed ごとの記事状況。near_dup_rate=null の理由を切り分けるために数える。
-type ArticleStats = { inWindow: number; withEmbedding: number; total: number; nullPublished: number };
+// embedding 網羅率がこれを下回る観測は較正に使わない。平常時は 40〜50%（要約予算が credibility で
+// リランクされるため全記事は要約されない）で、2026-08-26 の要約全滅時は 33.6% まで落ちていた。
+const WINDOW_COVERAGE_FLOOR = 0.4;
 
 function fmtDays(ms: number): string {
   if (!Number.isFinite(ms)) return "未取得";
@@ -62,78 +57,21 @@ async function main() {
   // 診断では判定と表示の時刻がズレると内訳が読めなくなるため明示的に渡す）。
   const now = Date.now();
 
-  // ── feeds + source pref（app/feeds/page.tsx と同じ組み立て）────────────────
-  const { data: feedData, error: feedErr } = await supabase
-    .from("feeds")
-    .select("*")
-    .order("created_at", { ascending: false });
-  if (feedErr) {
-    console.error("feeds の取得に失敗:", feedErr);
-    process.exit(1);
-  }
-  const feeds = (feedData ?? []) as Feed[];
-  // page.tsx は空 Map に倒す（UI が落ちないことを優先）。診断では黙って倒すと「pref シグナルが
-  // 一件も立たない」を「嗜好は健全」と誤読するので、失敗したことを明示する。
-  let prefsFailed = false;
-  const sourcePrefs = await loadSourcePrefs(supabase).catch((e) => {
-    console.warn("⚠ preferences の取得に失敗。pref 列は全て 0 として扱う（判定は無意味になる）:", e);
-    prefsFailed = true;
-    return new Map<string, number>();
-  });
-
-  const active = feeds.filter((f) => f.active);
-
-  // dead シグナル用（YAT-70 で last_fetched_at から差し替え）。診断では「RPC が取れなかった」を
-  // 黙って通すと dead 列が全て空欄になり健全と誤読されるので、失敗を明示して落とす。
-  const { data: recentRows, error: lpErr } = await supabase.rpc(
-    "feed_recent_published",
-    { sample_size: TH.CADENCE_SAMPLE },
-  );
-  if (lpErr) {
-    console.error(
-      "feed_recent_published の取得に失敗（migration 0014 未適用の可能性）:",
-      lpErr,
-    );
-    process.exit(1);
-  }
-  const recentPublished = new Map<string, string[]>();
-  for (const r of (recentRows ?? []) as { feed_id: string; published_at: string }[]) {
-    const l = recentPublished.get(r.feed_id);
-    if (l) l.push(r.published_at);
-    else recentPublished.set(r.feed_id, [r.published_at]);
-  }
-
-  const inputs: FeedHealthInput[] = active.map((f) => ({
-    id: f.id,
-    title: f.title,
-    url: f.url,
-    created_at: f.created_at,
-    recentPublishedAt: recentPublished.get(f.id) ?? [],
-    credibility: f.credibility,
-    near_dup_rate: f.near_dup_rate,
-    sourcePref: sourcePrefs.get(f.id) ?? 0,
-  }));
-
-  // ── articles（near_dup_rate=null の内訳用）──────────────────────────────
-  // 母集団は compute-dedup-rate.ts と共有する（near-dup-window）。ここが 1 行でもズレると
-  // 「なぜ null なのか」の内訳が算出側の実態と食い違い、診断の意味が無くなる。
-  const { rows: articles, truncated } = await fetchWindowArticles(supabase, now);
-  const stats = new Map<string, ArticleStats>();
-  for (const a of articles) {
-    const s = stats.get(a.feed_id) ?? { inWindow: 0, withEmbedding: 0, total: 0, nullPublished: 0 };
-    s.total += 1;
-    s.inWindow += 1;
-    // compute-dedup-rate は parseEmbedding 失敗行も捨てるので、そこまで揃える。
-    if (parseEmbedding(a.embedding)) s.withEmbedding += 1;
-    stats.set(a.feed_id, s);
-  }
-  if (truncated) {
+  // 収集は snapshot-feed-health と共有する（feed-health-observation）。ここを別実装にすると
+  // 「診断で見た値」と「較正に貯める値」が別物になり、較正そのものが成立しない。
+  // 収集の失敗は末尾の main().catch に任せる（オブジェクトごと出す既存スクリプトの作法。
+  // ここで message だけに潰すと PostgrestError の code / details / hint が消える）。
+  const obs = await collectFeedHealthObservation(supabase, now);
+  const { feeds, active, rows, window: win, prefsError } = obs;
+  const inputs = rows.map((r) => r.input);
+  if (win.truncated) {
     console.warn(
       `⚠ 窓内の記事が安全弁 ${FETCH_CAP} 件に達した。古い記事が切れており、` +
         `feed 別の embedding 件数が実態より小さく出る（母数不足の誤判定につながる）`,
     );
   }
 
+  // ── 記事の有無（near_dup_rate=null の内訳用）──────────────────────────
   // 窓外・embedding 無しも含めた feed 別の記事有無。「記事そのものが無い」と
   // 「記事はあるが窓/embedding の条件で落ちた」を切り分けるために別途数える。
   //
@@ -164,19 +102,6 @@ async function main() {
     hasAnyArticle.set(input.id, { total: total ?? 0, nullPublished: nullPublished ?? 0 });
   }
 
-  // ── 評価（filter せず全 active feed）────────────────────────────────────
-  const rows = inputs.map((input) => {
-    const result = evaluateFeedHealth(input, now);
-    const ageMs = now - Date.parse(input.created_at);
-    // 発信停滞（最新記事の公開からの経過）。記事ゼロは Infinity＝「未発信」として扱う。
-    const recent = input.recentPublishedAt ?? [];
-    const quietMs = recent.length === 0 ? Infinity : now - Date.parse(recent[0]);
-    // 適応閾値（feed ごとの投稿間隔の中央値ベース）。固定 14d と別物なので併記する。
-    const deadMs = deadThresholdMs(recent);
-    return { input, result, ageMs, quietMs, deadMs, stat: stats.get(input.id) };
-  });
-  rows.sort((a, b) => b.result.score - a.result.score);
-
   console.log("=== feed 引退スコアリング診断（YAT-60） ===");
   console.log(
     `feed 総数 ${feeds.length}（active ${active.length} / 非活性 ${feeds.length - active.length}）` +
@@ -189,8 +114,20 @@ async function main() {
   console.log(
     `加重: ${(Object.keys(RETIRE_SIGNAL_WEIGHTS) as RetireReason[]).map((k) => `${k}=${RETIRE_SIGNAL_WEIGHTS[k]}`).join(" / ")}`,
   );
-  if (prefsFailed) {
+  if (prefsError) {
     console.log("⚠ preferences 取得失敗のため pref 列と low_pref 判定は無効（全て 0 扱い）");
+    console.warn("  原因:", prefsError);
+  }
+
+  // 窓の健全性を見出しに出す。near_dup は「窓に何が入っていたか」で値が変わるので、
+  // 網羅率を見ずに値だけ読むと汚染された観測を較正に使ってしまう（2026-08-26 に実際に起きた:
+  // 要約全滅で直近 7 日の embedding が丸ごと欠けた窓で算出された値だった）。
+  console.log(describeWindow(win));
+  if (win.coverage < WINDOW_COVERAGE_FLOOR) {
+    console.log(
+      `⚠ embedding 網羅率が ${(WINDOW_COVERAGE_FLOOR * 100).toFixed(0)}% を下回っている。` +
+        `要約・embed 経路が止まっている可能性がある（near_dup を較正に使わないこと）`,
+    );
   }
 
   console.log("\n--- 全 active feed のシグナル値（score 降順・推奨は ★）---");
@@ -262,8 +199,9 @@ async function main() {
     `  ※ 未到達のシグナルが 1 つ以上ある feed のみ、閾値に近い順に最大 12 件。★ は別シグナルで既に推奨済み`,
   );
   console.log(
-    `  ※ credibility / pref は「< 閾値」の strict 比較。ちょうど ${TH.LOW_CREDIBILITY} の feed は` +
-      `フラグが立たない（cred +0.00 の行がそれ）。dismiss 回数もこれを織り込んで +1 している`,
+    `  ※ credibility / pref は「< 閾値」の strict 比較。dismiss 回数もこれを織り込んで +1 している。` +
+      `credibility の閾値 ${TH.LOW_CREDIBILITY} はシード値の段（-0.5 / -0.3）の間に置いてあるので、` +
+      `境界ちょうどの feed は存在しない（YAT-55 指摘 F の決着）`,
   );
 
   // ── near_dup_rate = null の内訳 ────────────────────────────────────────
@@ -271,7 +209,7 @@ async function main() {
   const nonNull = rows.length - nullRows.length;
   console.log(
     `\n--- near_dup_rate = null の内訳（${nullRows.length} / ${rows.length} feed）` +
-      `｜母集団: 直近 ${WINDOW_DAYS}d の embedding 付き記事 ${articles.length} 件 ---`,
+      `｜母集団: 直近 ${WINDOW_DAYS}d の embedding 付き記事 ${win.embedded} 件 ---`,
   );
   if (nonNull === 0 && rows.length > 0) {
     console.log(
@@ -288,7 +226,7 @@ async function main() {
   // ので、該当 feed を名前・embedding 件数・feed 齢つきで挙げる。
   const enoughButNullRows: typeof nullRows = [];
   for (const r of nullRows) {
-    const withEmbed = r.stat?.withEmbedding ?? 0;
+    const withEmbed = r.windowOwnEmbedded;
     const any = hasAnyArticle.get(r.input.id);
     if (withEmbed >= MIN_OWN_ARTICLES) enoughButNullRows.push(r);
     else if (withEmbed > 0) tooFew += 1;
@@ -309,7 +247,7 @@ async function main() {
         ? `feed 齢 ${(r.ageMs / DAY_MS).toFixed(1)}d（作成 ${r.input.created_at?.slice(0, 10)}）`
         : "feed 齢 不明（created_at が null）";
       console.log(
-        `    - ${pad(r.input.title ?? r.input.url, 27)} embedding ${r.stat?.withEmbedding ?? 0} 件 / ${age}`,
+        `    - ${pad(r.input.title ?? r.input.url, 27)} embedding ${r.windowOwnEmbedded} 件 / ${age}`,
       );
     }
     console.log(
@@ -337,8 +275,10 @@ async function main() {
   }
 
   console.log(
-    `\n※ near_dup_rate は上書き型で履歴が無い。分布を得るには本スクリプトを定期実行して記録を貯める` +
-      `必要がある（dead は YAT-70 で articles.published_at 由来になったため遡れる）`,
+    `\n※ near_dup_rate は上書き型で履歴が無く、この出力も残らない。系列は feed_health_snapshots に` +
+      `貯めている（週次 cron の npm run snapshot-feed-health）。較正にはそちらを使うこと` +
+      `——本スクリプトはあくまで「今」を読むためのもの` +
+      `（dead は YAT-70 で articles.published_at 由来になったため遡れる）`,
   );
 }
 
