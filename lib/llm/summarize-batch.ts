@@ -24,6 +24,19 @@ type PoolRow = Row & {
 };
 
 const DEFAULT_LIMIT = 20; // 1 回の実行で要約する上限（コスト暴走を防ぐ。残りは次回消化）
+
+// 1 UTC 日あたりの要約上限（YAT-74）。**run をまたぐ唯一の支出天井。**
+//
+// DEFAULT_LIMIT は 1 run の上限でしかなく、日次の消費は cron の発火回数に比例する。
+// その発火回数は GitHub Actions の best-effort スケジューリングで実測 2〜23 回/日 と
+// 10 倍振れるため、日次消費は 40〜460 件（月 $4〜$46）と制御できていなかった。
+// 2026-08-19 のクレジット枯渇はこの天井の不在が直接の原因。
+//
+// 300 は「今の運用を絞らない上限」として置いた。実効レートは 165 件/日
+// （30 日窓の要約 4,947 件 ÷ 30）で、健全期のピーク 23 run × 20 件 = 460 件/日 だけを弾く。
+// コスト削減が目的の値ではない（それは Batches 移行と対象の絞り込みで別途やる）。
+// 月額の天井は 300 × 30 × (1,010 tok × $1 + 240 tok × $5) / 1M ≒ $20。
+export const DAILY_SUMMARIZE_CAP = 300;
 const DEFAULT_CONCURRENCY = 5; // 同時並列数（レート制限に配慮）
 const POOL_FACTOR = 8; // 信頼度リランクの母集団 = limit × この係数（新着 POOL から良記事を選る）
 const ANNOTATE_POOL_CAP = 300; // 母集団の上限（取り込み直後の大量バックログを引きすぎない）
@@ -306,6 +319,15 @@ export type AnnotateBatchResult = {
   succeeded: number;
   failed: number;
   skipped: boolean; // API キー未設定でスキップした場合 true
+  /** この UTC 日に既に要約した件数（この run のぶんを含まない、実行開始時点の値）。 */
+  dailyUsed: number;
+  /** 日次上限（DAILY_SUMMARIZE_CAP）。呼び出し側がログに出す用。 */
+  dailyCap: number;
+  /**
+   * 日次上限に達して要約を見送ったか。**picked=0 の理由が「対象なし」か「上限到達」かを
+   * 区別するために要る**（区別しないと、上限で止まっているのを「平常運転」と読んでしまう）。
+   */
+  dailyCapped: boolean;
 };
 
 export async function annotateMissing(
@@ -322,8 +344,59 @@ export async function annotateMissing(
     opts.summarizer !== undefined ? opts.summarizer : createHaikuSummarizer();
 
   if (!summarizer) {
-    return { picked: 0, succeeded: 0, failed: 0, skipped: true };
+    return {
+      picked: 0,
+      succeeded: 0,
+      failed: 0,
+      skipped: true,
+      dailyUsed: 0,
+      dailyCap: DAILY_SUMMARIZE_CAP,
+      dailyCapped: false,
+    };
   }
+
+  // ── 日次の支出天井（YAT-74）─────────────────────────────────────────────
+  // DEFAULT_LIMIT は 1 run の上限で、run をまたぐ天井は無かった。cron の実発火が
+  // 2〜23 回/日 と振れるので、日次消費は 10 倍の幅で制御不能だった（クレジット枯渇の直接原因）。
+  //
+  // 起点は UTC 0 時。cron が UTC 基準なので、ローカル時刻で切ると日境界が run の途中に来る。
+  // 取得に失敗したら**要約を見送る**（上限が分からないまま課金しない側に倒す）。
+  const dayStart = new Date();
+  dayStart.setUTCHours(0, 0, 0, 0);
+  const { count: usedRaw, error: capErr } = await supabase
+    .from("articles")
+    .select("id", { count: "exact", head: true })
+    .gte("summarized_at", dayStart.toISOString());
+  if (capErr) {
+    console.warn(
+      "日次要約数の取得に失敗（migration 0016 未適用の可能性）。上限が確認できないので要約を見送る:",
+      capErr,
+    );
+    return {
+      picked: 0,
+      succeeded: 0,
+      failed: 0,
+      skipped: false,
+      dailyUsed: 0,
+      dailyCap: DAILY_SUMMARIZE_CAP,
+      dailyCapped: true,
+    };
+  }
+  const dailyUsed = usedRaw ?? 0;
+  const remaining = Math.max(0, DAILY_SUMMARIZE_CAP - dailyUsed);
+  if (remaining === 0) {
+    return {
+      picked: 0,
+      succeeded: 0,
+      failed: 0,
+      skipped: false,
+      dailyUsed,
+      dailyCap: DAILY_SUMMARIZE_CAP,
+      dailyCapped: true,
+    };
+  }
+  // 残り枠が 1 run ぶんより少ない日は、その端数だけ処理する。
+  const effectiveLimit = Math.min(limit, remaining);
 
   // summary 未設定の記事を対象にする（新着が summary+tags を一括で得る）。
   // 既存の要約済み記事は対象外で、72h のキュレーション候補窓から自然に外れていく。
@@ -341,7 +414,7 @@ export async function annotateMissing(
       .is("summary", null)
       .not("content_html", "is", null)
       .order("published_at", { ascending: false, nullsFirst: false })
-      .limit(Math.min(limit * POOL_FACTOR, ANNOTATE_POOL_CAP));
+      .limit(Math.min(effectiveLimit * POOL_FACTOR, ANNOTATE_POOL_CAP));
     if (error) throw error;
     const pool = (data ?? []) as PoolRow[];
     rows = pool
@@ -350,11 +423,19 @@ export async function annotateMissing(
         rank: feedCredibility(r.feeds) + recencyDecay(r.published_at),
       }))
       .sort((a, b) => b.rank - a.rank)
-      .slice(0, limit)
+      .slice(0, effectiveLimit)
       .map((x) => x.row);
   } catch (e) {
     console.warn("アノテート対象の取得に失敗:", e);
-    return { picked: 0, succeeded: 0, failed: 0, skipped: false };
+    return {
+      picked: 0,
+      succeeded: 0,
+      failed: 0,
+      skipped: false,
+      dailyUsed,
+      dailyCap: DAILY_SUMMARIZE_CAP,
+      dailyCapped: false,
+    };
   }
 
   let succeeded = 0;
@@ -388,9 +469,11 @@ export async function annotateMissing(
             });
           if (tagErr) throw tagErr;
         }
+        // summarized_at は消費台帳（YAT-74）。summary と同じ update で書くので
+        // 「要約はあるが台帳に無い」というドリフトが原理的に起きない。
         const { error: upErr } = await supabase
           .from("articles")
-          .update({ summary })
+          .update({ summary, summarized_at: new Date().toISOString() })
           .eq("id", row.id);
         if (upErr) throw upErr;
       }),
@@ -405,5 +488,13 @@ export async function annotateMissing(
     });
   }
 
-  return { picked: rows.length, succeeded, failed, skipped: false };
+  return {
+    picked: rows.length,
+    succeeded,
+    failed,
+    skipped: false,
+    dailyUsed,
+    dailyCap: DAILY_SUMMARIZE_CAP,
+    dailyCapped: false,
+  };
 }

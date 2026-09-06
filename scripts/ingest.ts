@@ -47,6 +47,18 @@ async function main() {
   console.log(
     `要約+タグ: 成功 ${s.succeeded} / 失敗 ${s.failed}${s.skipped ? " (ANTHROPIC_API_KEY 未設定でスキップ)" : ""}`,
   );
+  // 消費台帳（YAT-74）。毎 run 出しておくと「今日いくら使ったか」が Actions のログから読める。
+  // クレジット枯渇のとき、この数字がプロジェクト側のどこにも無かったのが診断を遅らせた。
+  if (!s.skipped) {
+    console.log(
+      `  日次要約: ${s.dailyUsed + s.succeeded} / ${s.dailyCap} 件（UTC 日次上限）`,
+    );
+    if (s.dailyCapped) {
+      console.log(
+        `  ⚠ 日次上限に達したため要約を見送った。対象が無いのではなく上限で止まっている`,
+      );
+    }
+  }
 
   // 要約済み記事を embed（重複排除用。summary 済み×embedding NULL が対象。fail-soft）。
   const em = await embedMissing(supabase);
@@ -94,6 +106,8 @@ async function main() {
   // その run が赤かったのは別要因の feed 継続失敗が同時に出ていたからにすぎない）。
   //
   // 対象ゼロ（succeeded も failed も 0）は正常なので判定に入れない。
+  // 日次上限で止まった run（dailyCapped）も failed=0 なので発火しない。上限は正常な抑制であって
+  // 障害ではないため（上限に達したこと自体は上のログで可視化する）。
   const annotateDead = !s.skipped && s.failed > 0 && s.succeeded === 0;
   if (annotateDead) {
     console.error(
