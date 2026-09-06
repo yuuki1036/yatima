@@ -29,6 +29,10 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run discover
+        # job の timeout 超過は GitHub 側で cancel 扱いになり if: failure() を素通りする
+        # （learn.yml と同じ理由）。ステップ側に timeout を置いて failure に倒し、
+        # 下の alert-on-failure が拾えるようにする。job の timeout はその外側の保険。
+        timeout-minutes: 13
         env:
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}

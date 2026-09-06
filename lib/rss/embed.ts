@@ -241,10 +241,6 @@ export function cardCandidateEmbedText(row: CardEmbedFields): string {
 // 母集団が静かに欠ける。
 export const EMBED_RETENTION_DAYS = 35;
 
-// 1 run で NULL 化する上限。定常状態の流出は 1 日 165 件程度なので 2000 あれば十分だが、
-// 長時間止まっていた後でも 1 回の UPDATE が肥大しないように上限を置く。
-const PRUNE_LIMIT = 2000;
-
 export type PruneResult = {
   /** この run で embedding を NULL にした件数。 */
   pruned: number;
@@ -269,36 +265,46 @@ export async function pruneStaleEmbeddings(
     Date.now() - EMBED_RETENTION_DAYS * 86_400_000,
   ).toISOString();
 
-  const stale = () =>
-    supabase
-      .from("articles")
-      .select("id", { count: "exact", head: true })
-      .not("embedding", "is", null)
-      .lt("published_at", cutoff);
+  // 「窓外」= 保持窓より古い、または published_at 不明。後者を含めるのは、published_at NULL の
+  // 記事は near_dup 窓（published_at ベース）にも RAG（30 日窓）にも乗らず、embedding を持っても
+  // 使い道が無いため。ISO タイムスタンプにカンマは含まれないので or フィルタの区切りと衝突しない。
+  const staleFilter = <T extends { or: (f: string) => T; not: (c: string, op: string, v: unknown) => T }>(
+    q: T,
+  ): T => q.not("embedding", "is", null).or(`published_at.lt.${cutoff},published_at.is.null`);
 
-  const { data, error } = await supabase
-    .from("articles")
-    .select("id")
-    .not("embedding", "is", null)
-    .lt("published_at", cutoff)
-    .order("published_at", { ascending: true })
-    .limit(PRUNE_LIMIT);
-  if (error) {
-    console.warn("embedding prune の対象取得に失敗:", error);
+  // ID を列挙して .in() で更新すると URL 長超過で 400 になる（PostgREST の既知の落とし穴。
+  // 本プロジェクトは 755 件で実際に踏んでいる: knowledge supabase-in-filter-url-length-limit）。
+  // prune は WHERE 条件で書けるので ID 列挙は不要。UPDATE の WHERE 対象行数には max-rows 制限が
+  // かからないため、窓外がいくつあっても 1 リクエストで済む（embedding を NULL にするだけなので軽い）。
+  //
+  // 件数は「更新前の窓外数 − 更新後の窓外数」で出す。update に .select() を付けて全行を返させると
+  // 大量時に重いので、head+count の差分で数える。
+  const { count: before, error: beforeErr } = await staleFilter(
+    supabase.from("articles").select("id", { count: "exact", head: true }),
+  );
+  if (beforeErr) {
+    console.warn("embedding prune の対象件数取得に失敗:", beforeErr);
     return { pruned: 0, remaining: -1 };
   }
-  const ids = (data ?? []).map((r) => (r as { id: string }).id);
-  if (ids.length === 0) return { pruned: 0, remaining: 0 };
+  if ((before ?? 0) === 0) return { pruned: 0, remaining: 0 };
 
-  const { error: upErr } = await supabase
-    .from("articles")
-    .update({ embedding: null })
-    .in("id", ids);
+  const { error: upErr } = await staleFilter(
+    supabase.from("articles").update({ embedding: null }),
+  );
   if (upErr) {
     console.warn("embedding prune の更新に失敗:", upErr);
     return { pruned: 0, remaining: -1 };
   }
 
-  const { count } = await stale();
-  return { pruned: ids.length, remaining: count ?? 0 };
+  // 再カウントの失敗は remaining:0（全クリア）でなく -1（判定不能）に倒す。0 を返すと
+  // ingest 側の pruneStalled 検知をすり抜け、実際は残っているのに「排出完了」と誤報告する
+  // （knowledge fail-soft-return-breaks-ratio-logs）。update は成功しているので pruned は before。
+  const { count: after, error: afterErr } = await staleFilter(
+    supabase.from("articles").select("id", { count: "exact", head: true }),
+  );
+  if (afterErr) {
+    console.warn("embedding prune 後の残数取得に失敗:", afterErr);
+    return { pruned: before ?? 0, remaining: -1 };
+  }
+  return { pruned: (before ?? 0) - (after ?? 0), remaining: after ?? 0 };
 }

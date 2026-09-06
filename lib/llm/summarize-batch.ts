@@ -328,6 +328,12 @@ export type AnnotateBatchResult = {
    * 区別するために要る**（区別しないと、上限で止まっているのを「平常運転」と読んでしまう）。
    */
   dailyCapped: boolean;
+  /**
+   * 日次消費の台帳クエリ自体が失敗して要約を見送ったか（migration 0016 未適用・DB 障害など）。
+   * これは正常な抑制ではなく**障害**なので、呼び出し側は exit 1 で赤くすること。
+   * dailyCapped（上限到達＝正常）と混同すると「要約が止まっているのに緑」を作る。
+   */
+  capUnavailable: boolean;
 };
 
 export async function annotateMissing(
@@ -352,6 +358,7 @@ export async function annotateMissing(
       dailyUsed: 0,
       dailyCap: DAILY_SUMMARIZE_CAP,
       dailyCapped: false,
+      capUnavailable: false,
     };
   }
 
@@ -368,6 +375,10 @@ export async function annotateMissing(
     .select("id", { count: "exact", head: true })
     .gte("summarized_at", dayStart.toISOString());
   if (capErr) {
+    // 台帳クエリの失敗は「上限到達（dailyCapped）」ではなく障害。dailyCapped:true を返すと
+    // ログが「上限に達した」と嘘をつき、しかも failed=0 なので YAT-73 の全滅ガードも発火せず、
+    // 要約が止まったまま緑で流れる（本 PR が潰したかった構造を cap 導入で作り直すことになる）。
+    // capUnavailable で返し、呼び出し側が exit 1 する。
     console.warn(
       "日次要約数の取得に失敗（migration 0016 未適用の可能性）。上限が確認できないので要約を見送る:",
       capErr,
@@ -379,7 +390,8 @@ export async function annotateMissing(
       skipped: false,
       dailyUsed: 0,
       dailyCap: DAILY_SUMMARIZE_CAP,
-      dailyCapped: true,
+      dailyCapped: false,
+      capUnavailable: true,
     };
   }
   const dailyUsed = usedRaw ?? 0;
@@ -393,6 +405,7 @@ export async function annotateMissing(
       dailyUsed,
       dailyCap: DAILY_SUMMARIZE_CAP,
       dailyCapped: true,
+      capUnavailable: false,
     };
   }
   // 残り枠が 1 run ぶんより少ない日は、その端数だけ処理する。
@@ -435,6 +448,7 @@ export async function annotateMissing(
       dailyUsed,
       dailyCap: DAILY_SUMMARIZE_CAP,
       dailyCapped: false,
+      capUnavailable: false,
     };
   }
 
@@ -496,5 +510,6 @@ export async function annotateMissing(
     dailyUsed,
     dailyCap: DAILY_SUMMARIZE_CAP,
     dailyCapped: false,
+    capUnavailable: false,
   };
 }

@@ -68,6 +68,18 @@ async function main() {
       console.warn("ANTHROPIC_API_KEY 未設定でスキップ");
       break;
     }
+    // 日次上限（YAT-74）に達しても picked=0 になる。これを「全件完了」と誤判定すると、
+    // 大半が summary=NULL のまま偽の完了ログを出す。dailyCapped で区別して break 理由を分ける。
+    if (r.dailyCapped) {
+      console.log(
+        `日次上限（${r.dailyCap} 件）に達したので中断。残りは翌 UTC 日に再実行してください`,
+      );
+      break;
+    }
+    if (r.capUnavailable) {
+      console.error("日次台帳クエリに失敗（migration 0016 未適用の可能性）。中断します");
+      break;
+    }
     if (r.picked === 0) {
       console.log("全件完了");
       break;

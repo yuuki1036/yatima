@@ -57,7 +57,7 @@ async function main() {
   );
   // 消費台帳（YAT-74）。毎 run 出しておくと「今日いくら使ったか」が Actions のログから読める。
   // クレジット枯渇のとき、この数字がプロジェクト側のどこにも無かったのが診断を遅らせた。
-  if (!s.skipped) {
+  if (!s.skipped && !s.capUnavailable) {
     console.log(
       `  日次要約: ${s.dailyUsed + s.succeeded} / ${s.dailyCap} 件（UTC 日次上限）`,
     );
@@ -66,6 +66,14 @@ async function main() {
         `  ⚠ 日次上限に達したため要約を見送った。対象が無いのではなく上限で止まっている`,
       );
     }
+  }
+  if (s.capUnavailable) {
+    console.error(
+      `\n⚠ 日次消費の台帳クエリに失敗した（migration 0016 未適用の可能性）`,
+    );
+    console.error(
+      `  上限が確認できないため要約を見送った。これは上限到達ではなく障害なので赤くする`,
+    );
   }
 
   // 要約済み記事を embed（重複排除用。summary 済み×embedding NULL が対象。fail-soft）。
@@ -156,7 +164,13 @@ async function main() {
   }
 
   const allFailed = results.length > 0 && failed === results.length;
-  if (allFailed || stale.length > 0 || annotateDead || pruneStalled)
+  if (
+    allFailed ||
+    stale.length > 0 ||
+    annotateDead ||
+    pruneStalled ||
+    s.capUnavailable
+  )
     process.exit(1);
 }
 
