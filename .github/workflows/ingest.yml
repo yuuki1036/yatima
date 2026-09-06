@@ -14,6 +14,10 @@ concurrency:
 
 jobs:
   ingest:
+    # 失敗時に Issue を立てるため（下の alert-on-failure）。既定の read-only では作れない。
+    permissions:
+      contents: read
+      issues: write
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -30,3 +34,12 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
+
+      # 失敗を Issue に昇格させる（YAT-74）。検知が動いていても通知が無いと放置される
+      # ——実際 2026-08-26〜09-06 の 11 日間、全 run が赤のまま誰も見なかった。
+      - name: 失敗を Issue にする
+        if: failure()
+        uses: ./.github/actions/alert-on-failure
+        with:
+          job: ingest
+          token: ${{ secrets.GITHUB_TOKEN }}

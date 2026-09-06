@@ -1,0 +1,59 @@
+name: alert-on-failure
+description: >
+  cron ジョブの失敗を GitHub Issue に昇格させる。同じ workflow の open な Issue が既にあれば
+  コメントを足すだけにして、Issue が乱立しないようにする。
+
+# なぜ要るか（YAT-74）: 2026-08-19 にクレジットが尽きて要約が止まったとき、YAT-73 のガードは
+# 08-26 のマージ直後から正しく赤を出していた。にもかかわらず **11 日間誰も見なかった**。
+# 検知は動いていて、通知が無かった。Actions の失敗メールは他の通知に埋もれるが、
+# Issue は別経路で届き、閉じるまで一覧に残り続ける。
+#
+# あわせて実測で分かったこと: 失敗が続くと GitHub は schedule の発火自体を絞る
+# （08-25 まで 23 回/日 → 08-26 以降 2〜8 回/日）。赤を放置すると実行頻度まで削れるので、
+# 「赤に気付く」ことの価値は見た目より大きい。
+
+inputs:
+  job:
+    description: 失敗した cron の名前（Issue のタイトルに使う）
+    required: true
+  token:
+    description: issues:write を持つトークン
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        JOB: ${{ inputs.job }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        TITLE="[cron] ${JOB} が失敗している"
+
+        # 同一タイトルの open Issue を探す。--search はタイトル以外にも当たるので、
+        # 取得後に完全一致で絞る（部分一致で別 Issue に相乗りすると気付けなくなる）。
+        EXISTING=$(gh issue list --state open --label cron-failure --json number,title \
+          --jq "map(select(.title == \"${TITLE}\")) | .[0].number // empty")
+
+        if [ -n "$EXISTING" ]; then
+          gh issue comment "$EXISTING" --body "再発: ${RUN_URL}"
+          echo "既存 Issue #${EXISTING} にコメントした"
+          exit 0
+        fi
+
+        # ラベルは初回だけ作る。既にあれば失敗するので握り潰す。
+        gh label create cron-failure --color B60205 --description "cron ジョブの継続失敗" 2>/dev/null || true
+
+        BODY=$(printf '%s\n' \
+          "\`${JOB}\` の cron が失敗した。" \
+          "" \
+          "- 最初の失敗: ${RUN_URL}" \
+          "" \
+          "失敗が続くと GitHub が schedule の発火頻度を絞るため、放置すると実行回数まで落ちる" \
+          "（実測: 23 回/日 → 2〜8 回/日）。原因を直したらこの Issue を閉じること。" \
+          "再発すると同じ Issue にコメントが積まれる。")
+
+        gh issue create --title "$TITLE" --label cron-failure --body "$BODY"
+        echo "Issue を作成した"
