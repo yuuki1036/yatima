@@ -22,7 +22,7 @@ export function AskForm() {
           required
           rows={2}
           disabled={pending}
-          placeholder="蓄積した記事に質問する（例: 最近の AI エージェントの動向は？）"
+          placeholder="直近 1 ヶ月の記事に質問する（例: 最近の AI エージェントの動向は？）"
           className="resize-y border border-border bg-surface px-3 py-2 font-mono text-sm outline-none focus:border-accent disabled:opacity-50"
         />
         <button

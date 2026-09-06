@@ -17,7 +17,7 @@ export default function AskPage() {
       </div>
 
       <p className="mb-5 text-sm text-muted">
-        蓄積した記事を横断して質問できます。回答は記事を根拠に生成され、出典を表示します。
+        直近 1 ヶ月の記事を横断して質問できます。回答は記事を根拠に生成され、出典を表示します。
       </p>
 
       <AskForm />

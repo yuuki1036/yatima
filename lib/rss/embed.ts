@@ -220,3 +220,85 @@ export function cardCandidateEmbedText(row: CardEmbedFields): string {
       : [row.front, row.back].filter(Boolean).join(" ");
   return [body, row.source_quote].filter(Boolean).join("\n");
 }
+
+// ── embedding の保持窓（YAT-74）─────────────────────────────────────────────
+//
+// embedding は「貯めるもの」ではなく **30 日窓の生き物** として扱う。
+//
+// 理由はディスク。Supabase 無料枠は 500MB で、実測 417MB を使っており残り 83MB しかない。
+// 内訳は articles 399MB のうち embedding の TOAST 197MB ＋ HNSW index 126MB ＝ 323MB で、
+// **DB の 77% が embedding**。1 件あたり実効 12.2KB なので、現状の 165 件/日 でも
+// 約 40 日で無料枠が尽きる。
+//
+// 一方 embedding の用途は 2 つとも短期窓しか見ていない:
+//   - near_dup（YAT-55）: 30 日窓（lib/ranking/near-dup-window.ts の WINDOW_DAYS）
+//   - TODAY デッキの近重複除外: 72h
+// 長期の embedding を要求していたのは横断 Q&A（/ask）だけで、**RAG を 30 日窓に縮める判断**を
+// したのでこの制約は外れた。実測では 16,133 件中 11,189 件（69%）が 30 日窓の外にあった。
+//
+// 35 日なのは near_dup の 30 日窓に余裕を持たせるため。ちょうど 30 日で切ると、
+// prune と compute-dedup-rate の実行順によって窓の端の記事が embedding を失い、
+// 母集団が静かに欠ける。
+export const EMBED_RETENTION_DAYS = 35;
+
+// 1 run で NULL 化する上限。定常状態の流出は 1 日 165 件程度なので 2000 あれば十分だが、
+// 長時間止まっていた後でも 1 回の UPDATE が肥大しないように上限を置く。
+const PRUNE_LIMIT = 2000;
+
+export type PruneResult = {
+  /** この run で embedding を NULL にした件数。 */
+  pruned: number;
+  /** prune 後に窓外へ残っている件数（次 run 以降で消える分）。 */
+  remaining: number;
+};
+
+/**
+ * 保持窓より古い記事の embedding を NULL にする。
+ *
+ * **行は消さない。** 記事本体・要約・タグは残り、消えるのはベクタだけ。
+ * NULL 化で HNSW の部分 index（where embedding is not null）からも外れる。
+ *
+ * TOAST の領域は VACUUM で「再利用可能な空き」になるだけで OS には返らない。
+ * それでよい——目的はディスクを取り返すことではなく **増え続けるのを止める** ことで、
+ * 空いた領域は次の embedding が埋める。index の実サイズを縮めたいときだけ REINDEX する。
+ */
+export async function pruneStaleEmbeddings(
+  supabase: SupabaseClient,
+): Promise<PruneResult> {
+  const cutoff = new Date(
+    Date.now() - EMBED_RETENTION_DAYS * 86_400_000,
+  ).toISOString();
+
+  const stale = () =>
+    supabase
+      .from("articles")
+      .select("id", { count: "exact", head: true })
+      .not("embedding", "is", null)
+      .lt("published_at", cutoff);
+
+  const { data, error } = await supabase
+    .from("articles")
+    .select("id")
+    .not("embedding", "is", null)
+    .lt("published_at", cutoff)
+    .order("published_at", { ascending: true })
+    .limit(PRUNE_LIMIT);
+  if (error) {
+    console.warn("embedding prune の対象取得に失敗:", error);
+    return { pruned: 0, remaining: -1 };
+  }
+  const ids = (data ?? []).map((r) => (r as { id: string }).id);
+  if (ids.length === 0) return { pruned: 0, remaining: 0 };
+
+  const { error: upErr } = await supabase
+    .from("articles")
+    .update({ embedding: null })
+    .in("id", ids);
+  if (upErr) {
+    console.warn("embedding prune の更新に失敗:", upErr);
+    return { pruned: 0, remaining: -1 };
+  }
+
+  const { count } = await stale();
+  return { pruned: ids.length, remaining: count ?? 0 };
+}
