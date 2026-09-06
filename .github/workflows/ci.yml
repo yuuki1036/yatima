@@ -112,9 +112,16 @@ jobs:
           # GitHub は run の中身も式として評価するため、説明目的で書いただけでも workflow が
           # invalid になり job が 1 つも起動しない（実際に踏んだ。step ログすら残らない）。
           # 下の grep が文字クラスで書いてあるのはそのため。
+          # GITHUB_TOKEN は GitHub が run ごとに自動注入する組み込み secret で、
+          # gh secret set で登録するものではない（登録漏れという概念が無い）。DECLARED に足すと
+          # 「登録すべき secret」の一覧が嘘になり、optional-secrets.txt に足すのも意味が違う
+          # （あちらは "未登録でも機能が成立する secret" のリスト）。抽出段で落とすのが正しい。
+          BUILTIN_SECRETS='^(GITHUB_TOKEN)$'
           grep -rhoE '\$[{][{][^}]*[}][}]' .github/workflows/ \
             | grep -oE 'secrets\.[A-Za-z_][A-Za-z0-9_]*' \
-            | sed 's/^secrets\.//' | sort -u > /tmp/referenced.txt || true
+            | sed 's/^secrets\.//' \
+            | grep -vE "$BUILTIN_SECRETS" \
+            | sort -u > /tmp/referenced.txt || true
 
           printf '%s\n' $DECLARED | sort -u > /tmp/declared.txt
 

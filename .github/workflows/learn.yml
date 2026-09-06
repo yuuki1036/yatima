@@ -17,6 +17,10 @@ concurrency:
 
 jobs:
   learn:
+    # 失敗時に Issue を立てるため（下の alert-on-failure）。既定の read-only では作れない。
+    permissions:
+      contents: read
+      issues: write
     runs-on: ubuntu-latest
     # 生成 + Voyage embed（候補+補完・2問/チャンク・21s 間隔）のレート制限に加え、
     # feed 側 2 ステップ（窓のページング取得を各 1 回）ぶんの余白を持たせる。
@@ -76,3 +80,12 @@ jobs:
           NEAR_DUP_FRESH: ${{ steps.dedup.outcome == 'success' }}
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+      # 失敗を Issue に昇格させる（YAT-74）。検知が動いていても通知が無いと放置される
+      # ——実際 2026-08-26〜09-06 の 11 日間、全 run が赤のまま誰も見なかった。
+      - name: 失敗を Issue にする
+        if: failure()
+        uses: ./.github/actions/alert-on-failure
+        with:
+          job: learn
+          token: ${{ secrets.GITHUB_TOKEN }}

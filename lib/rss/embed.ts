@@ -220,3 +220,91 @@ export function cardCandidateEmbedText(row: CardEmbedFields): string {
       : [row.front, row.back].filter(Boolean).join(" ");
   return [body, row.source_quote].filter(Boolean).join("\n");
 }
+
+// ── embedding の保持窓（YAT-74）─────────────────────────────────────────────
+//
+// embedding は「貯めるもの」ではなく **30 日窓の生き物** として扱う。
+//
+// 理由はディスク。Supabase 無料枠は 500MB で、実測 417MB を使っており残り 83MB しかない。
+// 内訳は articles 399MB のうち embedding の TOAST 197MB ＋ HNSW index 126MB ＝ 323MB で、
+// **DB の 77% が embedding**。1 件あたり実効 12.2KB なので、現状の 165 件/日 でも
+// 約 40 日で無料枠が尽きる。
+//
+// 一方 embedding の用途は 2 つとも短期窓しか見ていない:
+//   - near_dup（YAT-55）: 30 日窓（lib/ranking/near-dup-window.ts の WINDOW_DAYS）
+//   - TODAY デッキの近重複除外: 72h
+// 長期の embedding を要求していたのは横断 Q&A（/ask）だけで、**RAG を 30 日窓に縮める判断**を
+// したのでこの制約は外れた。実測では 16,133 件中 11,189 件（69%）が 30 日窓の外にあった。
+//
+// 35 日なのは near_dup の 30 日窓に余裕を持たせるため。ちょうど 30 日で切ると、
+// prune と compute-dedup-rate の実行順によって窓の端の記事が embedding を失い、
+// 母集団が静かに欠ける。
+export const EMBED_RETENTION_DAYS = 35;
+
+export type PruneResult = {
+  /** この run で embedding を NULL にした件数。 */
+  pruned: number;
+  /** prune 後に窓外へ残っている件数（次 run 以降で消える分）。 */
+  remaining: number;
+};
+
+/**
+ * 保持窓より古い記事の embedding を NULL にする。
+ *
+ * **行は消さない。** 記事本体・要約・タグは残り、消えるのはベクタだけ。
+ * NULL 化で HNSW の部分 index（where embedding is not null）からも外れる。
+ *
+ * TOAST の領域は VACUUM で「再利用可能な空き」になるだけで OS には返らない。
+ * それでよい——目的はディスクを取り返すことではなく **増え続けるのを止める** ことで、
+ * 空いた領域は次の embedding が埋める。index の実サイズを縮めたいときだけ REINDEX する。
+ */
+export async function pruneStaleEmbeddings(
+  supabase: SupabaseClient,
+): Promise<PruneResult> {
+  const cutoff = new Date(
+    Date.now() - EMBED_RETENTION_DAYS * 86_400_000,
+  ).toISOString();
+
+  // 「窓外」= 保持窓より古い、または published_at 不明。後者を含めるのは、published_at NULL の
+  // 記事は near_dup 窓（published_at ベース）にも RAG（30 日窓）にも乗らず、embedding を持っても
+  // 使い道が無いため。ISO タイムスタンプにカンマは含まれないので or フィルタの区切りと衝突しない。
+  const staleFilter = <T extends { or: (f: string) => T; not: (c: string, op: string, v: unknown) => T }>(
+    q: T,
+  ): T => q.not("embedding", "is", null).or(`published_at.lt.${cutoff},published_at.is.null`);
+
+  // ID を列挙して .in() で更新すると URL 長超過で 400 になる（PostgREST の既知の落とし穴。
+  // 本プロジェクトは 755 件で実際に踏んでいる: knowledge supabase-in-filter-url-length-limit）。
+  // prune は WHERE 条件で書けるので ID 列挙は不要。UPDATE の WHERE 対象行数には max-rows 制限が
+  // かからないため、窓外がいくつあっても 1 リクエストで済む（embedding を NULL にするだけなので軽い）。
+  //
+  // 件数は「更新前の窓外数 − 更新後の窓外数」で出す。update に .select() を付けて全行を返させると
+  // 大量時に重いので、head+count の差分で数える。
+  const { count: before, error: beforeErr } = await staleFilter(
+    supabase.from("articles").select("id", { count: "exact", head: true }),
+  );
+  if (beforeErr) {
+    console.warn("embedding prune の対象件数取得に失敗:", beforeErr);
+    return { pruned: 0, remaining: -1 };
+  }
+  if ((before ?? 0) === 0) return { pruned: 0, remaining: 0 };
+
+  const { error: upErr } = await staleFilter(
+    supabase.from("articles").update({ embedding: null }),
+  );
+  if (upErr) {
+    console.warn("embedding prune の更新に失敗:", upErr);
+    return { pruned: 0, remaining: -1 };
+  }
+
+  // 再カウントの失敗は remaining:0（全クリア）でなく -1（判定不能）に倒す。0 を返すと
+  // ingest 側の pruneStalled 検知をすり抜け、実際は残っているのに「排出完了」と誤報告する
+  // （knowledge fail-soft-return-breaks-ratio-logs）。update は成功しているので pruned は before。
+  const { count: after, error: afterErr } = await staleFilter(
+    supabase.from("articles").select("id", { count: "exact", head: true }),
+  );
+  if (afterErr) {
+    console.warn("embedding prune 後の残数取得に失敗:", afterErr);
+    return { pruned: before ?? 0, remaining: -1 };
+  }
+  return { pruned: (before ?? 0) - (after ?? 0), remaining: after ?? 0 };
+}

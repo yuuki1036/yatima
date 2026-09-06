@@ -13,8 +13,16 @@ import {
 } from "../lib/rss/ingest-health";
 import { enrichMissingBodies } from "../lib/rss/enrich";
 import { annotateMissing } from "../lib/llm/summarize-batch";
-import { embedMissing } from "../lib/rss/embed";
+import {
+  embedMissing,
+  pruneStaleEmbeddings,
+  EMBED_RETENTION_DAYS,
+} from "../lib/rss/embed";
 import { curateToday } from "../lib/ranking/curate";
+
+// 窓外に残ってよい embedding の上限（YAT-74）。定常の流出は 1 日 165 件程度なので、
+// これを超えるのは prune が止まっているか、初回の積み残しが未消化かのどちらか。
+const EMBED_PRUNE_BACKLOG_LIMIT = 1000;
 
 async function main() {
   const supabase = createAdminClient();
@@ -47,12 +55,42 @@ async function main() {
   console.log(
     `要約+タグ: 成功 ${s.succeeded} / 失敗 ${s.failed}${s.skipped ? " (ANTHROPIC_API_KEY 未設定でスキップ)" : ""}`,
   );
+  // 消費台帳（YAT-74）。毎 run 出しておくと「今日いくら使ったか」が Actions のログから読める。
+  // クレジット枯渇のとき、この数字がプロジェクト側のどこにも無かったのが診断を遅らせた。
+  if (!s.skipped && !s.capUnavailable) {
+    console.log(
+      `  日次要約: ${s.dailyUsed + s.succeeded} / ${s.dailyCap} 件（UTC 日次上限）`,
+    );
+    if (s.dailyCapped) {
+      console.log(
+        `  ⚠ 日次上限に達したため要約を見送った。対象が無いのではなく上限で止まっている`,
+      );
+    }
+  }
+  if (s.capUnavailable) {
+    console.error(
+      `\n⚠ 日次消費の台帳クエリに失敗した（migration 0016 未適用の可能性）`,
+    );
+    console.error(
+      `  上限が確認できないため要約を見送った。これは上限到達ではなく障害なので赤くする`,
+    );
+  }
 
   // 要約済み記事を embed（重複排除用。summary 済み×embedding NULL が対象。fail-soft）。
   const em = await embedMissing(supabase);
   console.log(
     `embedding: 成功 ${em.succeeded} / 失敗 ${em.failed}${em.skipped ? " (VOYAGE_API_KEY 未設定でスキップ)" : ""}`,
   );
+
+  // 保持窓より古い embedding を落とす（YAT-74）。embedding は 30 日窓の生き物で、
+  // 貯め続けると Supabase 無料枠 500MB の 77% を占める（実測 417MB 中 323MB）。
+  // 行は消さずベクタだけ NULL にするので、記事・要約・タグは残る。
+  const pr = await pruneStaleEmbeddings(supabase);
+  if (pr.pruned > 0 || pr.remaining > 0) {
+    console.log(
+      `embedding prune: ${pr.pruned} 件を解放（${EMBED_RETENTION_DAYS}日より古い）/ 窓外の残り ${pr.remaining} 件`,
+    );
+  }
 
   // デッキを未判定10件へ補充（連続トップアップ。未判定が10件あれば skip で冪等）。
   // キュレーション失敗は ingest 全体を落とさない（fail-soft）。
@@ -94,6 +132,8 @@ async function main() {
   // その run が赤かったのは別要因の feed 継続失敗が同時に出ていたからにすぎない）。
   //
   // 対象ゼロ（succeeded も failed も 0）は正常なので判定に入れない。
+  // 日次上限で止まった run（dailyCapped）も failed=0 なので発火しない。上限は正常な抑制であって
+  // 障害ではないため（上限に達したこと自体は上のログで可視化する）。
   const annotateDead = !s.skipped && s.failed > 0 && s.succeeded === 0;
   if (annotateDead) {
     console.error(
@@ -108,8 +148,30 @@ async function main() {
   }
 
   // 全フィード失敗は「6 時間待たずに今すぐ赤くすべき」別の障害モードなので併存させる。
+  // prune が機能しなくなると embedding が単調増加し、無料枠 500MB を静かに食い潰す
+  // （残り 83MB / 1 件 12.2KB なので、止まれば 1 ヶ月強で書き込みごと落ちる）。
+  // 定常状態の窓外残りは 1 日ぶん（165 件程度）なので、1000 件を超えたら排出が追いついていない。
+  // remaining < 0 は取得自体の失敗（prune が一度も走っていない）なのでこれも異常に含める。
+  const pruneStalled = pr.remaining < 0 || pr.remaining > EMBED_PRUNE_BACKLOG_LIMIT;
+  if (pruneStalled) {
+    console.error(
+      `\n⚠ 保持窓より古い embedding が ${pr.remaining} 件残っている（上限 ${EMBED_PRUNE_BACKLOG_LIMIT}）`,
+    );
+    console.error(
+      `  排出が追いついていない。Supabase 無料枠 500MB のうち embedding が 77% を占めるため、`,
+    );
+    console.error(`  放置すると DB が満杯になり書き込みごと落ちる`);
+  }
+
   const allFailed = results.length > 0 && failed === results.length;
-  if (allFailed || stale.length > 0 || annotateDead) process.exit(1);
+  if (
+    allFailed ||
+    stale.length > 0 ||
+    annotateDead ||
+    pruneStalled ||
+    s.capUnavailable
+  )
+    process.exit(1);
 }
 
 main().catch((e) => {
