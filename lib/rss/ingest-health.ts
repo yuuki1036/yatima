@@ -1,4 +1,5 @@
 import type { IngestResult } from "./ingest";
+import type { EmbedSkipReason } from "./embed";
 
 // ingest の「継続失敗」検知（YAT-68）。
 //
@@ -111,7 +112,7 @@ export function isEmbedDead(em: {
 // ——天井は exit 1 にしない設計（永久赤を作らない）なので、その skip をここで赤に
 // 変換したら台無しになる。
 export function isEmbedStalled(
-  em: { skipReason?: string },
+  em: { skipReason?: EmbedSkipReason },
   counts: { embeddedLast26h: number; candidatesAvailable: number },
 ): boolean {
   return (

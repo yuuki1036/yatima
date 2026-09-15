@@ -6,20 +6,29 @@ import { createEmbedder, estimateTokens, type Embedder } from "@/lib/llm/embed";
 // 設計方針: fail-soft。例外は外へ漏らさず集計に畳む（embedding 由来でジョブを止めない）。
 // 既存の embedding NULL 行は次回実行で自然にバックフィルされる。
 
-export type EmbedBatchResult = {
+// skip の理由。ガード側（ingest-health）の carve-out 判定に使う。今は no_api_key のみで、
+// ディスク天井の disk_ceiling は YAT-77 で足す（embedStalled はその値を既に除外している）。
+export type EmbedSkipReason = "no_api_key" | "disk_ceiling";
+
+type EmbedBatchCounts = {
   picked: number; // embedding NULL から取得した件数
   succeeded: number;
   failed: number;
-  skipped: boolean; // 実行せずスキップした場合 true（理由は skipReason）
-  // skip の理由。ガード側（ingest-health）の carve-out 判定に使う。今は no_api_key のみで、
-  // ディスク天井の disk_ceiling は YAT-77 で足す（embedStalled はその値を既に除外している）。
-  skipReason?: "no_api_key" | "disk_ceiling";
   // この run の Voyage 実消費（usage.total_tokens の合算）と、estimateTokens による見積もり合計。
   // TPM 台帳（YAT-76）: 実測と見積もりを並べてログに出し、見積もり係数のずれを観測する。
   // embedder が消費を報告しない（モック等）場合は tokensUsed を持たない。
   tokensUsed?: number;
   tokensEstimated?: number;
 };
+
+// skipped と skipReason を判別可能ユニオンで結ぶ。skip したなら理由が必ず要る——
+// 天井 skip（YAT-77）を足すとき skipped だけ立てて skipReason を付け忘れると、
+// isEmbedStalled の carve-out（skipReason !== 'disk_ceiling'）が効かず、意図的に止めた run が
+// 永久赤になる。この付け忘れをコンパイルエラーにするのが目的。skipReason?: never で
+// 非 skip 側への理由の混入も塞ぐ。件数・トークンは skip 有無に関わらず読むので共通に残す。
+export type EmbedBatchResult =
+  | (EmbedBatchCounts & { skipped: true; skipReason: EmbedSkipReason })
+  | (EmbedBatchCounts & { skipped: false; skipReason?: never });
 
 // 1 回の実行で埋め込む上限。無料枠（3 RPM / 10K TPM）だと throughput が ~8.5K tokens/分に
 // 制限され、実測で 24 件 embed に約 4 分・ingest 全体で約 6 分かかった。cron の 10 分 timeout に
