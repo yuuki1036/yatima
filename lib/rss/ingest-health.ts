@@ -84,3 +84,49 @@ export function formatStale(staleMs: number): string {
     ? `${(hours / 24).toFixed(1)}日`
     : `${hours.toFixed(1)}時間`;
 }
+
+// ── embed / デッキ供給の静かな死の検知（YAT-76）──────────────────────────────
+//
+// 要約の全滅（YAT-73 の annotateDead）は赤くなるのに、embed の全滅・停滞とデッキ供給の
+// 枯渇は素通りしていた。実際に embed が 13 日間 1 件も進まず、気付いたのは feed 網羅率の
+// 週次低下からという遅すぎる検知が起票の理由。判定は純関数に閉じ、DB カウントの取得は
+// 呼び出し側（scripts/ingest.ts + lib/rss/embed.ts の embedHealthCounts）に置く。
+//
+// 取得失敗（-1）はどのガードも不活性にする。0 と混ぜると「進んでいない」偽陽性か
+// 「対象なし」偽陰性のどちらかに倒れるため、-1 は「判定不能」として warn だけ残す。
+
+// embed の run 内全滅。対象を拾ったのに 1 件も成功しなかった＝ Voyage 側の恒常障害
+// （キー失効・クレジット・レート制限の張り付き）。対象ゼロは正常なので発火しない。
+export function isEmbedDead(em: {
+  skipped: boolean;
+  picked: number;
+  succeeded: number;
+}): boolean {
+  return !em.skipped && em.picked > 0 && em.succeeded === 0;
+}
+
+// embed の生存判定。候補が積まれているのに直近 26h で 1 件も進んでいない。
+// run 単位の isEmbedDead と違い、「fail-soft で毎 run 静かに 0 件のまま流れる」型を捕まえる。
+// ディスク天井で意図的に止めた run（skipReason='disk_ceiling'・YAT-77 で実装）は除外する
+// ——天井は exit 1 にしない設計（永久赤を作らない）なので、その skip をここで赤に
+// 変換したら台無しになる。
+export function isEmbedStalled(
+  em: { skipReason?: string },
+  counts: { embeddedLast26h: number; candidatesAvailable: number },
+): boolean {
+  return (
+    em.skipReason !== "disk_ceiling" &&
+    counts.embeddedLast26h === 0 &&
+    counts.candidatesAvailable > 0
+  );
+}
+
+// デッキ供給の最終防衛線。curate が拾う候補（要約済み ∧ 未ピック ∧ 直近 72h）の実数が
+// この床を割ったら、取得・要約・選抜のどこが壊れていても最後にここで赤くなる。
+// 40 は日次 10 件×3 日ぶん＋余裕。候補が細るのは上流障害の遅行指標なので、床は
+// 「即死ではないが放置すると数日でデッキが空く」水準に置く。
+export const DECK_STARVED_FLOOR = 40;
+
+export function isDeckStarved(candidateCount: number): boolean {
+  return candidateCount >= 0 && candidateCount < DECK_STARVED_FLOOR;
+}
