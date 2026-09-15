@@ -24,10 +24,14 @@ export interface Embedder {
   // または最終的に失敗したチャンクの要素は null（部分成功を許容）。
   // 内部でレート制限に合わせて分割・待機・再試行する。
   embed(texts: string[]): Promise<(number[] | null)[]>;
+  // この Embedder が今までに消費した実トークンの累計（Voyage の usage.total_tokens）。
+  // TPM 台帳（YAT-76）用。テスト用のモック実装では省略できるよう optional にする。
+  usedTokens?(): number;
 }
 
 type VoyageResponse = {
   data: { embedding: number[]; index: number }[];
+  usage?: { total_tokens: number };
 };
 
 class RateLimitError extends Error {}
@@ -36,10 +40,21 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // 粗いトークン見積り。正確なトークナイザは持たないので「実トークン数の上限」になるよう
 // 保守的に見積もる（これにより TOKEN_BUDGET 遵守 → TPM 遵守が保証される）。
-// 日本語は Voyage の BPE で概ね 1 文字 ≒ 1 トークン前後になるため、安全側で 2.0 倍を使う
-// （英語は 1 文字 ≒ 0.25 トークンなので、混在でも 2.0 倍なら実数を下回らない）。
-function estimateTokens(text: string): number {
-  return Math.ceil(text.length * 2.0);
+//
+// 旧実装は一律 2.0 倍で、英語主体のテキスト（実際は 1 文字 ≒ 0.25 トークン）を最大 8 倍に
+// 過大見積もりしていた。10K TPM の無料枠では見積もりがそのまま予算消費になるため、
+// 過大なぶんだけ 1 リクエストに詰められる件数が減り、embed の消化が遅くなる（YAT-76）。
+// 文字種で分けて上限を締める: ASCII は 0.4 倍（実測 ~0.25 の上限）、それ以外（CJK・
+// アクセント付き・キリル等）は 1.5 倍（日本語の実測 ~1.0 前後の上限。希少漢字も覆う）。
+// どちらも実数を下回らない側に倒してあるので TPM 遵守の保証は変わらない。
+// 実測（usage.total_tokens）との突き合わせは ingest の TPM 台帳ログで行う。
+export function estimateTokens(text: string): number {
+  let ascii = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text.charCodeAt(i) <= 0x7f) ascii += 1;
+  }
+  const nonAscii = text.length - ascii;
+  return Math.ceil(ascii * 0.4 + nonAscii * 1.5);
 }
 
 // トークン上限と件数上限でリクエスト単位に分割する。単独で上限超のテキストは単体チャンクにする。
@@ -65,6 +80,15 @@ function chunkByTokens(texts: string[]): { text: string; index: number }[][] {
 }
 
 class VoyageEmbedder implements Embedder {
+  // 実消費トークンの累計（usage.total_tokens の合算）。10K TPM の無料枠で「1 run が
+  // いくら使ったか」を台帳としてログに出すため（YAT-76）。失敗チャンクは usage が
+  // 返らないので加算されない＝台帳は「実際に課金対象になった消費」を表す。
+  private tokensUsed = 0;
+
+  usedTokens(): number {
+    return this.tokensUsed;
+  }
+
   constructor(private apiKey: string) {}
 
   async embed(texts: string[]): Promise<(number[] | null)[]> {
@@ -136,6 +160,7 @@ class VoyageEmbedder implements Embedder {
     }
 
     const json = (await res.json()) as VoyageResponse;
+    this.tokensUsed += json.usage?.total_tokens ?? 0;
     // index 順に並べ直して入力順を保証する（API は index 付きで返す）。
     const out: number[][] = new Array(texts.length);
     for (const d of json.data) out[d.index] = d.embedding;

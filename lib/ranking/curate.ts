@@ -161,6 +161,27 @@ export function pickDeck(params: {
   return { scored, deduped, explored };
 }
 
+// デッキ候補の実数（deckStarved・YAT-76 の分母）。述語は curateToday の候補取得と同一
+// （未ピック ∧ 要約済み ∧ 直近 72h）に保つこと——ここがずれると「curate は拾えるのに赤い」
+// か「curate が枯れているのに緑」のどちらかになる。取得失敗は -1（判定不能）に倒す。
+export async function countDeckCandidates(
+  supabase: SupabaseClient,
+  now: number = Date.now(),
+): Promise<number> {
+  const since = new Date(now - CANDIDATE_WINDOW_HOURS * 3_600_000).toISOString();
+  const { count, error } = await supabase
+    .from("articles")
+    .select("id", { count: "exact", head: true })
+    .is("picked_date", null)
+    .not("summary", "is", null)
+    .gte("published_at", since);
+  if (error) {
+    console.warn("デッキ候補数の取得に失敗:", error);
+    return -1;
+  }
+  return count ?? -1;
+}
+
 export async function curateToday(
   supabase: SupabaseClient,
   opts: { now?: number; size?: number } = {},

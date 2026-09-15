@@ -9,16 +9,22 @@ import { ingestAllFeeds } from "../lib/rss/ingest";
 import {
   findStaleFeeds,
   formatStale,
+  isDeckStarved,
+  isEmbedDead,
+  isEmbedStalled,
+  DECK_STARVED_FLOOR,
   STALE_ALERT_HOURS,
 } from "../lib/rss/ingest-health";
 import { enrichMissingBodies } from "../lib/rss/enrich";
 import { annotateMissing } from "../lib/llm/summarize-batch";
 import {
+  embedHealthCounts,
   embedMissing,
   pruneStaleEmbeddings,
   EMBED_RETENTION_DAYS,
+  EMBED_STALL_WINDOW_HOURS,
 } from "../lib/rss/embed";
-import { curateToday } from "../lib/ranking/curate";
+import { countDeckCandidates, curateToday } from "../lib/ranking/curate";
 
 // 窓外に残ってよい embedding の上限（YAT-74）。定常の流出は 1 日 165 件程度なので、
 // これを超えるのは prune が止まっているか、初回の積み残しが未消化かのどちらか。
@@ -81,6 +87,14 @@ async function main() {
   console.log(
     `embedding: 成功 ${em.succeeded} / 失敗 ${em.failed}${em.skipped ? " (VOYAGE_API_KEY 未設定でスキップ)" : ""}`,
   );
+  // TPM 台帳（YAT-76）。無料枠 10K TPM の消費を毎 run 残す。見積もりを併記するのは
+  // estimateTokens の係数ずれ（過大だと 1 リクエストに詰められず消化が遅い）を実測と
+  // 突き合わせて観測するため。
+  if (em.tokensUsed !== undefined) {
+    console.log(
+      `  Voyage 消費: ${em.tokensUsed} tokens（見積もり ${em.tokensEstimated ?? "-"}・無料枠 10K TPM）`,
+    );
+  }
 
   // 保持窓より古い embedding を落とす（YAT-74）。embedding は 30 日窓の生き物で、
   // 貯め続けると Supabase 無料枠 500MB の 77% を占める（実測 417MB 中 323MB）。
@@ -152,6 +166,43 @@ async function main() {
   // （残り 83MB / 1 件 12.2KB なので、止まれば 1 ヶ月強で書き込みごと落ちる）。
   // 定常状態の窓外残りは 1 日ぶん（165 件程度）なので、1000 件を超えたら排出が追いついていない。
   // remaining < 0 は取得自体の失敗（prune が一度も走っていない）なのでこれも異常に含める。
+  // embed の静かな死（YAT-76）: 要約の annotateDead（YAT-73）の embed 版。
+  // embedDead は run 内の全滅（対象を拾ったのに成功 0）、embedStalled は 26h の停滞
+  // （候補が積まれているのに embedded_at が 1 件も進まない）。前者は即日、後者は
+  // fail-soft で「毎 run 静かに 0 件」のまま流れる型を捕まえる（実際に 13 日沈黙した）。
+  // カウントは embedMissing の後に取る＝この run の成功が分子に反映されてから判定する。
+  const eh = await embedHealthCounts(supabase);
+  const embedDead = isEmbedDead(em);
+  if (embedDead) {
+    console.error(`\n⚠ embedding が ${em.picked} 件すべて失敗している（成功 0）`);
+    console.error(
+      `  Voyage 呼び出しが全滅している可能性が高い（VOYAGE_API_KEY・クレジット・レート制限を確認）`,
+    );
+  }
+  const embedStalled = isEmbedStalled(em, eh);
+  if (embedStalled) {
+    console.error(
+      `\n⚠ embed 候補が ${eh.candidatesAvailable} 件あるのに、直近 ${EMBED_STALL_WINDOW_HOURS}h で 1 件も embed されていない`,
+    );
+    console.error(
+      `  run 単位では fail-soft で流れる型の停滞。embedding が付かない記事は近重複判定の母集団から欠け、`,
+    );
+    console.error(`  feed 網羅率が静かに下がる（過去に 13 日間沈黙した実績がある）`);
+  }
+
+  // デッキ供給の最終防衛線（YAT-76）: 取得・要約・選抜のどこが壊れても、curate が拾える
+  // 候補の実数が床を割ればここで赤くなる。個別ガードの取りこぼしに対する保険。
+  const deckCandidates = await countDeckCandidates(supabase);
+  const deckStarved = isDeckStarved(deckCandidates);
+  if (deckStarved) {
+    console.error(
+      `\n⚠ デッキ候補（要約済み・未ピック・72h）が ${deckCandidates} 件しかない（床 ${DECK_STARVED_FLOOR}）`,
+    );
+    console.error(
+      `  上流（取得・要約・選抜）のどこかが細っている。放置すると数日で TODAY デッキが空になる`,
+    );
+  }
+
   const pruneStalled = pr.remaining < 0 || pr.remaining > EMBED_PRUNE_BACKLOG_LIMIT;
   if (pruneStalled) {
     console.error(
@@ -168,6 +219,9 @@ async function main() {
     allFailed ||
     stale.length > 0 ||
     annotateDead ||
+    embedDead ||
+    embedStalled ||
+    deckStarved ||
     pruneStalled ||
     s.capUnavailable
   )

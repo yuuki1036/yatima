@@ -2,6 +2,10 @@ import { describe, it, expect } from "vitest";
 import {
   findStaleFeeds,
   formatStale,
+  isDeckStarved,
+  isEmbedDead,
+  isEmbedStalled,
+  DECK_STARVED_FLOOR,
   STALE_ALERT_HOURS,
 } from "@/lib/rss/ingest-health";
 import type { IngestResult } from "@/lib/rss/ingest";
@@ -113,5 +117,79 @@ describe("formatStale", () => {
   it("48 時間以上は日で出す", () => {
     expect(formatStale(48 * HOUR_MS)).toBe("2.0日");
     expect(formatStale(24 * 15 * HOUR_MS)).toBe("15.0日");
+  });
+});
+
+// ── YAT-76: embed / デッキ供給の静かな死 ─────────────────────────────────────
+// 「どの条件の組で赤くなるか」の関係を固定する。閾値の妥当性ではなく、carve-out
+// （skip 理由・対象ゼロ・判定不能 -1）が赤に変換されないことが本題。
+
+describe("isEmbedDead", () => {
+  it("対象を拾ったのに成功 0 なら dead", () => {
+    expect(isEmbedDead({ skipped: false, picked: 16, succeeded: 0 })).toBe(true);
+  });
+
+  it("1 件でも成功していれば dead ではない（部分失敗は fail-soft の想定内）", () => {
+    expect(isEmbedDead({ skipped: false, picked: 16, succeeded: 1 })).toBe(false);
+  });
+
+  it("対象ゼロは正常（発火しない）", () => {
+    expect(isEmbedDead({ skipped: false, picked: 0, succeeded: 0 })).toBe(false);
+  });
+
+  it("skip した run は判定しない（キー未設定は embedStalled 側が 26h で拾う）", () => {
+    expect(isEmbedDead({ skipped: true, picked: 0, succeeded: 0 })).toBe(false);
+  });
+});
+
+describe("isEmbedStalled", () => {
+  const idle = { embeddedLast26h: 0, candidatesAvailable: 30 };
+
+  it("候補があるのに 26h 実績ゼロなら stalled", () => {
+    expect(isEmbedStalled({}, idle)).toBe(true);
+  });
+
+  it("ディスク天井による意図的な skip は除外する（天井は exit 1 にしない設計）", () => {
+    expect(isEmbedStalled({ skipReason: "disk_ceiling" }, idle)).toBe(false);
+  });
+
+  it("キー未設定の skip は除外しない（キー喪失は 26h 経過で本物の障害として赤くする）", () => {
+    expect(isEmbedStalled({ skipReason: "no_api_key" }, idle)).toBe(true);
+  });
+
+  it("候補ゼロなら不活性（観測対象が無いのに赤くならない）", () => {
+    expect(
+      isEmbedStalled({}, { embeddedLast26h: 0, candidatesAvailable: 0 }),
+    ).toBe(false);
+  });
+
+  it("26h に 1 件でも進んでいれば生存", () => {
+    expect(
+      isEmbedStalled({}, { embeddedLast26h: 1, candidatesAvailable: 100 }),
+    ).toBe(false);
+  });
+
+  it("カウント取得失敗（-1）は判定不能として不活性", () => {
+    expect(
+      isEmbedStalled({}, { embeddedLast26h: -1, candidatesAvailable: 30 }),
+    ).toBe(false);
+    expect(
+      isEmbedStalled({}, { embeddedLast26h: 0, candidatesAvailable: -1 }),
+    ).toBe(false);
+  });
+});
+
+describe("isDeckStarved", () => {
+  it("床を割ったら starved", () => {
+    expect(isDeckStarved(DECK_STARVED_FLOOR - 1)).toBe(true);
+    expect(isDeckStarved(0)).toBe(true);
+  });
+
+  it("床ちょうどは starved ではない", () => {
+    expect(isDeckStarved(DECK_STARVED_FLOOR)).toBe(false);
+  });
+
+  it("カウント取得失敗（-1）は判定不能として不活性", () => {
+    expect(isDeckStarved(-1)).toBe(false);
   });
 });
