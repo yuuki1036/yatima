@@ -1,6 +1,7 @@
 // Voyage AI による埋め込み生成（Anthropic 推奨の embedding プロバイダ。Claude は embedding 非提供）。
 // API キーは VOYAGE_API_KEY（NEXT_PUBLIC_ は付けない＝サーバー専用）。呼び出し元は cron スクリプトのみ。
-// 用途は記事の重複排除（dedup）。title+summary を embed し pgvector に保存する。
+// 用途は記事の重複排除（dedup）。title＋本文冒頭を embed し pgvector に保存する（YAT-77 で
+// 要約から切り離した。テキストの作り方は lib/rss/embed.ts の articleEmbedText を参照）。
 //
 // 無料枠（支払い方法未登録）は 3 RPM / 10K TPM に絞られる。これを踏まえ embed() 内部で
 // トークン量に応じてリクエストを分割し、リクエスト間隔を空け、429 は指数バックオフで再試行する。
@@ -18,15 +19,25 @@ const MAX_PER_REQUEST = 128; // Voyage の 1 リクエスト最大入力数
 const MIN_INTERVAL_MS = 21_000; // リクエスト間隔（3 RPM ≒ 20s/req。余裕を見て 21s）
 const MAX_RETRIES = 4; // 429 リトライ回数
 const BACKOFF_BASE_MS = 25_000; // バックオフ初期待機（25s, 50s, ...）
+// 1 リクエスト（fetch＋レスポンス）の実測余裕（YAT-77）。締切判定で「次のチャンクを着手すると
+// リクエストが締切を跨ぐか」を見積もるために間隔に足す。実測 ~2s に保守側マージンを乗せる。
+const EXPECTED_REQUEST_MS = 3_000;
 
 export interface Embedder {
   // 複数テキストをまとめて埋め込む。返り値は入力と同順・同長で、各要素はベクトル、
   // または最終的に失敗したチャンクの要素は null（部分成功を許容）。
   // 内部でレート制限に合わせて分割・待機・再試行する。
-  embed(texts: string[]): Promise<(number[] | null)[]>;
+  // opts.deadlineMs（epoch ms）を渡すと、締切を跨ぎそうなチャンクは着手せず未着手のまま
+  // null を返す（次 run で拾う）。未指定なら締切なし＝従来の挙動（YAT-77 の壁時計予算）。
+  embed(texts: string[], opts?: { deadlineMs?: number }): Promise<(number[] | null)[]>;
   // この Embedder が今までに消費した実トークンの累計（Voyage の usage.total_tokens）。
   // TPM 台帳（YAT-76）用。テスト用のモック実装では省略できるよう optional にする。
   usedTokens?(): number;
+  // 直近の embed() で「締切に間に合わず着手しなかった」入力数（YAT-77）。usedTokens と同じ
+  // アクセサ方式にするのは返り値の配列契約（入力と同順・同長）を壊さないため。呼び出し側は
+  // attempted = picked - lastDeferred() で「失敗」と「未着手」を分ける（前者は Voyage 障害、
+  // 後者は単に次 run で拾うだけ）。モックでは省略可。
+  lastDeferred?(): number;
 }
 
 type VoyageResponse = {
@@ -37,6 +48,17 @@ type VoyageResponse = {
 class RateLimitError extends Error {}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// 締切まで needMs 以上残っているか（YAT-77 の壁時計予算）。deadlineMs 未指定なら常に true
+// （締切なし＝従来の挙動）。境界（残りちょうど needMs）は「間に合わない側」に倒す。
+// 純関数として export しテストで固定する（VoyageEmbedder は非 export のため）。
+export function hasTimeBudget(
+  deadlineMs: number | undefined,
+  needMs: number,
+  now: number = Date.now(),
+): boolean {
+  return deadlineMs === undefined || now + needMs < deadlineMs;
+}
 
 // 粗いトークン見積り。正確なトークナイザは持たないので「実トークン数の上限」になるよう
 // 保守的に見積もる（これにより TOKEN_BUDGET 遵守 → TPM 遵守が保証される）。
@@ -84,14 +106,24 @@ class VoyageEmbedder implements Embedder {
   // いくら使ったか」を台帳としてログに出すため（YAT-76）。失敗チャンクは usage が
   // 返らないので加算されない＝台帳は「実際に課金対象になった消費」を表す。
   private tokensUsed = 0;
+  // 直近の embed() で締切により未着手のまま残した入力数（YAT-77）。
+  private deferred = 0;
 
   usedTokens(): number {
     return this.tokensUsed;
   }
 
+  lastDeferred(): number {
+    return this.deferred;
+  }
+
   constructor(private apiKey: string) {}
 
-  async embed(texts: string[]): Promise<(number[] | null)[]> {
+  async embed(
+    texts: string[],
+    opts: { deadlineMs?: number } = {},
+  ): Promise<(number[] | null)[]> {
+    this.deferred = 0;
     if (texts.length === 0) return [];
 
     // 既定 null。成功したチャンクの要素だけ上書きする（部分成功を許容＝後半チャンク失敗で
@@ -100,10 +132,23 @@ class VoyageEmbedder implements Embedder {
     const chunks = chunkByTokens(texts);
 
     for (let i = 0; i < chunks.length; i++) {
-      if (i > 0) await sleep(MIN_INTERVAL_MS); // 3 RPM 遵守
+      const wait = i > 0 ? MIN_INTERVAL_MS : 0;
+      // 締切を跨ぎそうなら、以降のチャンクは着手せず未着手（deferred）として残す。null のまま
+      // 返るが「失敗」ではない——次 run で拾う。deferred と failed を分けるのは、締切の持ち越しを
+      // Voyage の恒常障害（isEmbedDead）と取り違えないため。
+      if (!hasTimeBudget(opts.deadlineMs, wait + EXPECTED_REQUEST_MS)) {
+        this.deferred = chunks.slice(i).reduce((s, c) => s + c.length, 0);
+        console.log(`embed 締切到達: 残り ${this.deferred} 件は次回 run に送る`);
+        break;
+      }
+      if (wait > 0) await sleep(wait); // 3 RPM 遵守
       const chunk = chunks[i];
       try {
-        const vecs = await this.embedChunkWithRetry(chunk.map((c) => c.text));
+        const vecs = await this.embedChunkWithRetry(
+          chunk.map((c) => c.text),
+          0,
+          opts.deadlineMs,
+        );
         // チャンク内の入力順 → 元の index に書き戻す。
         chunk.forEach((c, j) => {
           out[c.index] = vecs[j];
@@ -120,16 +165,22 @@ class VoyageEmbedder implements Embedder {
   }
 
   // 429 を指数バックオフで再試行する。それ以外のエラーは即時 throw。
+  // deadlineMs を渡すと、次のバックオフ待機で締切を跨ぐ場合は再試行せず throw する（YAT-77）。
+  // この経路は「実際に 429 を食ったチャンク」なので deferred ではなく failed に数える
+  // ——静かに握り潰すと Voyage 側のレート張り付きが見えなくなる。
   private async embedChunkWithRetry(
     texts: string[],
     attempt = 0,
+    deadlineMs?: number,
   ): Promise<number[][]> {
     try {
       return await this.embedChunk(texts);
     } catch (e) {
       if (e instanceof RateLimitError && attempt < MAX_RETRIES) {
-        await sleep(BACKOFF_BASE_MS * 2 ** attempt);
-        return this.embedChunkWithRetry(texts, attempt + 1);
+        const backoff = BACKOFF_BASE_MS * 2 ** attempt;
+        if (!hasTimeBudget(deadlineMs, backoff)) throw e;
+        await sleep(backoff);
+        return this.embedChunkWithRetry(texts, attempt + 1, deadlineMs);
       }
       throw e;
     }

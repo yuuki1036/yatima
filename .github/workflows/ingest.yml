@@ -4,7 +4,9 @@ name: ingest
 # Supabase 無料枠の「7日無活動で pause」も毎時アクセスで自然回避できる。
 on:
   schedule:
-    - cron: "0 * * * *" # 毎時 0 分（UTC）
+    # 毎時 17 分（UTC）。0 分は GitHub Actions が最も混雑して発火が遅延・欠落しやすいので
+    # ずらした（YAT-77・design doc open 5）。発火率の改善は段階 5 の観測で判定する。
+    - cron: "17 * * * *"
   workflow_dispatch: {} # Actions タブから手動実行
 
 # 同時に走らないように直列化
@@ -19,7 +21,8 @@ jobs:
       contents: read
       issues: write
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # embed の壁時計 3 分ぶんを載せて 10 → 15（YAT-77）。job の timeout はステップ timeout の外側の保険。
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -31,7 +34,8 @@ jobs:
         # job の timeout 超過は GitHub 側で cancel 扱いになり if: failure() を素通りする
         # （learn.yml と同じ理由）。ステップ側に timeout を置いて failure に倒し、
         # 下の alert-on-failure が拾えるようにする。job の timeout はその外側の保険。
-        timeout-minutes: 8
+        # embed の壁時計 3 分ぶんを載せて 8 → 13（YAT-77。job の 15 分の内側に収める）。
+        timeout-minutes: 13
         env:
           # GitHub リポジトリの Settings > Secrets and variables > Actions に登録する
           NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}

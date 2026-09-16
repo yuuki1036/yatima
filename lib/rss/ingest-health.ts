@@ -96,14 +96,39 @@ export function formatStale(staleMs: number): string {
 // 取得失敗（-1）はどのガードも不活性にする。0 と混ぜると「進んでいない」偽陽性か
 // 「対象なし」偽陰性のどちらかに倒れるため、-1 は「判定不能」として warn だけ残す。
 
-// embed の run 内全滅。対象を拾ったのに 1 件も成功しなかった＝ Voyage 側の恒常障害
+// embed の run 内全滅。**実際に試みた**のに 1 件も成功しなかった＝ Voyage 側の恒常障害
 // （キー失効・クレジット・レート制限の張り付き）。対象ゼロは正常なので発火しない。
+// 分子分母は attempted（= picked - deferred）で見る（YAT-77）: 壁時計締切で 1 チャンクしか
+// 着手できず残りを次 run に送った run では、picked を使うと「拾ったのに成功 0」の偽陽性が出る。
 export function isEmbedDead(em: {
   skipped: boolean;
-  picked: number;
+  attempted: number;
   succeeded: number;
 }): boolean {
-  return !em.skipped && em.picked > 0 && em.succeeded === 0;
+  return !em.skipped && em.attempted > 0 && em.succeeded === 0;
+}
+
+// embed ゲート全閉（day-0 回帰の署名・YAT-77）。候補（pending）はあるのに 1 件も選抜されない
+// （eligible === 0）＝ body_text_len >= 250 のゲートが全部弾いている（backfill 未了・trigger 停止・
+// feeds.active の異常）。天井 skip は除外（exit 1 にしない設計）。pending / eligible の -1
+// （取得不能）は両条件とも偽になり自動的に不活性。
+export function isEmbedGateStuck(em: {
+  skipReason?: EmbedSkipReason;
+  pending: number;
+  eligible: number;
+}): boolean {
+  return em.skipReason !== "disk_ceiling" && em.pending > 0 && em.eligible === 0;
+}
+
+// 選抜 RPC（select_embed_candidates）の恒常失敗（YAT-77）。embed の候補取得を RPC に寄せた結果
+// 生まれた新しい静かな死: RPC が落ち続けると pending/eligible が -1 になって上の 2 ガードが
+// 不活性化し、embed が止まったまま緑で流れる。単発失敗では鳴らさず、26h 実績ゼロと重なった
+// ときだけ赤くする（fail-soft を保ったまま「選抜が死んだまま緑」を塞ぐ）。
+export function isEmbedSelectStalled(
+  em: { selectError: string | null },
+  counts: { embeddedLast26h: number },
+): boolean {
+  return em.selectError !== null && counts.embeddedLast26h === 0;
 }
 
 // embed の生存判定。候補が積まれているのに直近 26h で 1 件も進んでいない。
