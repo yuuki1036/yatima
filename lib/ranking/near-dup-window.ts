@@ -1,4 +1,11 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
+import {
+  recipeOf,
+  EMBED_RECIPE_EPOCH,
+  type EmbedRecipe,
+  type RecipeCounts,
+} from "./embed-recipe";
+import { EMBED_MIN_BODY_LEN } from "../rss/embed";
 
 // near_dup_rate（feed の重複量産率・YAT-20）の「母集団の取り方」を一箇所に固定する。
 //
@@ -44,10 +51,19 @@ const SELECT_PAGE = 1000; // PostgREST 既定の 1 ページ上限。これを�
 // これは「安全弁」であって窓の定義ではない。到達したら窓が実質縮むので呼び出し側が警告する。
 export const FETCH_CAP = 20_000;
 
+// ゲート観点の集計（fetchWindowGateCounts）専用の安全弁。embedding 非 null に絞らず窓内の全記事を
+// 数えるため、母集団が embedding パス（FETCH_CAP）より大きい。現状の窓は約 18,910 行で FETCH_CAP に
+// 肉薄するので、この経路だけ別に広く取る。
+export const GATE_FETCH_CAP = 60_000;
+
+const emptyRecipeCounts = (): RecipeCounts => ({ legacy: 0, lead: 0 });
+
 export type WindowArticle = {
   feed_id: string;
   embedding: unknown;
   published_at: string | null;
+  /** レシピ判定（YAT-77）に使う。null / EPOCH 未満は legacy（title+summary）、以降は lead（title+lead）。 */
+  embedded_at: string | null;
 };
 
 export type WindowFetch = {
@@ -56,7 +72,19 @@ export type WindowFetch = {
   truncated: boolean;
   /** 窓の下端（ISO 8601）。 */
   since: string;
+  /** 窓内で embedding を持つ記事のレシピ内訳（YAT-77）。 */
+  byRecipe: RecipeCounts;
 };
+
+/** 取得済み行を指定レシピだけに絞る（YAT-77）。own と比較プールの両方に同じレシピを効かせる。
+ *  多数派が legacy かつ share 1.0（段階 3 前・revert 後）のとき 1 行も落とさない＝現行挙動に合流。
+ *  元配列は破壊しない。 */
+export function filterByRecipe(
+  rows: WindowArticle[],
+  recipe: EmbedRecipe,
+): WindowArticle[] {
+  return rows.filter((r) => recipeOf(r.embedded_at) === recipe);
+}
 
 /**
  * 直近 WINDOW_DAYS の「embedding を持つ記事」を新しい順に全件取得する。
@@ -70,11 +98,12 @@ export async function fetchWindowArticles(
 ): Promise<WindowFetch> {
   const since = new Date(now - WINDOW_DAYS * 86_400_000).toISOString();
   const rows: WindowArticle[] = [];
+  const byRecipe = emptyRecipeCounts();
   while (rows.length < FETCH_CAP) {
     const size = Math.min(SELECT_PAGE, FETCH_CAP - rows.length);
     const { data, error } = await supabase
       .from("articles")
-      .select("feed_id, embedding, published_at")
+      .select("feed_id, embedding, published_at, embedded_at")
       .gte("published_at", since)
       .not("embedding", "is", null)
       .order("published_at", { ascending: false })
@@ -86,10 +115,11 @@ export async function fetchWindowArticles(
     // db-max-rows が SELECT_PAGE より小さい環境で 1 ページ目から break し、残りを丸ごと取りこぼす
     // ——本モジュールが直したはずのバグを、警告も出さずに再発させる形になる。オフセットは要求幅
     // ではなく実取得件数（rows.length）で前進させるので、1 ページの実サイズが何であれ連続する。
-    if (batch.length === 0) return { rows, truncated: false, since };
+    if (batch.length === 0) return { rows, truncated: false, since, byRecipe };
+    for (const r of batch) byRecipe[recipeOf(r.embedded_at)] += 1;
     rows.push(...batch);
   }
-  return { rows, truncated: true, since };
+  return { rows, truncated: true, since, byRecipe };
 }
 
 /** feed ごとの窓内件数（embedding 列が非 null の記事）。 */
@@ -102,6 +132,10 @@ export type WindowFeedCounts = {
   truncated: boolean;
   /** 窓の下端（ISO 8601）。 */
   since: string;
+  /** 窓内で embedding を持つ記事のレシピ内訳（YAT-77・全 feed 合算）。 */
+  byRecipe: RecipeCounts;
+  /** feed_id → その feed のレシピ内訳（YAT-77）。 */
+  byFeedRecipe: Map<string, RecipeCounts>;
 };
 
 /**
@@ -126,23 +160,109 @@ export async function fetchWindowFeedCounts(
 ): Promise<WindowFeedCounts> {
   const since = new Date(now - WINDOW_DAYS * 86_400_000).toISOString();
   const byFeed = new Map<string, number>();
+  const byFeedRecipe = new Map<string, RecipeCounts>();
+  const byRecipe = emptyRecipeCounts();
   let embedded = 0;
   while (embedded < FETCH_CAP) {
     const size = Math.min(SELECT_PAGE, FETCH_CAP - embedded);
     const { data, error } = await supabase
       .from("articles")
-      .select("feed_id")
+      .select("feed_id, embedded_at")
       .gte("published_at", since)
       .not("embedding", "is", null)
       .order("published_at", { ascending: false })
       .order("id", { ascending: true })
       .range(embedded, embedded + size - 1);
     if (error) throw error;
-    const batch = (data ?? []) as unknown as { feed_id: string }[];
+    const batch = (data ?? []) as unknown as {
+      feed_id: string;
+      embedded_at: string | null;
+    }[];
     // 打ち切り条件は fetchWindowArticles と同じ理由で「0 件が返った」ときだけ。
-    if (batch.length === 0) return { byFeed, embedded, truncated: false, since };
-    for (const r of batch) byFeed.set(r.feed_id, (byFeed.get(r.feed_id) ?? 0) + 1);
+    if (batch.length === 0)
+      return { byFeed, embedded, truncated: false, since, byRecipe, byFeedRecipe };
+    for (const r of batch) {
+      byFeed.set(r.feed_id, (byFeed.get(r.feed_id) ?? 0) + 1);
+      const recipe = recipeOf(r.embedded_at);
+      byRecipe[recipe] += 1;
+      const fr = byFeedRecipe.get(r.feed_id) ?? emptyRecipeCounts();
+      fr[recipe] += 1;
+      byFeedRecipe.set(r.feed_id, fr);
+    }
     embedded += batch.length;
   }
-  return { byFeed, embedded, truncated: true, since };
+  return { byFeed, embedded, truncated: true, since, byRecipe, byFeedRecipe };
+}
+
+/** 窓内の「全記事」を embed ゲート観点で数える（YAT-77）。embedding の有無を問わない。
+ *  feed_health_snapshots の window_own_articles / window_own_eligible を埋めるための母集団で、
+ *  「記事はあるがゲート（body_text_len >= 250）で弾かれて embed されない」を feed 単位で切り分ける。 */
+export type WindowGateCounts = {
+  /** feed_id → { 窓内の記事数, うちゲートを通る（body_text_len >= 250）件数 }。 */
+  byFeed: Map<string, { articles: number; eligible: number }>;
+  /** 窓内の記事総数。 */
+  articles: number;
+  /** うちゲートを通る総数。 */
+  eligible: number;
+  /** GATE_FETCH_CAP に達して古い側を切り捨てたか。embedding パスの truncated とは影響が違う。 */
+  truncated: boolean;
+  /** 窓の下端（ISO 8601）。 */
+  since: string;
+};
+
+export async function fetchWindowGateCounts(
+  supabase: SupabaseClient,
+  now: number,
+): Promise<WindowGateCounts> {
+  const since = new Date(now - WINDOW_DAYS * 86_400_000).toISOString();
+  const byFeed = new Map<string, { articles: number; eligible: number }>();
+  let articles = 0;
+  let eligible = 0;
+  while (articles < GATE_FETCH_CAP) {
+    const size = Math.min(SELECT_PAGE, GATE_FETCH_CAP - articles);
+    const { data, error } = await supabase
+      .from("articles")
+      .select("feed_id, body_text_len")
+      .gte("published_at", since)
+      .order("published_at", { ascending: false })
+      .order("id", { ascending: true })
+      .range(articles, articles + size - 1);
+    if (error) throw error;
+    const batch = (data ?? []) as unknown as {
+      feed_id: string;
+      body_text_len: number | null;
+    }[];
+    if (batch.length === 0)
+      return { byFeed, articles, eligible, truncated: false, since };
+    for (const r of batch) {
+      const isEligible = (r.body_text_len ?? 0) >= EMBED_MIN_BODY_LEN;
+      const cur = byFeed.get(r.feed_id) ?? { articles: 0, eligible: 0 };
+      cur.articles += 1;
+      if (isEligible) {
+        cur.eligible += 1;
+        eligible += 1;
+      }
+      byFeed.set(r.feed_id, cur);
+    }
+    articles += batch.length;
+  }
+  return { byFeed, articles, eligible, truncated: true, since };
+}
+
+/** 新レシピ（title+lead）で embedding された最初の時刻（YAT-77・45 日 clock の耐久 probe）。
+ *  行が無ければ null。**窓で絞らない**——窓外に落ちても clock は動き続ける必要がある。
+ *  embedded_at は prune では消えない（pruneStaleEmbeddings は embedding のみ NULL 化）ので耐久。
+ *  取得失敗は throw（週次 1 回・判定不能を緑で流さない。null は「行が無い」に予約済み）。 */
+export async function firstLeadEmbeddedAt(
+  supabase: SupabaseClient,
+): Promise<string | null> {
+  const { data, error } = await supabase
+    .from("articles")
+    .select("embedded_at")
+    .gte("embedded_at", EMBED_RECIPE_EPOCH)
+    .order("embedded_at", { ascending: true })
+    .limit(1);
+  if (error) throw error;
+  const rows = (data ?? []) as unknown as { embedded_at: string | null }[];
+  return rows[0]?.embedded_at ?? null;
 }

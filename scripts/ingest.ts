@@ -12,6 +12,8 @@ import {
   isDeckStarved,
   isEmbedDead,
   isEmbedStalled,
+  isEmbedGateStuck,
+  isEmbedSelectStalled,
   DECK_STARVED_FLOOR,
   STALE_ALERT_HOURS,
 } from "../lib/rss/ingest-health";
@@ -21,6 +23,7 @@ import {
   embedHealthCounts,
   embedMissing,
   pruneStaleEmbeddings,
+  DISK_CEILING_BYTES,
   EMBED_RETENTION_DAYS,
   EMBED_STALL_WINDOW_HOURS,
 } from "../lib/rss/embed";
@@ -82,11 +85,40 @@ async function main() {
     );
   }
 
-  // 要約済み記事を embed（重複排除用。summary 済み×embedding NULL が対象。fail-soft）。
+  // デッキを未判定10件へ補充（連続トップアップ。未判定が10件あれば skip で冪等）。
+  // キュレーション失敗は ingest 全体を落とさない（fail-soft）。
+  // embed の前に置く（YAT-77）: embed は壁時計 3 分を使う最長ステップなので、その下流に curate を
+  // 置くと timeout でデッキ補充が巻き添えで落ちる。
+  // トレードオフ: curate の近重複除外は DB の embedding 列を読むため、この run で新規 embed される
+  // 候補は curate 時点では embedding NULL で dedup 母集団から外れる（同一 run 内の dedup が弱まる）。
+  // 切り離し後（YAT-77）embedding は要約・デッキ入りより前の run で概ね済むため取りこぼしは embed
+  // バックログ滞留時に限られ、timeout でデッキ補充ごと落ちるリスクの方を重く見て embed を後段に置く。
+  try {
+    const c = await curateToday(supabase);
+    console.log(
+      c.skipped
+        ? `キュレーション: デッキ充足のため補充なし`
+        : `キュレーション: デッキに ${c.picked}件 を補充${c.explored ? `（探索枠 ${c.explored}件）` : ""}${c.deduped ? `（近重複 ${c.deduped}件を除外）` : ""}`,
+    );
+  } catch (e) {
+    console.warn("キュレーション失敗:", e);
+  }
+
+  // 記事を embed（重複排除用。要約から切り離し・title＋本文冒頭 250 字・YAT-77）。
+  // select_embed_candidates で選抜し、ディスク天井 450MB 超なら disk_ceiling で見送る（fail-soft）。
   const em = await embedMissing(supabase);
-  console.log(
-    `embedding: 成功 ${em.succeeded} / 失敗 ${em.failed}${em.skipped ? " (VOYAGE_API_KEY 未設定でスキップ)" : ""}`,
-  );
+  if (em.skipReason === "disk_ceiling") {
+    console.warn(
+      `embedding: DB が ${DISK_CEILING_BYTES} bytes を超えたため見送った（disk_ceiling）。` +
+        `これは障害ではないので赤くしない。content_html の保持窓（別テーマ）を検討する時期`,
+    );
+  } else {
+    console.log(
+      `embedding: 成功 ${em.succeeded} / 失敗 ${em.failed} / 締切持ち越し ${em.deferred}` +
+        `（候補 ${em.pending} → 選抜 ${em.eligible} → 取得 ${em.picked}）` +
+        (em.skipped ? " (VOYAGE_API_KEY 未設定でスキップ)" : ""),
+    );
+  }
   // TPM 台帳（YAT-76）。無料枠 10K TPM の消費を毎 run 残す。見積もりを併記するのは
   // estimateTokens の係数ずれ（過大だと 1 リクエストに詰められず消化が遅い）を実測と
   // 突き合わせて観測するため。
@@ -104,19 +136,6 @@ async function main() {
     console.log(
       `embedding prune: ${pr.pruned} 件を解放（${EMBED_RETENTION_DAYS}日より古い）/ 窓外の残り ${pr.remaining} 件`,
     );
-  }
-
-  // デッキを未判定10件へ補充（連続トップアップ。未判定が10件あれば skip で冪等）。
-  // キュレーション失敗は ingest 全体を落とさない（fail-soft）。
-  try {
-    const c = await curateToday(supabase);
-    console.log(
-      c.skipped
-        ? `キュレーション: デッキ充足のため補充なし`
-        : `キュレーション: デッキに ${c.picked}件 を補充${c.explored ? `（探索枠 ${c.explored}件）` : ""}${c.deduped ? `（近重複 ${c.deduped}件を除外）` : ""}`,
-    );
-  } catch (e) {
-    console.warn("キュレーション失敗:", e);
   }
 
   // ── 失敗の可視化（YAT-68）─────────────────────────────────────────────
@@ -171,10 +190,11 @@ async function main() {
   // （候補が積まれているのに embedded_at が 1 件も進まない）。前者は即日、後者は
   // fail-soft で「毎 run 静かに 0 件」のまま流れる型を捕まえる（実際に 13 日沈黙した）。
   // カウントは embedMissing の後に取る＝この run の成功が分子に反映されてから判定する。
-  const eh = await embedHealthCounts(supabase);
+  const eh = await embedHealthCounts(supabase, em);
   const embedDead = isEmbedDead(em);
   if (embedDead) {
-    console.error(`\n⚠ embedding が ${em.picked} 件すべて失敗している（成功 0）`);
+    // 判定と同じ attempted で件数を出す（picked だと壁時計持ち越し deferred ぶんまで「失敗」と過大表示する）。
+    console.error(`\n⚠ embedding が ${em.attempted} 件すべて失敗している（成功 0）`);
     console.error(
       `  Voyage 呼び出しが全滅している可能性が高い（VOYAGE_API_KEY・クレジット・レート制限を確認）`,
     );
@@ -188,6 +208,28 @@ async function main() {
       `  run 単位では fail-soft で流れる型の停滞。embedding が付かない記事は近重複判定の母集団から欠け、`,
     );
     console.error(`  feed 網羅率が静かに下がる（過去に 13 日間沈黙した実績がある）`);
+  }
+
+  // embed ゲート全閉（YAT-77・day-0 回帰の署名）: 候補はあるのに body_text_len >= 250 が全部弾く。
+  const embedGateStuck = isEmbedGateStuck(em);
+  if (embedGateStuck) {
+    console.error(
+      `\n⚠ embed 候補 ${em.pending} 件に対し選抜が 0 件（body_text_len >= 250 のゲートが全閉）`,
+    );
+    console.error(
+      `  backfill:body-text-len の未了 / body_text_len trigger の停止 / feeds.active を疑う`,
+    );
+  }
+
+  // 選抜 RPC の恒常失敗（YAT-77）: 候補取得を RPC に寄せた結果生まれた静かな死。RPC が落ち続けると
+  // pending/eligible が -1 になって上の 2 ガードが不活性化し、embed が止まったまま緑で流れる。
+  const embedSelectStalled = isEmbedSelectStalled(em, eh);
+  if (embedSelectStalled) {
+    console.error(
+      `\n⚠ select_embed_candidates が失敗し、直近 ${EMBED_STALL_WINDOW_HOURS}h で 1 件も embed されていない`,
+    );
+    console.error(`  RPC エラー: ${em.selectError}`);
+    console.error(`  migration 0017 の未適用 / RPC の権限（service_role）を疑う`);
   }
 
   // デッキ供給の最終防衛線（YAT-76）: 取得・要約・選抜のどこが壊れても、curate が拾える
@@ -221,6 +263,8 @@ async function main() {
     annotateDead ||
     embedDead ||
     embedStalled ||
+    embedGateStuck ||
+    embedSelectStalled ||
     deckStarved ||
     pruneStalled ||
     s.capUnavailable

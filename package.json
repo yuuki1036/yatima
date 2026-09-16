@@ -20,6 +20,7 @@
     "diagnose-card-grounding": "tsx scripts/diagnose-card-grounding.ts",
     "diagnose-dedup": "tsx scripts/diagnose-dedup.ts",
     "diagnose-feed-health": "tsx scripts/diagnose-feed-health.ts",
+    "diagnose-cross-recipe": "tsx scripts/diagnose-cross-recipe.ts",
     "diagnose-mastery": "tsx scripts/diagnose-mastery.ts",
     "compute-dedup-rate": "tsx scripts/compute-dedup-rate.ts",
     "snapshot-feed-health": "tsx scripts/snapshot-feed-health.ts",

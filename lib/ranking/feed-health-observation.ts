@@ -9,10 +9,22 @@ import {
 import { loadSourcePrefs } from "./preferences";
 import {
   fetchWindowFeedCounts,
+  fetchWindowGateCounts,
   WINDOW_DAYS,
   PER_FEED_LIMIT,
 } from "./near-dup-window";
+import {
+  majorityRecipe,
+  type EmbedRecipe,
+  type RecipeCounts,
+} from "./embed-recipe";
 import type { Feed } from "../types";
+
+// near_dup を算出できた active feed 数（feedsWithRate）の週次下限（YAT-77）。段階 3/4 の受け入れは
+// この値が 13 → 21（構造上限）へ回復すること。12 未満は母集団が痩せた異常（snapshot が exit 1）。
+// ただし near_dup_fresh=false（混在期・compute 失敗）のときは feedsWithRate=0 が正常なので、
+// ガードは fresh のときだけ有効化する（呼び出し側 snapshot-feed-health.ts）。
+export const FEEDS_WITH_RATE_FLOOR = 12;
 
 // 退役スコアリングの「観測 1 回分」を組み立てる共有モジュール（YAT-55 観測 ⑥）。
 //
@@ -62,6 +74,13 @@ export type FeedObservation = {
    * 実数ではなくこちらを使うこと（実数を使うと 100 超の feed で安定性を過大評価する）。
    */
   ownArticles: number;
+  /** 窓内の自 feed 記事総数（embedding の有無を問わない・YAT-77）。0017 の window_own_articles。 */
+  windowOwnArticles: number;
+  /** うち embed ゲート（body_text_len >= 250）を通る件数（YAT-77）。0017 の window_own_eligible。
+   *  「記事はあるがゲートで弾かれて embed されない」を feed 単位で切り分ける。 */
+  windowOwnEligible: number;
+  /** 窓内で embedding を持つ自 feed 記事のレシピ内訳（YAT-77）。 */
+  windowOwnRecipe: RecipeCounts;
 };
 
 /**
@@ -82,6 +101,16 @@ export type ObservationWindow = {
   coverage: number;
   /** FETCH_CAP に達して古い側を切り捨てたか。true なら窓が実質縮んでいる。 */
   truncated: boolean;
+  /** 窓内で embedding を持つ記事のレシピ内訳（YAT-77・全 feed 合算）。 */
+  byRecipe: RecipeCounts;
+  /** byRecipe の多数派とその share（レシピ移行の進行度）。 */
+  majority: { recipe: EmbedRecipe; share: number; total: number };
+  /** レシピ別網羅率（そのレシピの embedded 数 / articles）。移行期の表示・記録に使う。 */
+  coverageByRecipe: Record<EmbedRecipe, number>;
+  /** fetchWindowGateCounts 由来。窓内でゲート（body_text_len >= 250）を通る記事数。 */
+  eligible: number;
+  /** ゲート集計の truncated（GATE_FETCH_CAP 到達）。embedding パスの truncated とは別物。 */
+  gateTruncated: boolean;
 };
 
 export type FeedHealthObservation = {
@@ -98,6 +127,9 @@ export type FeedHealthObservation = {
    * 誤読されるので、呼び出し側が**理由まで**提示すること。
    */
   prefsError: unknown;
+  /** near_dup_rate が非 null の active feed 数（YAT-77）。段階 3/4 の受け入れ判定（13 → 21）。
+   *  near_dup_rate=0.00 は最も多い実値なので、!r.input.near_dup_rate でなく !== null で数える。 */
+  feedsWithRate: number;
 };
 
 /**
@@ -166,20 +198,20 @@ export async function collectFeedHealthObservation(
     embedded,
     truncated,
     since,
+    byRecipe,
+    byFeedRecipe,
   } = await fetchWindowFeedCounts(supabase, now);
 
-  // 窓内の記事「総数」。窓の取得は embedding 非 null に絞っているので別途数える。
-  // これが無いと「窓が痩せている」と「そもそも記事が少ない」を区別できない。
-  const { count: windowTotal, error: wErr } = await supabase
-    .from("articles")
-    .select("id", { count: "exact", head: true })
-    .gte("published_at", since);
-  if (wErr) throw wrap("窓内の記事数の取得に失敗", wErr);
-  const articlesTotal = windowTotal ?? 0;
+  // 窓内の記事「総数」＋ゲート（body_text_len >= 250）を通る件数を feed 別に数える（YAT-77）。
+  // 以前は head+count で総数だけ取っていたが、gate 集計と同一スキャン由来にすると
+  // 「記事はあるがゲートで弾かれて embed されない」を feed 単位で切り分けられる（0017 の 2 列）。
+  const gate = await fetchWindowGateCounts(supabase, now);
+  const articlesTotal = gate.articles;
 
   const rows: FeedObservation[] = inputs.map((input) => {
     const recent = input.recentPublishedAt ?? [];
     const own = perFeed.get(input.id) ?? 0;
+    const g = gate.byFeed.get(input.id);
     return {
       input,
       result: evaluateFeedHealth(input, now),
@@ -188,9 +220,17 @@ export async function collectFeedHealthObservation(
       deadMs: deadThresholdMs(recent),
       windowOwnEmbedded: own,
       ownArticles: Math.min(own, PER_FEED_LIMIT),
+      windowOwnArticles: g?.articles ?? 0,
+      windowOwnEligible: g?.eligible ?? 0,
+      windowOwnRecipe: byFeedRecipe.get(input.id) ?? { legacy: 0, lead: 0 },
     };
   });
   rows.sort((a, b) => b.result.score - a.result.score);
+
+  const majority = majorityRecipe(byRecipe);
+  const feedsWithRate = rows.filter(
+    (r) => r.input.near_dup_rate !== null,
+  ).length;
 
   return {
     now,
@@ -203,8 +243,17 @@ export async function collectFeedHealthObservation(
       embedded,
       coverage: articlesTotal === 0 ? 0 : embedded / articlesTotal,
       truncated,
+      byRecipe,
+      majority,
+      coverageByRecipe: {
+        legacy: articlesTotal === 0 ? 0 : byRecipe.legacy / articlesTotal,
+        lead: articlesTotal === 0 ? 0 : byRecipe.lead / articlesTotal,
+      },
+      eligible: gate.eligible,
+      gateTruncated: gate.truncated,
     },
     prefsError,
+    feedsWithRate,
   };
 }
 
@@ -215,9 +264,16 @@ export async function collectFeedHealthObservation(
  * 両方出すと同じ事実が 2 回並ぶ。
  */
 export function describeWindow(w: ObservationWindow): string {
-  return (
+  const base =
     `窓 ${WINDOW_DAYS}d: 記事 ${w.articles} 件 / embedding 付き ${w.embedded} 件` +
-    `（網羅率 ${(w.coverage * 100).toFixed(1)}%）`
+    `（網羅率 ${(w.coverage * 100).toFixed(1)}%）`;
+  // 平常時（share 1.0）はレシピ内訳を出さない。移行期（混在）だけ多数派 share を併記する（YAT-77）。
+  if (w.majority.share >= 1 || w.majority.total === 0) return base;
+  return (
+    base +
+    `｜legacy ${w.byRecipe.legacy}（${(w.coverageByRecipe.legacy * 100).toFixed(1)}%）` +
+    ` / lead ${w.byRecipe.lead}（${(w.coverageByRecipe.lead * 100).toFixed(1)}%）` +
+    `・多数派 ${w.majority.recipe} ${w.majority.share.toFixed(2)}`
   );
 }
 

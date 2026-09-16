@@ -54,9 +54,13 @@ export async function enrichArticleBody(
       reason: `取得本文が元より長くない（${got} <= ${had} 文字）`,
     };
   }
+  // 本文を差し替えたら embedding も落とす（YAT-77）。「本文が変わったら埋め直す」を構造で保証する
+  // ——旧本文から作った embedding を残すと near_dup の母集団が古い本文のベクタで汚れる。
+  // body_text_len は 0017 の trigger（update of content_html）が再計算する。
+  // この関数は再アノテート経路（YAT-13）からも呼ばれるが、そちらでも同じ不変条件が要る。
   const { error } = await supabase
     .from("articles")
-    .update({ content_html: content })
+    .update({ content_html: content, embedding: null, embedded_at: null })
     .eq("id", row.id);
   if (error) throw error;
   return { ok: true, content };
@@ -75,7 +79,14 @@ export async function enrichMissingBodies(
       .from("articles")
       .select("id, url, content_html")
       .is("summary", null)
+      // 試行済みは除外（YAT-77）。enrich の契約は「1 回だけ試す」——成否に関わらず enriched_at を
+      // 立てるので、途中で死んだ行を無限に取りに行かない。再試行したいときは enriched_at を手で null に。
+      .is("enriched_at", null)
       .not("url", "is", null)
+      // 本文が薄い候補を DB 側で粗く絞る（YAT-77）。body_text_len は 0017 の trigger 値。
+      // NULL（backfill 未了・trigger 前の行）は .lt から漏れるので or で拾い、最終判定は下の
+      // JS isThinBody（content_html を直接読むので NULL でも正しい）に委ねる。
+      .or(`body_text_len.lt.${THIN_BODY_CHARS},body_text_len.is.null`)
       .order("published_at", { ascending: false, nullsFirst: false })
       .limit(limit);
     if (error) throw error;
@@ -85,13 +96,27 @@ export async function enrichMissingBodies(
     return { thin: 0, enriched: 0, failed: 0 };
   }
 
-  // 本文が薄いものだけ対象に絞る（全文配信フィードはここで除外される）。
+  // 本文が薄いものだけ対象に絞る（全文配信フィードはここで除外される）。DB の粗フィルタが
+  // body_text_len ベースなのに対し、ここは content_html を直接読む最終判定（NULL 行も正しく扱う）。
   const targets = rows.filter((r) => r.url && isThinBody(r.content_html));
 
   let enriched = 0;
   let failed = 0;
   for (let i = 0; i < targets.length; i += concurrency) {
     const chunk = targets.slice(i, i + concurrency);
+    // 試行フラグを処理の**前**に立てる（YAT-77）。allSettled の後だとプロセスが途中で死んだ行が
+    // 次 run でまた対象になり、無限に取りに行く。成否は問わない（「試したか」であって「成功したか」
+    // ではない）。チャンクは concurrency（4 件）なので .in() の URL 長超過には当たらない。
+    const stamp = await supabase
+      .from("articles")
+      .update({ enriched_at: new Date().toISOString() })
+      .in(
+        "id",
+        chunk.map((r) => r.id),
+      );
+    if (stamp.error) {
+      console.warn("enriched_at のスタンプに失敗（次 run で再試行される）:", stamp.error);
+    }
     const results = await Promise.allSettled(
       chunk.map(async (row) => {
         const result = await enrichArticleBody(supabase, row);

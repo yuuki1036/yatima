@@ -73,6 +73,10 @@ jobs:
       # NEAR_DUP_FRESH で「この run の near_dup_rate が算出し直されたか」を渡す。dedup が落ちた週も
       # 観測は撮る（撮らないと系列が欠ける）が、その行の near_dup_rate は最大 1 週間前の値なので
       # near_dup_fresh=false として記録し、較正から外せるようにする。
+      # これは near_dup_fresh の**必要条件**（compute が exit 0 で回ったか）。**十分条件**（compute が
+      # 実際に値を入れたか＝レシピ多数派 share >= 0.8）は snapshot 側が DB から再判定して AND する
+      # （YAT-77）。混在期は compute が exit 0 でも全 feed を null にするので、env だけでは fresh を
+      # 判定できない。YAML に 2 本目の暗黙契約を足さないため、share 判定は snapshot に閉じる。
       # 読み取り＋insert のみで LLM/embed の secret は不要。
       - run: npm run snapshot-feed-health
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}

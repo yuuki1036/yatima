@@ -1,19 +1,26 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { createEmbedder, estimateTokens, type Embedder } from "@/lib/llm/embed";
+import { htmlToInputText } from "@/lib/llm/extract-text";
 
 // 取得→要約の後に呼ぶバッチ埋め込み。embedding 未生成の行を拾い、対象テキストを Voyage で embed
 // して `<table>.embedding`（pgvector）に保存する。articles（YAT-3）とカード候補（YAT-17）が共有する。
 // 設計方針: fail-soft。例外は外へ漏らさず集計に畳む（embedding 由来でジョブを止めない）。
 // 既存の embedding NULL 行は次回実行で自然にバックフィルされる。
 
-// skip の理由。ガード側（ingest-health）の carve-out 判定に使う。今は no_api_key のみで、
-// ディスク天井の disk_ceiling は YAT-77 で足す（embedStalled はその値を既に除外している）。
+// skip の理由。ガード側（ingest-health）の carve-out 判定に使う。no_api_key（キー未設定）と
+// disk_ceiling（DB が 450MB 超・YAT-77）。後者は exit 1 にしない設計なので、生存系ガード
+// （isEmbedStalled / isEmbedGateStuck）はこの値を明示的に除外する。
 export type EmbedSkipReason = "no_api_key" | "disk_ceiling";
 
 type EmbedBatchCounts = {
-  picked: number; // embedding NULL から取得した件数
+  picked: number; // 選抜で取得した件数（embedding NULL の候補）
+  // 実際に embed を試みた件数（= picked - deferred）。isEmbedDead の分母。
+  attempted: number;
+  // 壁時計締切で未着手のまま次 run に送った件数（YAT-77）。picked = attempted + deferred。
+  // 「失敗」ではないので isEmbedDead の分子分母に混ぜない。
+  deferred: number;
   succeeded: number;
-  failed: number;
+  failed: number; // = attempted - succeeded
   // この run の Voyage 実消費（usage.total_tokens の合算）と、estimateTokens による見積もり合計。
   // TPM 台帳（YAT-76）: 実測と見積もりを並べてログに出し、見積もり係数のずれを観測する。
   // embedder が消費を報告しない（モック等）場合は tokensUsed を持たない。
@@ -30,11 +37,53 @@ export type EmbedBatchResult =
   | (EmbedBatchCounts & { skipped: true; skipReason: EmbedSkipReason })
   | (EmbedBatchCounts & { skipped: false; skipReason?: never });
 
-// 1 回の実行で埋め込む上限。無料枠（3 RPM / 10K TPM）だと throughput が ~8.5K tokens/分に
-// 制限され、実測で 24 件 embed に約 4 分・ingest 全体で約 6 分かかった。cron の 10 分 timeout に
-// 余裕を持たせるため 16 件に抑える（残りは次回消化。newest-first で候補窓 72h は先に埋まる）。
-// 支払い方法を登録してレート制限が緩んだら上げてよい。
+// articles 経路（embedMissing）専用の上乗せ（YAT-77）。交差型はユニオンに分配されるので
+// skipped/skipReason の判別可能性は保たれる。card/quiz 経路の EmbedBatchResult には付かない。
+export type ArticleEmbedResult = EmbedBatchResult & {
+  // ゲート前の候補数（select_embed_candidates.pending）。-1 は取得不能（判定不能）。
+  pending: number;
+  // ゲート後＝実際に選ばれうる件数（.eligible）。-1 は取得不能。embedHealthCounts の分母に運ぶ。
+  eligible: number;
+  // 選抜 RPC（または天井 RPC）が落ちたときの理由。null なら正常。isEmbedSelectStalled が読む。
+  selectError: string | null;
+};
+
+// 1 回の実行で埋め込む上限（card/quiz 経路の DEFAULT。articles は EMBED_MAX_ROWS）。
+// 無料枠（3 RPM / 10K TPM）だと throughput が ~8.5K tokens/分に制限され、実測で 24 件 embed に
+// 約 4 分かかった。残りは次回消化。支払い方法を登録してレート制限が緩んだら上げてよい。
 const DEFAULT_LIMIT = 16;
+
+// ディスク天井（YAT-77・design doc open 11。ユーザー確定 450MB）。base-2 で数える
+// （Supabase の表示に合わせる）。db_size_bytes() がこれ以上なら embed を skip する（exit 1 はしない）。
+export const DISK_CEILING_BYTES = 450 * 1024 * 1024;
+
+// embed の壁時計予算（YAT-77）。3 分 = 8 リクエスト ≒ 130〜175 件/run（design doc「壁時計予算」）。
+export const EMBED_WALL_CLOCK_MS = 180_000;
+
+// embed ゲートの本文長下限（YAT-77）。分布の谷（240-249: 144 件 / 250-259: 104 件 /
+// 290-299: 1,907 件）。⚠ この値を変えるときは migration 0017 の idx_articles_embed_pending の
+// 述語（250 が焼き込まれている・design doc open 6）も張り直すこと。動かさず閾値だけ変えると
+// index が効かず seq scan に落ちる（静かな劣化）。
+export const EMBED_MIN_BODY_LEN = 250;
+
+// 新レシピ（YAT-77）の本文冒頭の長さ。800 件実測で title+summary と有向 maxSim 分布がほぼ一致
+// （p50 0.741/0.741・p90 0.801/0.800）した値。DEDUP_THRESHOLD=0.86 を流用できる根拠。
+export const EMBED_LEAD_CHARS = 250;
+
+// articles 1 run の選抜上限（YAT-77）。3 分の壁時計で消化できる件数から決める:
+//   消化側: チャンク間隔 21s ＋ リクエスト実測 ~2s ≒ 23s。3 分なら 1 + floor((180-3)/23) ≈ 8 チャンク。
+//   1 チャンクの件数 = TOKEN_BUDGET 3000 / estimateTokens(title 60 字 + 本文 250 字):
+//     全 ASCII ≈ 124 tok → 24 件 / 全 CJK ≈ 465 tok → 6 件 / 混在（本番の実勢）≈ 280 tok → 10 件。
+//   → 1 run の実消化は 48（CJK 最悪）/ 80（混在）/ 192（ASCII 最良）。
+//   フェッチ側: RPC の content_head は先頭 8,000 字 ≒ 8KB/行。120 なら 0.96MB/run・23MB/日 で、
+//   混在ケースの取りこぼしは 40 行ぶん（0.3MB/run）に収まる。max_rows=200 だと egress 1.1GB/月
+//   （無料枠 5GB の 23%）で半分以上は締切で未着手のまま捨てる。「混在ケースの実消化＋余裕」で置く。
+// per_day 導入（YAT-80）で再検証する。
+export const EMBED_MAX_ROWS = 120;
+
+// per_day（feed 別日次キャップ）は YAT-80 まで実質無効。RPC の room = per_day - used を常に
+// 十分大きくする番兵値を渡す。
+const EMBED_PER_DAY_DISABLED = 100_000;
 
 // pgvector へは文字列リテラル '[v1,v2,...]' で書き込む（PostgREST が text→vector にキャスト）。
 // card-gate のその場 embed→insert でも使うため export する。
@@ -48,20 +97,110 @@ type EmbedTableOpts = {
   table: string;
   selectColumns: string;
   embedTextOf: (row: Record<string, unknown>) => string;
-  // 必須でない行を除外する列（articles は要約済みのみ対象＝"summary"。カード候補は指定なし）。
+  // 必須でない行を除外する列（カード候補は指定なし）。articles は select_embed_candidates 経由に
+  // 移行したので使わなくなった（YAT-77）が、card/quiz 経路のため option としては残す。
   requireColumn?: string;
   // 特定の列値だけに絞る等値フィルタ（quiz は active のみ補完＝retired に embed 予算を使わない）。
   eqFilter?: { column: string; value: string };
-  // この時刻以降の行だけを候補にする下限（列は orderBy と同じ想定）。articles の保持窓
-  // （EMBED_RETENTION_DAYS）と揃え、prune 済みの窓外を再 embed して即捨てる空回りを塞ぐ（YAT-76）。
+  // この時刻以降の行だけを候補にする下限（列は orderBy と同じ想定）。articles は RPC の 30 日窓に
+  // 移ったので現在の呼び出し側では未使用（YAT-77）。card/quiz 経路のため残す。
   minTimestamp?: { column: string; value: string };
-  // 成功時に embedding と同時に now() を打つ列（articles の embedded_at）。embedStalled の
-  // 「直近 26h で 1 件も進んでいない」判定の分子になる。
+  // 成功時に embedding と同時に now() を打つ列。embedStalled の「直近 26h で 1 件も進んでいない」
+  // 判定の分子になる。
   stampColumn?: string;
   orderBy: { column: string; ascending: boolean; nullsFirst?: boolean };
   limit?: number;
   embedder?: Embedder | null;
 };
+
+// 空の counts（skip / 対象ゼロ用）。attempted/deferred を required にしているので、
+// 早期 return がこれらを付け忘れるとコンパイルエラーになる（YAT-77）。
+const EMPTY_COUNTS: EmbedBatchCounts = {
+  picked: 0,
+  attempted: 0,
+  deferred: 0,
+  succeeded: 0,
+  failed: 0,
+};
+
+type EmbedRowsOpts = {
+  table: string;
+  embedTextOf: (row: Record<string, unknown>) => string;
+  stampColumn?: string;
+  embedder: Embedder; // null 判定は呼び出し側で済ませる
+  deadlineMs?: number; // 壁時計締切（YAT-77・articles のみ渡す）
+};
+
+// 取得済みの行配列を embed して保存し、件数に畳む（YAT-77 で embedMissingFromTable から切り出し。
+// articles 経路は候補取得を RPC に移したためこの下半分だけを共有する）。rows は 1 件以上を前提。
+async function embedRows(
+  supabase: SupabaseClient,
+  rows: Record<string, unknown>[],
+  opts: EmbedRowsOpts,
+): Promise<EmbedBatchCounts & { skipped: false }> {
+  // まとめて埋め込む（Voyage はバッチ入力可）。embed は内部で分割・レート制御し、失敗チャンクの
+  // 要素は null で返す（部分成功を許容）。deadlineMs 到達で未着手になった末尾も null で返る。
+  const texts = rows.map(opts.embedTextOf);
+  const tokensEstimated = texts.reduce((s, t) => s + estimateTokens(t), 0);
+  const tokensBefore = opts.embedder.usedTokens?.();
+  let vectors: (number[] | null)[];
+  try {
+    vectors = await opts.embedder.embed(texts, { deadlineMs: opts.deadlineMs });
+  } catch (e) {
+    // embed 全体が throw するのは想定外（チャンク失敗は null 化される）。保険で全件 failed に。
+    console.warn(`embed API 呼び出しに失敗（${opts.table}）:`, e);
+    return {
+      picked: rows.length,
+      attempted: rows.length,
+      deferred: 0,
+      succeeded: 0,
+      failed: rows.length,
+      skipped: false,
+    };
+  }
+
+  // 締切で未着手のまま残った件数。deferred は必ず末尾のチャンク（embed が順に処理し break する）
+  // なので、attempted は先頭 (picked - deferred) 件になる。failed は attempted - succeeded で出す
+  // ——deferred の null を failed に混ぜない（次 run で拾うだけなので障害ではない）。
+  const deferred = opts.embedder.lastDeferred?.() ?? 0;
+  const attempted = rows.length - deferred;
+
+  let succeeded = 0;
+  // 保存は1件ずつ（embedding 値が行ごとに異なるため bulk update できない）。fail-soft。
+  for (let i = 0; i < rows.length; i++) {
+    const vec = vectors[i];
+    // null は「チャンク失敗」か「締切未着手」。どちらも embedding NULL のまま次回再試行で収束する。
+    if (!vec) continue;
+    try {
+      const patch: Record<string, unknown> = { embedding: vecToPg(vec) };
+      if (opts.stampColumn) patch[opts.stampColumn] = new Date().toISOString();
+      const { error } = await supabase
+        .from(opts.table)
+        .update(patch)
+        .eq("id", rows[i].id as string);
+      if (error) throw error;
+      succeeded += 1;
+    } catch (e) {
+      console.warn(`embedding 保存失敗 [${opts.table}/${rows[i].id}]:`, e);
+    }
+  }
+
+  const tokensAfter = opts.embedder.usedTokens?.();
+  return {
+    picked: rows.length,
+    attempted,
+    deferred,
+    succeeded,
+    failed: attempted - succeeded,
+    skipped: false,
+    tokensEstimated,
+    // usedTokens は Embedder 累計なので run 分は差分で出す（同一 embedder の使い回しに耐える）。
+    tokensUsed:
+      tokensAfter !== undefined && tokensBefore !== undefined
+        ? tokensAfter - tokensBefore
+        : undefined,
+  };
+}
 
 async function embedMissingFromTable(
   supabase: SupabaseClient,
@@ -73,13 +212,7 @@ async function embedMissingFromTable(
 
   // API キー未設定 → embed スキップ（呼び出し元のジョブは成功扱い）
   if (!embedder) {
-    return {
-      picked: 0,
-      succeeded: 0,
-      failed: 0,
-      skipped: true,
-      skipReason: "no_api_key",
-    };
+    return { ...EMPTY_COUNTS, skipped: true, skipReason: "no_api_key" };
   }
 
   let rows: Record<string, unknown>[] = [];
@@ -109,97 +242,130 @@ async function embedMissingFromTable(
     rows = (data ?? []) as unknown as Record<string, unknown>[];
   } catch (e) {
     console.warn(`embed 対象の取得に失敗（${opts.table}）:`, e);
-    return { picked: 0, succeeded: 0, failed: 0, skipped: false };
+    return { ...EMPTY_COUNTS, skipped: false };
   }
 
   if (rows.length === 0) {
-    return { picked: 0, succeeded: 0, failed: 0, skipped: false };
+    return { ...EMPTY_COUNTS, skipped: false };
   }
 
-  // まとめて埋め込む（Voyage はバッチ入力可）。embed は内部で分割・レート制御し、
-  // 失敗チャンクの要素は null で返す（部分成功を許容）。
-  const texts = rows.map(opts.embedTextOf);
-  const tokensEstimated = texts.reduce((s, t) => s + estimateTokens(t), 0);
-  const tokensBefore = embedder.usedTokens?.();
-  let vectors: (number[] | null)[];
-  try {
-    vectors = await embedder.embed(texts);
-  } catch (e) {
-    // embed 全体が throw するのは想定外（チャンク失敗は null 化される）。保険で全件 failed に。
-    console.warn(`embed API 呼び出しに失敗（${opts.table}）:`, e);
+  return embedRows(supabase, rows, {
+    table: opts.table,
+    embedTextOf: opts.embedTextOf,
+    stampColumn: opts.stampColumn,
+    embedder,
+  });
+}
+
+// 新レシピ（YAT-77）の embedding テキスト。title＋本文冒頭 250 字。要約に依存しない
+// （切り離しの本体）。content_head は select_embed_candidates が返す先頭 8,000 字の生 HTML なので、
+// ここで htmlToInputText してから 250 字に切る（body_text_len は SQL 側の trigger 値で、ゲート
+// 判定にのみ使う。テキスト整形は JS 側の htmlToInputText に揃える）。
+// title だけは棄却済み（p90 が 0.836 に上振れし英日クロス言語の転載ペアを取りこぼす）。
+export function articleEmbedText(row: {
+  title?: unknown;
+  content_head?: unknown;
+}): string {
+  const lead = htmlToInputText(
+    typeof row.content_head === "string" ? row.content_head : null,
+  ).slice(0, EMBED_LEAD_CHARS);
+  return [row.title, lead].filter(Boolean).join("\n");
+}
+
+// 記事の embedding 補完（YAT-3 / 要約から切り離した YAT-77）。embedding 未生成 ∧ feeds.active ∧
+// body_text_len >= 250 ∧ 直近 30 日 の articles を select_embed_candidates（migration 0017）で選ぶ。
+// 要約の有無は問わない（near_dup の母集団を要約予算から独立させるのが本 Issue の核心）。
+//
+// 処理順が肝: ①ディスク天井 → ②選抜 RPC（キー未設定でも呼ぶ）→ ③embed。
+// ①天井（db_size_bytes >= 450MB）は embed を skipReason='disk_ceiling' で見送る（exit 1 にしない）。
+// ②キー未設定でも RPC を呼ぶのは、eligible を取らないと embedHealthCounts の分母が欠けて
+//   isEmbedStalled が不活性化するため（「キー喪失を 26h で赤くする」既存の意図を守る）。
+export async function embedMissing(
+  supabase: SupabaseClient,
+  opts: {
+    maxRows?: number;
+    embedder?: Embedder | null;
+    now?: number;
+    budgetMs?: number;
+  } = {},
+): Promise<ArticleEmbedResult> {
+  const now = opts.now ?? Date.now();
+
+  // ① ディスク天井。取得失敗は skip しない（判定不能で止めると天井を装った静かな死になる）。
+  const { data: sizeData, error: sizeErr } = await supabase.rpc("db_size_bytes");
+  if (sizeErr) {
+    console.warn("db_size_bytes の取得に失敗（天井判定を見送って続行）:", sizeErr);
+  } else if (Number(sizeData) >= DISK_CEILING_BYTES) {
+    console.warn(
+      `DB が ${DISK_CEILING_BYTES} bytes を超えた（${sizeData}）ため embed を見送る（disk_ceiling）`,
+    );
+    // 選抜 RPC も呼ばない（天井時に content_head を引くのは無駄）。pending/eligible は判定不能に倒す。
     return {
-      picked: rows.length,
-      succeeded: 0,
-      failed: rows.length,
-      skipped: false,
+      ...EMPTY_COUNTS,
+      skipped: true,
+      skipReason: "disk_ceiling",
+      pending: -1,
+      eligible: -1,
+      selectError: null,
     };
   }
 
-  let succeeded = 0;
-  let failed = 0;
-  // 保存は1件ずつ（embedding 値が行ごとに異なるため bulk update できない）。fail-soft。
-  for (let i = 0; i < rows.length; i++) {
-    const vec = vectors[i];
-    if (!vec) {
-      // 埋め込み失敗（チャンク失敗）。embedding は NULL のまま残り次回再試行で収束する。
-      failed += 1;
-      continue;
-    }
-    try {
-      const patch: Record<string, unknown> = { embedding: vecToPg(vec) };
-      if (opts.stampColumn) patch[opts.stampColumn] = new Date().toISOString();
-      const { error } = await supabase
-        .from(opts.table)
-        .update(patch)
-        .eq("id", rows[i].id as string);
-      if (error) throw error;
-      succeeded += 1;
-    } catch (e) {
-      failed += 1;
-      console.warn(`embedding 保存失敗 [${opts.table}/${rows[i].id}]:`, e);
-    }
+  const embedder =
+    opts.embedder !== undefined ? opts.embedder : createEmbedder();
+
+  // ② 選抜 RPC。キー未設定でも呼ぶ（eligible が embedHealthCounts の分母に要る）。
+  let pending = -1;
+  let eligible = -1;
+  let selectError: string | null = null;
+  let rows: Record<string, unknown>[] = [];
+  try {
+    const { data, error } = await supabase.rpc("select_embed_candidates", {
+      per_day: EMBED_PER_DAY_DISABLED,
+      max_rows: opts.maxRows ?? EMBED_MAX_ROWS,
+      min_len: EMBED_MIN_BODY_LEN,
+    });
+    if (error) throw error;
+    // jsonb を 1 個返す RPC。動的 RPC の型は解決できないので unknown 経由でキャストする
+    // （match_articles / feed_recent_published と同じ作法）。
+    const res = (data ?? {}) as unknown as {
+      pending?: number;
+      eligible?: number;
+      rows?: Record<string, unknown>[];
+    };
+    pending = res.pending ?? -1;
+    eligible = res.eligible ?? -1;
+    rows = res.rows ?? [];
+  } catch (e) {
+    // 取得失敗は -1（判定不能）に倒す。0 に潰すとガードが偽陰性で沈黙する
+    // （knowledge fail-soft-return-breaks-ratio-logs）。isEmbedSelectStalled が selectError を読む。
+    selectError = e instanceof Error ? e.message : String(e);
+    console.warn("select_embed_candidates の取得に失敗:", e);
   }
 
-  const tokensAfter = embedder.usedTokens?.();
-  return {
-    picked: rows.length,
-    succeeded,
-    failed,
-    skipped: false,
-    tokensEstimated,
-    // usedTokens は Embedder 累計なので run 分は差分で出す（同一 embedder の使い回しに耐える）。
-    tokensUsed:
-      tokensAfter !== undefined && tokensBefore !== undefined
-        ? tokensAfter - tokensBefore
-        : undefined,
-  };
-}
+  // ③ キー未設定 → skip（pending/eligible は取れているので付けて返す）。
+  if (!embedder) {
+    return {
+      ...EMPTY_COUNTS,
+      skipped: true,
+      skipReason: "no_api_key",
+      pending,
+      eligible,
+      selectError,
+    };
+  }
 
-// 記事の embedding 補完（YAT-3）。summary 済みかつ embedding 未生成の articles を拾う。
-// dedup 用途なので本文は不要、title+summary で足りる。
-//
-// 候補は保持窓（EMBED_RETENTION_DAYS）内に限る（YAT-76）。窓外は prune が翌 run で NULL に
-// 戻すため、下限なしだと「embed → prune → また embed」の空回りに予算と枠を食われ続ける。
-// 排出の窓と候補の窓を同じ定数にすることで、窓を動かしても空回りが再発しない。
-export async function embedMissing(
-  supabase: SupabaseClient,
-  opts: { limit?: number; embedder?: Embedder | null; now?: number } = {},
-): Promise<EmbedBatchResult> {
-  return embedMissingFromTable(supabase, {
+  if (rows.length === 0) {
+    return { ...EMPTY_COUNTS, skipped: false, pending, eligible, selectError };
+  }
+
+  const counts = await embedRows(supabase, rows, {
     table: "articles",
-    selectColumns: "id, title, summary",
-    embedTextOf: (r) =>
-      [r.title, r.summary].filter(Boolean).join("\n"),
-    requireColumn: "summary", // 要約済みのみ embed（未要約は対象外）
-    minTimestamp: {
-      column: "published_at",
-      value: embedWindowCutoff(opts.now ?? Date.now()),
-    },
-    stampColumn: "embedded_at", // embedStalled（ingest-health）の分子
-    orderBy: { column: "published_at", ascending: false, nullsFirst: false },
-    limit: opts.limit,
-    embedder: opts.embedder,
+    embedTextOf: (r) => articleEmbedText(r),
+    stampColumn: "embedded_at", // embedStalled（ingest-health）の分子・レシピマーカー（YAT-77）
+    embedder,
+    deadlineMs: now + (opts.budgetMs ?? EMBED_WALL_CLOCK_MS),
   });
+  return { ...counts, pending, eligible, selectError };
 }
 
 // カード候補の embedding 補完（YAT-17）。card-gate のその場 embed が embedder 無し/失敗で取り
@@ -312,42 +478,37 @@ export const EMBED_STALL_WINDOW_HOURS = 26;
 export type EmbedHealthCounts = {
   /** 直近 26h に embed が成功した記事数（embedded_at ベース）。-1 は取得失敗（判定不能）。 */
   embeddedLast26h: number;
-  /** いま embed 待ちの候補数。分母は embedMissing の選抜と同じ述語。-1 は取得失敗。 */
+  /** いま embed 待ちの候補数。選抜 RPC の eligible をそのまま運ぶ。-1 は取得失敗。 */
   candidatesAvailable: number;
 };
 
-// embedStalled 判定の材料（YAT-76）。embedMissing の後（＝この run の成功が embedded_at に
-// 反映された後）に呼ぶこと。取得失敗は -1 に倒す: 0 を返すと「進んでいない」と誤読されて
-// 偽陽性で赤くなり、逆に候補 0 扱いだと偽陰性で沈黙する。-1 なら両ガードとも不活性＋warn が
-// ログに残る（knowledge fail-soft-return-breaks-ratio-logs と同じ作法）。
+// embedStalled 判定の材料（YAT-76 / YAT-77）。embedMissing の後（＝この run の成功が embedded_at に
+// 反映された後）に呼ぶこと。
+//
+// candidatesAvailable は embedMissing が返した eligible（選抜 RPC のゲート後件数）を**そのまま**使う。
+// 述語をここに書き写して同期させようとしない: 述語のコピーこそがドリフトの発生源で、切り離し後に
+// 「summary is not null」を残すと分母が実際の 1/3 に潰れて isEmbedStalled が静かに不活性化する
+// （「うるさいガードを外して静かな死」の再来）。RPC が返した値を運ぶのが唯一ドリフトしない解。
+// eligible が -1（RPC 取得失敗）ならそのまま判定不能として伝播する。
+// embeddedLast26h の取得失敗は -1 に倒す（0 だと偽陽性で赤くなる。fail-soft-return-breaks-ratio-logs）。
 export async function embedHealthCounts(
   supabase: SupabaseClient,
+  em: Pick<ArticleEmbedResult, "eligible">,
   now: number = Date.now(),
 ): Promise<EmbedHealthCounts> {
   const stallCutoff = new Date(
     now - EMBED_STALL_WINDOW_HOURS * 3_600_000,
   ).toISOString();
 
-  const [recent, pending] = await Promise.all([
-    supabase
-      .from("articles")
-      .select("id", { count: "exact", head: true })
-      .gte("embedded_at", stallCutoff),
-    // embedMissing の候補述語と同一に保つ（embedding NULL ∧ summary あり ∧ 保持窓内）。
-    // 対象がゼロならガードは自動で不活性になる＝「観測対象が無いのに赤い」を作らない。
-    supabase
-      .from("articles")
-      .select("id", { count: "exact", head: true })
-      .is("embedding", null)
-      .not("summary", "is", null)
-      .gte("published_at", embedWindowCutoff(now)),
-  ]);
+  const recent = await supabase
+    .from("articles")
+    .select("id", { count: "exact", head: true })
+    .gte("embedded_at", stallCutoff);
 
   if (recent.error) console.warn("embed 健全性: 26h 実績の取得に失敗:", recent.error);
-  if (pending.error) console.warn("embed 健全性: 候補数の取得に失敗:", pending.error);
   return {
     embeddedLast26h: recent.error ? -1 : (recent.count ?? -1),
-    candidatesAvailable: pending.error ? -1 : (pending.count ?? -1),
+    candidatesAvailable: em.eligible,
   };
 }
 

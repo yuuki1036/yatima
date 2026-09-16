@@ -5,6 +5,8 @@ import {
   isDeckStarved,
   isEmbedDead,
   isEmbedStalled,
+  isEmbedGateStuck,
+  isEmbedSelectStalled,
   DECK_STARVED_FLOOR,
   STALE_ALERT_HOURS,
 } from "@/lib/rss/ingest-health";
@@ -125,20 +127,82 @@ describe("formatStale", () => {
 // （skip 理由・対象ゼロ・判定不能 -1）が赤に変換されないことが本題。
 
 describe("isEmbedDead", () => {
-  it("対象を拾ったのに成功 0 なら dead", () => {
-    expect(isEmbedDead({ skipped: false, picked: 16, succeeded: 0 })).toBe(true);
+  it("試みたのに成功 0 なら dead", () => {
+    expect(isEmbedDead({ skipped: false, attempted: 16, succeeded: 0 })).toBe(true);
   });
 
   it("1 件でも成功していれば dead ではない（部分失敗は fail-soft の想定内）", () => {
-    expect(isEmbedDead({ skipped: false, picked: 16, succeeded: 1 })).toBe(false);
+    expect(isEmbedDead({ skipped: false, attempted: 16, succeeded: 1 })).toBe(false);
   });
 
   it("対象ゼロは正常（発火しない）", () => {
-    expect(isEmbedDead({ skipped: false, picked: 0, succeeded: 0 })).toBe(false);
+    expect(isEmbedDead({ skipped: false, attempted: 0, succeeded: 0 })).toBe(false);
+  });
+
+  it("締切持ち越しだけで着手ゼロなら dead ではない（YAT-77）", () => {
+    // picked=120 でも壁時計で全件 deferred（attempted=0）なら「拾ったのに成功 0」の偽陽性にしない。
+    expect(isEmbedDead({ skipped: false, attempted: 0, succeeded: 0 })).toBe(false);
   });
 
   it("skip した run は判定しない（キー未設定は embedStalled 側が 26h で拾う）", () => {
-    expect(isEmbedDead({ skipped: true, picked: 0, succeeded: 0 })).toBe(false);
+    expect(isEmbedDead({ skipped: true, attempted: 0, succeeded: 0 })).toBe(false);
+  });
+});
+
+describe("isEmbedGateStuck", () => {
+  it("候補はあるのに選抜 0 件なら stuck（ゲート全閉・day-0 回帰の署名）", () => {
+    expect(isEmbedGateStuck({ pending: 500, eligible: 0 })).toBe(true);
+  });
+
+  it("ディスク天井 skip は除外（exit 1 にしない設計）", () => {
+    expect(
+      isEmbedGateStuck({ skipReason: "disk_ceiling", pending: 500, eligible: 0 }),
+    ).toBe(false);
+  });
+
+  it("キー未設定 skip は除外しない（ゲート判定は API キーと独立）", () => {
+    expect(
+      isEmbedGateStuck({ skipReason: "no_api_key", pending: 500, eligible: 0 }),
+    ).toBe(true);
+  });
+
+  it("選抜が 1 件でもあれば stuck ではない", () => {
+    expect(isEmbedGateStuck({ pending: 500, eligible: 10 })).toBe(false);
+  });
+
+  it("候補ゼロは正常（対象が無いだけ）", () => {
+    expect(isEmbedGateStuck({ pending: 0, eligible: 0 })).toBe(false);
+  });
+
+  it("取得失敗（-1）は判定不能として不活性", () => {
+    expect(isEmbedGateStuck({ pending: -1, eligible: -1 })).toBe(false);
+  });
+});
+
+describe("isEmbedSelectStalled", () => {
+  it("選抜 RPC 失敗 × 26h 実績ゼロなら stalled", () => {
+    expect(
+      isEmbedSelectStalled({ selectError: "boom" }, { embeddedLast26h: 0 }),
+    ).toBe(true);
+  });
+
+  it("選抜 RPC 失敗でも 26h に 1 件でも進んでいれば生存", () => {
+    expect(
+      isEmbedSelectStalled({ selectError: "boom" }, { embeddedLast26h: 3 }),
+    ).toBe(false);
+  });
+
+  it("RPC が正常（selectError=null）なら発火しない", () => {
+    expect(
+      isEmbedSelectStalled({ selectError: null }, { embeddedLast26h: 0 }),
+    ).toBe(false);
+  });
+
+  it("26h 実績が -1（取得失敗）なら判定不能として不活性", () => {
+    // 姉妹ガードと同じく -1 は「進んでいない(0)」と区別する。=== 0 を <= 0 に変異させるとここで落ちる。
+    expect(
+      isEmbedSelectStalled({ selectError: "boom" }, { embeddedLast26h: -1 }),
+    ).toBe(false);
   });
 });
 

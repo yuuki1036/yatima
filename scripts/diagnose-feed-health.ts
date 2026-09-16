@@ -40,8 +40,11 @@ import { padEndWide } from "./_report-format";
 // 定数を置いて「compute-dedup-rate.ts と揃える」とコメントしていたが、揃っていたのは定数だけで
 // クエリ（行数上限）はズレていた。母集団ごと共有して drift の余地を消す。
 
-// embedding 網羅率がこれを下回る観測は較正に使わない。平常時は 40〜50%（要約予算が credibility で
-// リランクされるため全記事は要約されない）で、2026-08-26 の要約全滅時は 33.6% まで落ちていた。
+// embedding 網羅率の床。⚠ YAT-77 段階 3 で警告判定を一時無効化した。0.4 は「embedding は要約済みに
+// しか付かない」旧レジームで較正した値で、feed 均等 embed（YAT-80）は総網羅率を意図的に下げる設計。
+// 新レジームの定常値（≈25% 見込み）からの再導出は段階 10（YAT-55）で行う。それまでこの数字で
+// 較正の可否を判断しない。受け入れ指標は feedsWithRate（near_dup を算出できた active feed 数）に
+// 差し替わっている（design doc open 9）。定数は参照（下の情報行）で残す。
 const WINDOW_COVERAGE_FLOOR = 0.4;
 
 function fmtDays(ms: number): string {
@@ -123,10 +126,19 @@ async function main() {
   // 網羅率を見ずに値だけ読むと汚染された観測を較正に使ってしまう（2026-08-26 に実際に起きた:
   // 要約全滅で直近 7 日の embedding が丸ごと欠けた窓で算出された値だった）。
   console.log(describeWindow(win));
-  if (win.coverage < WINDOW_COVERAGE_FLOOR) {
+  console.log(
+    `near_dup 算出済み ${obs.feedsWithRate} / active ${active.length} feed（構造上限 21・受け入れ 13→21）`,
+  );
+  console.log(
+    `（網羅率の床 ${(WINDOW_COVERAGE_FLOOR * 100).toFixed(0)}% による警告は YAT-77 段階 3 で一時無効化中。` +
+      `受け入れ指標は feedsWithRate に差し替わっている）`,
+  );
+  // レシピ混在中（share < 0.8）は compute-dedup-rate が全 feed を null にする。これは既知の空白で
+  // あって障害ではないことを明示する（YAT-77）。
+  if (win.majority.total > 0 && win.majority.share < 0.8) {
     console.log(
-      `⚠ embedding 網羅率が ${(WINDOW_COVERAGE_FLOOR * 100).toFixed(0)}% を下回っている。` +
-        `要約・embed 経路が止まっている可能性がある（near_dup を較正に使わないこと）`,
+      `⚠ レシピ混在中（多数派 ${win.majority.recipe} ${win.majority.share.toFixed(2)} < 0.80）。` +
+        `compute-dedup-rate は全 feed を null にしている＝これは既知の空白であって障害ではない`,
     );
   }
 
@@ -220,6 +232,7 @@ async function main() {
   let noArticle = 0;
   let onlyNullPublished = 0;
   let noEmbed = 0;
+  let noEmbedGateFail = 0; // うち窓内にゲート（body_text_len >= 250）を通る記事が 0 件（構造的）
   let tooFew = 0;
   // 母数は足りているのに null ＝ cron 未実行 / 途中失敗。件数だけでは「直近追加の feed だから
   // まだ月曜 cron を通っていない（無害）」と「update が途中で落ちた（要調査）」を切り分けられない
@@ -233,11 +246,18 @@ async function main() {
     else if (!any || any.total === 0) noArticle += 1;
     // 記事は存在するが published_at が全て null → 30d 窓（gte）に構造的に入らない。
     else if (any.nullPublished === any.total) onlyNullPublished += 1;
-    else noEmbed += 1;
+    else {
+      noEmbed += 1;
+      // 窓内にゲート（body_text_len >= 250）を通る記事が 0 件なら、本文が薄い feed（構造的）。
+      // 通るのに embedding 0 は予算/停止（YAT-77）。
+      if (r.windowOwnEligible === 0) noEmbedGateFail += 1;
+    }
   }
   console.log(`  記事そのものが無い                   : ${noArticle}`);
   console.log(`  記事はあるが published_at が全て null : ${onlyNullPublished}`);
   console.log(`  窓内に記事はあるが embedding が 0 件  : ${noEmbed}`);
+  console.log(`    └ うちゲート（本文 >=250字）を通る記事が 0 件 : ${noEmbedGateFail}（本文が薄い・構造的）`);
+  console.log(`    └ ゲートは通るのに embedding 0 件            : ${noEmbed - noEmbedGateFail}（予算/停止）`);
   console.log(`  embedding 1〜${MIN_OWN_ARTICLES - 1} 件（母数不足）       : ${tooFew}`);
   console.log(`  embedding ${MIN_OWN_ARTICLES} 件以上あるのに null      : ${enoughButNullRows.length}`);
   if (enoughButNullRows.length > 0) {
@@ -269,8 +289,11 @@ async function main() {
   }
   if (noEmbed > 0) {
     console.log(
-      `  ※ embedding は要約済み記事にしか付かず、要約予算は credibility でリランクされる。` +
-        `低 credibility feed ほど near_dup が算出されない構造（YAT-55 の調査結果 E）`,
+      `  ※ embedding は title＋本文冒頭 250 字から作られ、要約とは独立（YAT-77）。0 件の原因は ` +
+        `①本文が 250 字未満でゲート落ち（上の「ゲートを通る記事が 0 件」）②embed 予算がその feed に ` +
+        `回っていない ③embed 経路の停止。②③の切り分けは ingest ログの「候補→選抜」と ` +
+        `embedGateStuck / embedStalled を見る。①は feed の性質なので MIN_OWN_ARTICLES を下げても直らない ` +
+        `（要約予算依存の調査結果 E は切り離しで配線ごと消えた）`,
     );
   }
 
