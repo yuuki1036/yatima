@@ -7,11 +7,18 @@ import { createAdminClient } from "../lib/supabase/admin";
 import { parseEmbedding, cosineSim, DEDUP_THRESHOLD } from "../lib/ranking/dedup";
 import {
   fetchWindowArticles,
+  filterByRecipe,
+  firstLeadEmbeddedAt,
   WINDOW_DAYS,
   MIN_OWN_ARTICLES,
   PER_FEED_LIMIT,
   FETCH_CAP,
 } from "../lib/ranking/near-dup-window";
+import {
+  judgeRecipe,
+  RECIPE_MAJORITY_SHARE,
+  RECIPE_MIXED_GRACE_DAYS,
+} from "../lib/ranking/embed-recipe";
 
 // feed ごとの「重複量産率」を事前算出して feeds.near_dup_rate に書き込む週次ジョブ（YAT-20）。
 // 削除推奨の near-dup シグナル。新規 embedding は発生せず、既存ベクタの cosine 集計のみ。
@@ -49,6 +56,8 @@ type Art = { feedId: string; vec: number[]; publishedAt: number };
 
 async function main() {
   const supabase = createAdminClient();
+  // --dry-run: UPDATE を打たず share / verdict / 混在日数だけ出す（本番投入前の確認用・YAT-77）。
+  const dryRun = process.argv.includes("--dry-run");
 
   // ── 対象は active feed のみ（非活性 feed は推奨対象外なので算出不要）。
   const { data: feeds, error: fErr } = await supabase
@@ -63,13 +72,61 @@ async function main() {
   }
 
   // ── 直近30日・embedding ありの記事をまとめて取得（新しい順・.range() で全件）。
-  const { rows: arts, truncated } = await fetchWindowArticles(supabase, Date.now());
+  const {
+    rows: allArts,
+    truncated,
+    byRecipe,
+  } = await fetchWindowArticles(supabase, Date.now());
   if (truncated) {
     console.warn(
       `⚠ 窓内の記事が安全弁 ${FETCH_CAP} 件に達した。古い側が切れており窓が実質縮んでいる。` +
         `低頻度 feed が母数不足（<${MIN_OWN_ARTICLES}）に倒れて near_dup_rate が null になる方向に偏る`,
     );
   }
+
+  // ── レシピ移行の判定（YAT-77 段階 4）。旧レシピ（title+summary）と新レシピ（title+lead）が
+  // 窓で混ざる期間は、多数派 share が 0.8 に届くまで算出しない（クロスレシピ汚染を near_dup_rate に
+  // 入れない）。firstLead は 45 日 clock の耐久 probe（DB 由来・prune で消えない）。
+  const firstLead = await firstLeadEmbeddedAt(supabase);
+  const verdict = judgeRecipe(byRecipe, firstLead, Date.now());
+  console.log(
+    `レシピ内訳: legacy ${byRecipe.legacy} / lead ${byRecipe.lead}` +
+      `（多数派 ${verdict.kind === "compute" ? verdict.recipe : majorityLabel(byRecipe)} ` +
+      `share ${verdict.share.toFixed(2)} / 判定 ${verdict.kind}` +
+      (verdict.kind === "compute"
+        ? ""
+        : ` / 混在 ${verdict.mixedDays.toFixed(1)}d・猶予 ${RECIPE_MIXED_GRACE_DAYS}d`) +
+      `）`,
+  );
+
+  // compute 以外は全 feed の near_dup_rate を null にする（既知の空白）。stuck は null 化を
+  // **先に**済ませてから exit 1 する（snapshot の「行を insert してから exit」と同じ作法——
+  // exit の前に DB を正しい状態＝古い値を残さない状態にする）。
+  if (verdict.kind !== "compute") {
+    if (verdict.kind === "blank") {
+      console.warn(
+        `⚠ レシピ多数派 share ${verdict.share.toFixed(2)} < ${RECIPE_MAJORITY_SHARE}。` +
+          `混在中のため全 active feed の near_dup_rate を null にする（既知の空白・exit 0）`,
+      );
+    } else {
+      console.error(
+        `✗ レシピ混在が ${verdict.mixedDays.toFixed(1)}d 続いている（猶予 ${RECIPE_MIXED_GRACE_DAYS}d 超過）。` +
+          `旧レシピが供給され続けている可能性が高い（embed の切り離しが効いているか確認）`,
+      );
+    }
+    if (dryRun) {
+      console.log(`[dry-run] ${feedIds.length} feed を null にする UPDATE は実行しない`);
+    } else {
+      await nullifyAll(supabase, feedIds);
+      console.log(`active feed ${feedIds.length} の near_dup_rate を null にした`);
+    }
+    if (verdict.kind === "stuck") process.exit(1);
+    return;
+  }
+
+  // compute: 多数派レシピの記事だけで算出する（own と比較プールの両方に効かせる）。
+  // 多数派が legacy かつ share 1.0（段階 3 前・revert 後）なら 1 行も落ちない＝現行挙動に合流。
+  const arts = filterByRecipe(allArts, verdict.recipe);
 
   // feed_id ごとにパース済みベクタを束ねる（新しい順を維持）。
   const byFeed = new Map<string, Art[]>();
@@ -122,6 +179,10 @@ async function main() {
       }
       rate = dup / own.length;
     }
+    if (dryRun) {
+      updated += 1;
+      continue;
+    }
     const { error: uErr } = await supabase
       .from("feeds")
       .update({ near_dup_rate: rate })
@@ -131,8 +192,29 @@ async function main() {
   }
 
   console.log(
-    `active feed ${feedIds.length} / 記事 ${all.length}（直近 ${WINDOW_DAYS}d）/ near_dup_rate 更新 ${updated}`,
+    `active feed ${feedIds.length} / 記事 ${all.length}（直近 ${WINDOW_DAYS}d・${verdict.recipe}）` +
+      `/ near_dup_rate ${dryRun ? "算出（dry-run・未更新）" : "更新"} ${updated}`,
   );
+}
+
+// 全 active feed の near_dup_rate を null にする（レシピ混在の既知の空白）。
+// PostgREST の .in() は URL 長超過（knowledge supabase-in-filter-url-length-limit）を避けるため
+// feed 数ぶんループで UPDATE する（active feed は数十本規模なので往復コストは無視できる）。
+async function nullifyAll(
+  supabase: ReturnType<typeof createAdminClient>,
+  feedIds: string[],
+): Promise<void> {
+  for (const feedId of feedIds) {
+    const { error } = await supabase
+      .from("feeds")
+      .update({ near_dup_rate: null })
+      .eq("id", feedId);
+    if (error) throw error;
+  }
+}
+
+function majorityLabel(c: { legacy: number; lead: number }): string {
+  return c.lead > c.legacy ? "lead" : "legacy";
 }
 
 main().catch((e) => {

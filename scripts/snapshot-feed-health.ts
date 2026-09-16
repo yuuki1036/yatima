@@ -8,6 +8,7 @@ import {
   collectFeedHealthObservation,
   describeWindow,
   DAY_MS,
+  FEEDS_WITH_RATE_FLOOR,
 } from "../lib/ranking/feed-health-observation";
 import { FEED_HEALTH_THRESHOLDS } from "../lib/ranking/feed-health";
 import {
@@ -15,6 +16,13 @@ import {
   PER_FEED_LIMIT,
   WINDOW_DAYS,
 } from "../lib/ranking/near-dup-window";
+import {
+  nearDupFreshness,
+  RECIPE_MAJORITY_SHARE,
+  RECIPE_MIXED_GRACE_DAYS,
+  EMBED_RECIPE_EPOCH,
+} from "../lib/ranking/embed-recipe";
+import { DISK_CEILING_BYTES, EMBED_MIN_BODY_LEN } from "../lib/rss/embed";
 
 // YAT-55: 退役スコアリングの観測を feed_health_snapshots に貯める（週次 cron）。
 //
@@ -40,13 +48,28 @@ async function main() {
   const now = Date.now();
   const capturedAt = new Date(now).toISOString();
 
-  // 同じ run で compute-dedup-rate が成功したか（learn.yml が steps.<id>.outcome を渡す）。
-  // 未設定＝手動実行とみなして false に倒す。near_dup_rate は上書き列なので、算出が落ちた週に
-  // 撮ると最大 1 週間前の値が今週の観測として入る。それを行から見分けられるようにする。
-  const nearDupFresh = process.env.NEAR_DUP_FRESH === "true";
+  // compute-dedup-rate の成否（learn.yml が steps.<id>.outcome を env で渡す・必要条件）。
+  // 未設定＝手動実行とみなして false に倒す。
+  const computeOk = process.env.NEAR_DUP_FRESH === "true";
   const runKind = process.env.GITHUB_ACTIONS === "true" ? "cron" : "manual";
 
   const obs = await collectFeedHealthObservation(supabase, now);
+
+  // near_dup_fresh は「compute が exit 0 で回った（必要条件）」AND「多数派 share が 0.8 以上＝
+  // compute が実際に値を入れた（十分条件）」で合成する（YAT-77）。混在期は compute が exit 0 でも
+  // 全 feed を null 化するので、env だけ見ると「fresh なのに feedsWithRate=0」になる。share は
+  // ここで snapshot 自身が数えた窓から判定するので、learn.yml に 2 本目の暗黙契約を足さない。
+  const share = obs.window.majority.share;
+  const { fresh: nearDupFresh, reason: nearDupFreshReason } = nearDupFreshness(
+    computeOk,
+    share,
+  );
+
+  // ディスク天井（YAT-77）。取れなくても行は必ず記録する（観測が取れないことは観測を捨てる
+  // 理由にならない）。天井に当たっていた期間を後から系列で判別するための耐久記録。
+  const { data: dbSizeData, error: dbSizeErr } = await supabase.rpc("db_size_bytes");
+  if (dbSizeErr) console.warn("db_size_bytes の取得に失敗（null で記録して続行）:", dbSizeErr);
+  const dbSize = dbSizeErr ? null : Number(dbSizeData);
 
   console.log("=== feed health snapshot（YAT-55）===");
   console.log(`captured_at: ${capturedAt}`);
@@ -59,9 +82,14 @@ async function main() {
       "⚠ 窓が安全弁に達して古い側を切り捨てた。window_embedded だけが頭打ちになるため網羅率は実態より低く出る",
     );
   }
+  console.log(
+    `near_dup 算出済み ${obs.feedsWithRate} / active ${obs.active.length} feed（構造上限 21・床 ${FEEDS_WITH_RATE_FLOOR}）`,
+  );
   if (!nearDupFresh) {
     console.warn(
-      "⚠ この run で compute-dedup-rate が成功していない。near_dup_rate は最大 1 週間古い値なので near_dup_fresh=false で記録する",
+      nearDupFreshReason === "compute_failed"
+        ? "⚠ この run で compute-dedup-rate が成功していない。near_dup_rate は最大 1 週間古い値なので near_dup_fresh=false で記録する"
+        : `⚠ レシピ混在中（多数派 share ${share.toFixed(2)} < ${RECIPE_MAJORITY_SHARE}）。compute は全 feed を null にしている＝既知の空白であって障害ではない。near_dup_fresh=false で記録する`,
     );
   }
 
@@ -83,11 +111,33 @@ async function main() {
   }
 
   // 撮影時に効いていた閾値一式。較正で閾値を動かした後、系列の前後を比較するのに要る。
+  // 段階 10 の引き直し対象は MIN_OWN_ARTICLES / NEAR_DUP_RATE 系のみ。RECIPE_* / EMBED_RECIPE_EPOCH /
+  // EMBED_MIN_BODY_LEN / feeds_with_rate 系は移行の進行を測る値で、指標の閾値ではない（YAT-77）。
   const thresholds = {
     ...FEED_HEALTH_THRESHOLDS,
     MIN_OWN_ARTICLES,
     PER_FEED_LIMIT,
     WINDOW_DAYS,
+    // レシピ移行（YAT-77）
+    RECIPE_MAJORITY_SHARE,
+    RECIPE_MIXED_GRACE_DAYS,
+    EMBED_RECIPE_EPOCH,
+    EMBED_MIN_BODY_LEN,
+    feeds_with_rate: obs.feedsWithRate,
+    feeds_with_rate_floor: FEEDS_WITH_RATE_FLOOR,
+    recipe: {
+      legacy: obs.window.byRecipe.legacy,
+      lead: obs.window.byRecipe.lead,
+      share,
+      majority: obs.window.majority.recipe,
+    },
+    coverage_by_recipe: obs.window.coverageByRecipe,
+    window_eligible: obs.window.eligible,
+    near_dup_fresh_reason: nearDupFreshReason,
+    // ディスク天井（YAT-77）。天井 skip 状態を後から系列で判別するための耐久記録。
+    DISK_CEILING_BYTES,
+    db_size_bytes: dbSize,
+    db_size_ratio: dbSize === null ? null : dbSize / DISK_CEILING_BYTES,
   };
 
   const rows = obs.rows.map((r) => ({
@@ -109,6 +159,8 @@ async function main() {
     near_dup_fresh: nearDupFresh,
     own_articles: r.ownArticles,
     window_own_embedded: r.windowOwnEmbedded,
+    window_own_articles: r.windowOwnArticles,
+    window_own_eligible: r.windowOwnEligible,
     window_articles: obs.window.articles,
     window_embedded: obs.window.embedded,
     window_truncated: obs.window.truncated,
@@ -137,6 +189,21 @@ async function main() {
     console.warn("  累計行数が取れなかった（記録自体は成功している）");
   } else {
     console.log(`  累計 ${count} 行（今回 ${rows.length} 行）`);
+  }
+
+  // 週次ガード（YAT-77）: near_dup を算出できた feed 数が床を割ったら赤くする。母集団が痩せた
+  // 観測はその事実こそ記録すべき値なので、**行を insert してから**判定する（doc [local]）。
+  // ただし near_dup_fresh=false（混在期・compute 失敗）のときは feedsWithRate=0 が設計どおりの
+  // 正常なので、ガードは fresh のときだけ有効にする——さもないと空白期に毎週赤が出続けて
+  // 「うるさいガードを外す → 静かな死」を踏む（doc open 12 と同型）。
+  if (nearDupFresh && obs.feedsWithRate < FEEDS_WITH_RATE_FLOOR) {
+    console.error(
+      `\n✗ near_dup を算出できた active feed が ${obs.feedsWithRate} 本しかない（床 ${FEEDS_WITH_RATE_FLOOR} / 構造上限 21）`,
+    );
+    console.error(
+      `  母集団が痩せている。embed 経路（ingest の embedStalled / embedGateStuck）と feed の本文長を確認`,
+    );
+    process.exit(1);
   }
 }
 
