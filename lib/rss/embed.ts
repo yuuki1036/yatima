@@ -513,9 +513,10 @@ export async function embedHealthCounts(
 }
 
 export type PruneResult = {
-  /** この run で embedding を NULL にした件数。 */
+  /** この run で embedding を NULL にした件数（update の Prefer: count による更新行数）。 */
   pruned: number;
-  /** prune 後に窓外へ残っている件数（次 run 以降で消える分）。 */
+  /** prune 後に窓外へ残っている件数。update が WHERE 全該当を 1 回で消すので成功時は常に 0、
+   *  更新自体が失敗したときだけ -1（判定不能）。ingest 側の pruneStalled はこの -1 で赤くする。 */
   remaining: number;
 };
 
@@ -546,34 +547,22 @@ export async function pruneStaleEmbeddings(
   // prune は WHERE 条件で書けるので ID 列挙は不要。UPDATE の WHERE 対象行数には max-rows 制限が
   // かからないため、窓外がいくつあっても 1 リクエストで済む（embedding を NULL にするだけなので軽い）。
   //
-  // 件数は「更新前の窓外数 − 更新後の窓外数」で出す。update に .select() を付けて全行を返させると
-  // 大量時に重いので、head+count の差分で数える。
-  const { count: before, error: beforeErr } = await staleFilter(
-    supabase.from("articles").select("id", { count: "exact", head: true }),
-  );
-  if (beforeErr) {
-    console.warn("embedding prune の対象件数取得に失敗:", beforeErr);
-    return { pruned: 0, remaining: -1 };
-  }
-  if ((before ?? 0) === 0) return { pruned: 0, remaining: 0 };
-
-  const { error: upErr } = await staleFilter(
-    supabase.from("articles").update({ embedding: null }),
+  // 件数は update に count:"exact" を付けて「更新した行数」で数える（PostgREST の Prefer: count）。
+  // 以前は before/after の 2 回 SELECT count(*) の差分で数えていたが、`embedding is not null` に
+  // 効く部分 index が無い（0017 で idx_articles_embedding は `where summary is not null` に変わった）
+  // ため count(*) が本番規模でフルスキャンし、statement timeout（約 8s・空エラー { message: '' }）に
+  // 達して prune が毎回 -1 を返し cron を赤くしていた（#84 と同型。YAT-77 hotfix）。update は同じ
+  // WHERE でも該当行だけを触るので 2 count より軽く、更新後の窓外は 0 なので再カウントも要らない。
+  const { count: pruned, error: upErr } = await staleFilter(
+    supabase.from("articles").update({ embedding: null }, { count: "exact" }),
   );
   if (upErr) {
+    // 更新失敗は remaining:0（全クリア）でなく -1（判定不能）に倒す。0 を返すと ingest 側の
+    // pruneStalled 検知をすり抜け、実際は残っているのに「排出完了」と誤報告する
+    // （knowledge fail-soft-return-breaks-ratio-logs）。
     console.warn("embedding prune の更新に失敗:", upErr);
     return { pruned: 0, remaining: -1 };
   }
-
-  // 再カウントの失敗は remaining:0（全クリア）でなく -1（判定不能）に倒す。0 を返すと
-  // ingest 側の pruneStalled 検知をすり抜け、実際は残っているのに「排出完了」と誤報告する
-  // （knowledge fail-soft-return-breaks-ratio-logs）。update は成功しているので pruned は before。
-  const { count: after, error: afterErr } = await staleFilter(
-    supabase.from("articles").select("id", { count: "exact", head: true }),
-  );
-  if (afterErr) {
-    console.warn("embedding prune 後の残数取得に失敗:", afterErr);
-    return { pruned: before ?? 0, remaining: -1 };
-  }
-  return { pruned: (before ?? 0) - (after ?? 0), remaining: after ?? 0 };
+  // 更新が成功すれば窓外の embedding は全て NULL になったので残りは 0。
+  return { pruned: pruned ?? 0, remaining: 0 };
 }
