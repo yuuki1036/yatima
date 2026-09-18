@@ -17,6 +17,11 @@ import { todayJst } from "../lib/format";
 // （summary IS NULL のみ対象）では拾えず残る。タグが無いと興味順スコアに乗らないため、
 // ここで対象を抽出 → 本文補完（薄い記事のみ）→ 再アノテートでタグを補う。
 //
+// **台帳・日次上限の対象外（YAT-78・design doc open 8 の (b)）。** この経路（annotateUntagged）は
+// llm_batches に記録せず DAILY_SUMMARIZE_CAP も消費しない。手動・低頻度で月額寄与がほぼゼロのため、
+// 「llm_batches が唯一の支出台帳」の唯一の例外として台帳外に置く。annotate() で課金は発生する
+// ので、大量に回すときは Anthropic の Usage を直接確認すること。
+//
 // 使い方:
 //   npm run retag                    … dry-run（対象件数のみ表示・書き込みなし）
 //   npm run retag -- --apply         … 再アノテートを実行（タグを付与・LLM 呼び出しが走る）

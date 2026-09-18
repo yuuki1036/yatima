@@ -8,7 +8,8 @@ import { coerceTags, TAG_VOCAB_PROMPT } from "@/lib/tags/vocabulary";
 // API キーは ANTHROPIC_API_KEY（NEXT_PUBLIC_ は付けない＝クライアントに鍵を漏らさない）。
 // 呼び出し元はサーバーのみ: cron スクリプトと Server Action。
 
-const MODEL = "claude-haiku-4-5";
+// 台帳（llm_batches.model・YAT-78）にも書くため export する。要約経路の唯一のモデル。
+export const MODEL = "claude-haiku-4-5";
 
 const SYSTEM_PROMPT = [
   "あなたは技術記事の要約者です。",
