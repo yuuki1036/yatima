@@ -14,11 +14,16 @@ import {
   isEmbedStalled,
   isEmbedGateStuck,
   isEmbedSelectStalled,
+  isSelectionDead,
+  isQuarantineSurging,
   DECK_STARVED_FLOOR,
   STALE_ALERT_HOURS,
 } from "../lib/rss/ingest-health";
 import { enrichMissingBodies } from "../lib/rss/enrich";
-import { annotateMissing } from "../lib/llm/summarize-batch";
+import {
+  annotateMissing,
+  summaryQuarantineCounts,
+} from "../lib/llm/summarize-batch";
 import {
   embedHealthCounts,
   embedMissing,
@@ -59,29 +64,45 @@ async function main() {
   );
 
   // 取得後にバッチ要約+タグ付け（summary IS NULL を埋める）。個々の失敗は fail-soft で流し、
-  // 全滅だけ末尾でまとめて赤くする（YAT-73。判定は下の「失敗の可視化」節）。
-  const s = await annotateMissing(supabase);
+  // 全滅・選抜死・帰責失敗・隔離暴走を末尾でまとめて赤くする（YAT-73 / YAT-78。判定は下の
+  // 「失敗の可視化」節）。選抜は feed ラウンドロビン（claim RPC）、日次上限は llm_batches の
+  // 当日 request_count 合計（投入基準・YAT-78）。
+  const s = await annotateMissing(supabase, { runKind: "cron" });
   console.log(
-    `要約+タグ: 成功 ${s.succeeded} / 失敗 ${s.failed}${s.skipped ? " (ANTHROPIC_API_KEY 未設定でスキップ)" : ""}`,
+    `要約+タグ: 母数 ${s.pool} → 選抜 ${s.selected} / 成功 ${s.succeeded} / 失敗 ${s.failed}` +
+      `（課金 ${s.charged} / 解放 ${s.released}）` +
+      (s.skipped ? ` (skip: ${s.skipReason})` : ""),
   );
-  // 消費台帳（YAT-74）。毎 run 出しておくと「今日いくら使ったか」が Actions のログから読める。
-  // クレジット枯渇のとき、この数字がプロジェクト側のどこにも無かったのが診断を遅らせた。
-  if (!s.skipped && !s.capUnavailable) {
+  // 消費台帳（YAT-74 → YAT-78）。分母は台帳（投入基準）＝ dailyUsed + この run の selected。
+  // succeeded を足さない（fail-soft-return-breaks-ratio-logs: 分子と分母を別ステージ由来にしない）。
+  if (!s.skipped && !s.capUnavailable && !s.ledgerError) {
     console.log(
-      `  日次要約: ${s.dailyUsed + s.succeeded} / ${s.dailyCap} 件（UTC 日次上限）`,
+      `  日次要約: ${s.dailyUsed + s.selected} / ${s.dailyCap} 件（UTC・投入基準）`,
     );
-    if (s.dailyCapped) {
-      console.log(
-        `  ⚠ 日次上限に達したため要約を見送った。対象が無いのではなく上限で止まっている`,
-      );
-    }
+  }
+  if (s.skipped && s.skipReason === "daily_capped") {
+    console.log(
+      `  ⚠ 日次上限（${s.dailyCap}）に達したため要約を見送った。対象が無いのではなく上限で止まっている`,
+    );
   }
   if (s.capUnavailable) {
     console.error(
-      `\n⚠ 日次消費の台帳クエリに失敗した（migration 0016 未適用の可能性）`,
+      `\n⚠ 日次消費の台帳（llm_batches）クエリに失敗した（migration 0017 未適用の可能性）`,
     );
     console.error(
       `  上限が確認できないため要約を見送った。これは上限到達ではなく障害なので赤くする`,
+    );
+  }
+  if (s.ledgerError) {
+    console.error(`\n⚠ 要約台帳（llm_batches）の記録に失敗した: ${s.ledgerError}`);
+    console.error(
+      `  LLM を呼ばず予約を解放した。台帳が書けないと支出天井が効かないので赤くする`,
+    );
+  }
+  if (s.settleError) {
+    console.error(`\n⚠ 要約失敗の帰責（settle_summary_attempts）に失敗した: ${s.settleError}`);
+    console.error(
+      `  予約が残ったままになる（次 run で候補から一時的に消える）。RPC / 権限を確認`,
     );
   }
 
@@ -180,6 +201,35 @@ async function main() {
     );
   }
 
+  // 要約の選抜死（YAT-78）: claim RPC の恒常失敗、または「候補はあるのに 1 件も予約できない」。
+  // annotateDead は failed>0 が要るが、選抜が 0 件だと failed=0 で素通りする穴を塞ぐ。
+  // 正常な抑制（daily_capped / no_api_key）は skipped で自動除外、capUnavailable は pool=-1 で不活性。
+  const selectionDead = isSelectionDead(s);
+  if (selectionDead) {
+    console.error(
+      `\n⚠ 要約の選抜が死んでいる（母数 ${s.pool} / 選抜 ${s.selected}${s.poolError ? ` / エラー: ${s.poolError}` : ""}）`,
+    );
+    console.error(
+      `  claim_summary_candidates の失敗 / migration 0017 未適用 / RPC 権限（service_role）を疑う`,
+    );
+  }
+
+  // 隔離（summary_attempts >= 3）の 24h 暴走（YAT-78・ADR-20260906205227）。環境起因の失敗を
+  // 誤って課金すると backlog 上位が全滅する。増えすぎたら赤くして npm run unquarantine を促す。
+  const quarantine = await summaryQuarantineCounts(supabase);
+  const quarantineSurge = isQuarantineSurging(quarantine);
+  if (quarantineSurge) {
+    console.error(
+      `\n⚠ 隔離（summary_attempts >= 3）が直近 24h で ${quarantine.quarantinedLast24h} 件に増えた`,
+    );
+    console.error(
+      `  環境起因の失敗を誤課金している可能性。npm run unquarantine で戻せる。対象（先頭 10 件）:`,
+    );
+    for (const q of quarantine.samples) {
+      console.error(`    - [${q.id}] ${q.title ?? "(無題)"}: ${q.lastError ?? ""}`);
+    }
+  }
+
   // 全フィード失敗は「6 時間待たずに今すぐ赤くすべき」別の障害モードなので併存させる。
   // prune が機能しなくなると embedding が単調増加し、無料枠 500MB を静かに食い潰す
   // （残り 83MB / 1 件 12.2KB なので、止まれば 1 ヶ月強で書き込みごと落ちる）。
@@ -261,6 +311,10 @@ async function main() {
     allFailed ||
     stale.length > 0 ||
     annotateDead ||
+    selectionDead ||
+    quarantineSurge ||
+    s.ledgerError !== null ||
+    s.settleError !== null ||
     embedDead ||
     embedStalled ||
     embedGateStuck ||

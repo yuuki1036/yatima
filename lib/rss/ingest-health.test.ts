@@ -7,6 +7,9 @@ import {
   isEmbedStalled,
   isEmbedGateStuck,
   isEmbedSelectStalled,
+  isSelectionDead,
+  isQuarantineSurging,
+  QUARANTINE_SURGE_LIMIT,
   DECK_STARVED_FLOOR,
   STALE_ALERT_HOURS,
 } from "@/lib/rss/ingest-health";
@@ -255,5 +258,48 @@ describe("isDeckStarved", () => {
 
   it("カウント取得失敗（-1）は判定不能として不活性", () => {
     expect(isDeckStarved(-1)).toBe(false);
+  });
+});
+
+describe("isSelectionDead", () => {
+  const base = { skipped: false, pool: 20, selected: 10, poolError: null as string | null };
+
+  it("正常な選抜（pool>0 ∧ selected>0）は dead ではない", () => {
+    expect(isSelectionDead(base)).toBe(false);
+  });
+
+  it("poolError があれば dead（claim RPC / 対象 select の失敗）", () => {
+    expect(isSelectionDead({ ...base, poolError: "rpc failed" })).toBe(true);
+  });
+
+  it("候補はあるのに 1 件も予約できない（pool>0 ∧ selected=0）は dead", () => {
+    expect(isSelectionDead({ ...base, selected: 0 })).toBe(true);
+  });
+
+  it("正常な抑制（daily_capped / no_api_key）は skipped で除外", () => {
+    // skipped=true のときは pool=0/selected=0 でも発火しない
+    expect(isSelectionDead({ skipped: true, pool: 0, selected: 0, poolError: null })).toBe(false);
+  });
+
+  it("対象ゼロ（pool=0 ∧ selected=0）は正常＝dead ではない", () => {
+    expect(isSelectionDead({ ...base, pool: 0, selected: 0 })).toBe(false);
+  });
+
+  it("capUnavailable（pool=-1）は発火しない", () => {
+    expect(isSelectionDead({ ...base, pool: -1, selected: 0 })).toBe(false);
+  });
+});
+
+describe("isQuarantineSurging", () => {
+  it("閾値ちょうどは surge ではない", () => {
+    expect(isQuarantineSurging({ quarantinedLast24h: QUARANTINE_SURGE_LIMIT })).toBe(false);
+  });
+
+  it("閾値超過で surge", () => {
+    expect(isQuarantineSurging({ quarantinedLast24h: QUARANTINE_SURGE_LIMIT + 1 })).toBe(true);
+  });
+
+  it("カウント取得失敗（-1）は不活性", () => {
+    expect(isQuarantineSurging({ quarantinedLast24h: -1 })).toBe(false);
   });
 });

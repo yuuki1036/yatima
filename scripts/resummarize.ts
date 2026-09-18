@@ -63,34 +63,48 @@ async function main() {
   let totalOk = 0;
   let consecutiveZero = 0;
   for (;;) {
-    const r = await annotateMissing(supabase);
+    const r = await annotateMissing(supabase, { runKind: "manual" });
     if (r.skipped) {
-      console.warn("ANTHROPIC_API_KEY 未設定でスキップ");
+      // 日次上限（YAT-78）に達しても skipReason='daily_capped' で止まる。これを「全件完了」と
+      // 誤判定すると大半が summary=NULL のまま偽の完了ログを出すため、理由で break を分ける。
+      if (r.skipReason === "daily_capped") {
+        console.log(
+          `日次上限（${r.dailyCap} 件）に達したので中断。残りは翌 UTC 日に再実行してください`,
+        );
+      } else {
+        console.warn("ANTHROPIC_API_KEY 未設定でスキップ");
+      }
       break;
     }
-    // 日次上限（YAT-74）に達しても picked=0 になる。これを「全件完了」と誤判定すると、
-    // 大半が summary=NULL のまま偽の完了ログを出す。dailyCapped で区別して break 理由を分ける。
-    if (r.dailyCapped) {
-      console.log(
-        `日次上限（${r.dailyCap} 件）に達したので中断。残りは翌 UTC 日に再実行してください`,
-      );
-      break;
-    }
+    // 台帳 read / claim / 台帳 insert / settle の障害は「全件完了（selected=0）」と区別する。
+    // これらで break しないと、RPC が壊れたまま selected=0 を返し続けて偽の完了になる。
     if (r.capUnavailable) {
-      console.error("日次台帳クエリに失敗（migration 0016 未適用の可能性）。中断します");
+      console.error("日次台帳（llm_batches）の読み取りに失敗（migration 0017 未適用の可能性）。中断");
       break;
     }
-    if (r.picked === 0) {
+    if (r.ledgerError) {
+      console.error(`要約台帳の記録に失敗: ${r.ledgerError}。中断`);
+      break;
+    }
+    if (r.poolError) {
+      console.error(`要約候補の claim に失敗: ${r.poolError}。中断`);
+      break;
+    }
+    if (r.settleError) {
+      console.error(`帰責（settle）に失敗: ${r.settleError}。予約が残る。中断`);
+      break;
+    }
+    if (r.selected === 0) {
       console.log("全件完了");
       break;
     }
     totalOk += r.succeeded;
-    console.log(`  +${r.succeeded}/${r.picked} 成功（累計 ${totalOk}）`);
+    console.log(`  +${r.succeeded}/${r.selected} 成功（累計 ${totalOk}）`);
     if (r.succeeded === 0) {
       consecutiveZero += 1;
       if (consecutiveZero >= MAX_CONSECUTIVE_ZERO) {
         console.warn(
-          `残り ${r.picked} 件が ${MAX_CONSECUTIVE_ZERO} 連続で全失敗。中断`,
+          `残り ${r.selected} 件が ${MAX_CONSECUTIVE_ZERO} 連続で全失敗。中断`,
         );
         break;
       }

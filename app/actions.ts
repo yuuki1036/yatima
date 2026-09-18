@@ -315,6 +315,7 @@ export async function refreshNow(): Promise<RefreshState> {
       await enrichMissingBodies(supabase);
       const a = await annotateMissing(supabase, {
         limit: MANUAL_ANNOTATE_LIMIT,
+        runKind: "manual",
       });
       annotated = a.succeeded;
     }
