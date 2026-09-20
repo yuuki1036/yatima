@@ -156,3 +156,34 @@ export const DECK_STARVED_FLOOR = 40;
 export function isDeckStarved(candidateCount: number): boolean {
   return candidateCount >= 0 && candidateCount < DECK_STARVED_FLOOR;
 }
+
+// ── 要約の選抜・帰責の静かな死の検知（YAT-78）──────────────────────────────
+//
+// 要約の選抜を claim_summary_candidates RPC に寄せた結果生まれる新しい静かな死:
+// RPC が恒常的に落ちると選抜が 0 件のまま流れ、annotateDead（failed>0 && succeeded==0）は
+// failed=0 なので発火しない。embed 側の isEmbedSelectStalled と同じ穴（design doc open 12）。
+//
+// 判定は run 単位で足りる（26h 窓は要らない）: poolError は claim RPC / 対象 select の失敗、
+// pool>0 ∧ selected==0 は「候補はあるのに 1 件も予約できない」＝選抜の全閉。
+// 正常な抑制（日次上限 daily_capped / no_api_key）は skipped で自動除外する——ここで s.skipped を
+// 見るのが要点。「うるさいガードを外す → 静かな死」を過去 4 回踏んだ形の再来を防ぐため、
+// skip 理由を判別可能ユニオンで持ち、生存系ガードから明示的に外す（design doc 設計判断）。
+// capUnavailable（台帳 read 失敗）は pool を -1 で返すので pool>0 が偽になり、ここでは
+// 発火しない（capUnavailable は呼び出し側が別途 exit 1 する障害）。
+export function isSelectionDead(s: {
+  skipped: boolean;
+  pool: number;
+  selected: number;
+  poolError: string | null;
+}): boolean {
+  return !s.skipped && (s.poolError !== null || (s.pool > 0 && s.selected === 0));
+}
+
+// 隔離（summary_attempts >= 3）の暴走検知（YAT-78・ADR-20260906205227）。環境起因の失敗を
+// chargeable に誤分類すると健全期の backlog 上位が 3 run で全滅する。24h の増加率が閾値を
+// 超えたら赤くして npm run unquarantine の実行を促す。取得失敗（-1）は不活性（0 と混ぜない）。
+export const QUARANTINE_SURGE_LIMIT = 5;
+
+export function isQuarantineSurging(c: { quarantinedLast24h: number }): boolean {
+  return c.quarantinedLast24h > QUARANTINE_SURGE_LIMIT;
+}
