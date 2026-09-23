@@ -28,6 +28,7 @@
     "backfill:body-text-len": "tsx scripts/backfill-body-text-len.ts",
     "resummarize": "tsx scripts/resummarize.ts",
     "retag": "tsx scripts/retag.ts",
+    "fix-annotations": "tsx scripts/fix-broken-annotations.ts",
     "retire-news-quiz": "tsx scripts/retire-news-quiz.ts",
     "reshuffle-quiz-choices": "tsx scripts/reshuffle-quiz-choices.ts"
   },
