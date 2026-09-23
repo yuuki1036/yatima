@@ -174,29 +174,59 @@ export async function findUntaggedSummarized(
 // 設計なので、モデルが JSON を返そうとして壊れた場合はその生テキストが summary に入る。
 //
 // 署名は「日本語の要約には現れないが、壊れた JSON 出力には現れる」文字列に絞る:
-//   "summary" / "tags" … JSON のキーがそのまま残っている
-//   ```        … コードフェンスが剥がれずに残っている
+//   "summary": / "tags": … JSON のキーがそのまま残っている
+//   ```               … コードフェンスが剥がれずに残っている
 // 誤検出は皆無にはできない（引用で出現しうる）ため、呼び出し側は dry-run で目視させること。
-const BROKEN_SUMMARY_PATTERNS = ['%"summary"%', '%"tags"%', "%```%"];
+export function isBrokenSummary(summary: string | null): boolean {
+  if (!summary) return false;
+  return /"(summary|tags)"\s*:|```/.test(summary);
+}
 
-// 壊れた要約を持つ記事を返す。パターンごとに引いて id で重複排除する
-// （PostgREST の .or() は値に " を含められないため 1 本にまとめない）。
+const BROKEN_SCAN_PAGE = 1000; // 1 ページの走査件数（PostgREST 既定上限）
+const BROKEN_FETCH_CHUNK = 100; // 本文込みで取り直すときの .in() 分割幅（URL 長対策）
+
+// 壊れた要約を持つ記事を返す。
+//
+// DB 側の like '%...%' で絞れない: 前方一致でないため index が使えず、articles 全体（約 5 万行）の
+// seq scan になって statement timeout（57014）に達する。かわりに **id + summary だけ**を
+// キーセットページングで走査し（pk index の range scan なので深いページでも劣化しない）、
+// 判定は JS で行う。content_html を載せないのが肝——載せると TOAST の解凍で重くなる（0018 と同じ罠）。
+// 本文は当たった行のぶんだけ後から取り直す。
 export async function findBrokenAnnotations(
   supabase: SupabaseClient,
 ): Promise<UntaggedRow[]> {
-  const byId = new Map<string, UntaggedRow>();
-  for (const pattern of BROKEN_SUMMARY_PATTERNS) {
+  const brokenIds: string[] = [];
+  let cursor = "";
+  for (;;) {
+    let q = supabase
+      .from("articles")
+      .select("id, summary")
+      .not("summary", "is", null)
+      .order("id", { ascending: true })
+      .limit(BROKEN_SCAN_PAGE);
+    if (cursor) q = q.gt("id", cursor);
+    const { data, error } = await q;
+    if (error) throw error;
+    const page = (data ?? []) as { id: string; summary: string | null }[];
+    for (const r of page) {
+      if (isBrokenSummary(r.summary)) brokenIds.push(r.id);
+    }
+    if (page.length < BROKEN_SCAN_PAGE) break; // 最終ページ
+    cursor = page[page.length - 1].id;
+  }
+
+  // 当たった行だけ本文込みで取り直す（アノテートの入力に content_html が要る）。
+  const out: UntaggedRow[] = [];
+  for (let i = 0; i < brokenIds.length; i += BROKEN_FETCH_CHUNK) {
     const { data, error } = await supabase
       .from("articles")
       .select("id, title, url, content_html, summary")
-      .like("summary", pattern)
+      .in("id", brokenIds.slice(i, i + BROKEN_FETCH_CHUNK))
       .order("published_at", { ascending: false, nullsFirst: false });
     if (error) throw error;
-    for (const r of (data ?? []) as (UntaggedRow & { summary: string })[]) {
-      if (!byId.has(r.id)) byId.set(r.id, r);
-    }
+    out.push(...((data ?? []) as UntaggedRow[]));
   }
-  return [...byId.values()];
+  return out;
 }
 
 export type RetagResult = {

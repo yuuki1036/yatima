@@ -4,6 +4,7 @@ import type { Summarizer } from "./types";
 import {
   annotateRows,
   findBrokenAnnotations,
+  isBrokenSummary,
   type UntaggedRow,
 } from "./summarize-batch";
 
@@ -79,33 +80,75 @@ describe("annotateRows", () => {
   });
 });
 
+describe("isBrokenSummary", () => {
+  it("JSON キーやコードフェンスが残った要約だけを壊れていると判定する", () => {
+    expect(isBrokenSummary('{"summary": "x"} 注: …')).toBe(true);
+    expect(isBrokenSummary('… "tags":["tech/ai"]')).toBe(true);
+    expect(isBrokenSummary("```json")).toBe(true);
+    expect(isBrokenSummary("正常な日本語の要約。tags や summary という語を含んでも壊れてはいない")).toBe(false);
+    expect(isBrokenSummary(null)).toBe(false);
+  });
+});
+
 describe("findBrokenAnnotations", () => {
-  it("複数パターンに当たった記事を id で重複排除して返す", async () => {
-    const byPattern: Record<string, { id: string; summary: string }[]> = {
-      '%"summary"%': [
-        { id: "a1", summary: '{"summary": "x"} 注: …' },
-        { id: "a2", summary: '…"summary":' },
-      ],
-      '%"tags"%': [{ id: "a1", summary: '{"summary": "x"} 注: …' }], // a1 は重複
-      "%```%": [{ id: "a3", summary: "```json" }],
-    };
-    const calls: string[] = [];
+  it("id でキーセット走査し、当たった行だけ本文込みで取り直す", async () => {
+    // 2 ページ（1000 件境界）をまたぐ走査を模す。壊れているのは a0500 と a1200。
+    const page1 = Array.from({ length: 1000 }, (_, i) => ({
+      id: `a${String(i).padStart(4, "0")}`,
+      summary: i === 500 ? '{"summary": "x"} 注: …' : "正常な要約",
+    }));
+    const page2 = [
+      { id: "a1200", summary: "```json" },
+      { id: "a1201", summary: "正常な要約" },
+    ];
+    const cursors: (string | null)[] = [];
+    const fetched: string[][] = [];
+
     const sb = {
       from: () => ({
-        select: () => ({
-          like: (_col: string, pattern: string) => {
-            calls.push(pattern);
-            return {
-              order: () =>
-                Promise.resolve({ data: byPattern[pattern], error: null }),
+        select: (cols: string) => {
+          if (cols === "id, summary") {
+            const q = {
+              cursor: null as string | null,
+              not: () => q,
+              order: () => q,
+              limit: () => q,
+              gt: (_c: string, v: string) => {
+                q.cursor = v;
+                return q;
+              },
+              then: (resolve: (v: unknown) => void) => {
+                cursors.push(q.cursor);
+                resolve({ data: q.cursor ? page2 : page1, error: null });
+              },
             };
-          },
-        }),
+            return q;
+          }
+          return {
+            in: (_c: string, ids: string[]) => {
+              fetched.push(ids);
+              return {
+                order: () =>
+                  Promise.resolve({
+                    data: ids.map((id) => ({
+                      id,
+                      title: "題",
+                      url: null,
+                      content_html: "<p>本文</p>",
+                      summary: "壊れた要約",
+                    })),
+                    error: null,
+                  }),
+              };
+            },
+          };
+        },
       }),
     } as unknown as SupabaseClient;
 
     const rows = await findBrokenAnnotations(sb);
-    expect(rows.map((r) => r.id)).toEqual(["a1", "a2", "a3"]);
-    expect(calls).toEqual(['%"summary"%', '%"tags"%', "%```%"]);
+    expect(cursors).toEqual([null, "a0999"]); // 2 ページ目は最終 id をカーソルに継ぐ
+    expect(fetched).toEqual([["a0500", "a1200"]]); // 当たった 2 件だけ取り直す
+    expect(rows.map((r) => r.id)).toEqual(["a0500", "a1200"]);
   });
 });
