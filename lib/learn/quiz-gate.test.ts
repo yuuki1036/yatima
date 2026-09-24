@@ -3,6 +3,11 @@ import {
   shuffleChoices,
   choiceShuffleSeed,
   markQuizDuplicates,
+  judgeUnjudgedRows,
+  pickBodyWindow,
+  toJudgeRow,
+  DUP_JUDGE_ERA_START,
+  type JudgeRow,
   type QuizInsertRow,
 } from "@/lib/learn/quiz-gate";
 import { QUIZ_DEDUP_THRESHOLD } from "@/lib/ranking/dedup";
@@ -189,5 +194,124 @@ describe("shuffleChoices", () => {
     // （シャッフル導入前の実データは χ²=89 だった）。
     expect(chi).toBeLessThan(16.27);
     for (const n of dist) expect(n).toBeGreaterThan(0);
+  });
+});
+
+// YAT-82: embed 失敗で判定を受けずに入った行は、backfill で embedding が埋まっても再判定されず、
+// 既存問題の言い換え（類似度 0.905〜0.960）が出題され続けていた。再判定の意味論を固定する。
+describe("judgeUnjudgedRows", () => {
+  const unit = (rad: number) => [Math.cos(rad), Math.sin(rad)];
+  const row = (id: string, rad: number, unjudged: boolean, dupFlag = false): JudgeRow => ({
+    id,
+    vec: unit(rad),
+    unjudged,
+    dupFlag,
+  });
+
+  it("判定欠落行が前の問題の近重複なら dup_flag を立て、類似度を残す", () => {
+    const r = judgeUnjudgedRows([row("orig", 0, false), row("para", Math.acos(0.93), true)]);
+    expect(r).toEqual([
+      { id: "para", kind: "judge", dupFlag: true, dupSimilarity: expect.closeTo(0.93, 5) },
+    ]);
+  });
+
+  it("閾値未満なら dup_flag=false でも類似度は書く（判定済みにして次回以降の対象から外す）", () => {
+    const r = judgeUnjudgedRows([row("a", 0, false), row("b", Math.acos(0.5), true)]);
+    expect(r[0].dupFlag).toBe(false);
+    expect(r[0].dupSimilarity).toBeCloseTo(0.5, 5);
+  });
+
+  // 元の問題を後発の言い換えの重複として落とさない。後発の方を格上げする。
+  it("判定欠落行の後発の近重複は、判定欠落行でなく後発を dup に格上げする", () => {
+    const r = judgeUnjudgedRows([row("orig", 0, true), row("later", Math.acos(0.95), false)]);
+    expect(r).toEqual([
+      { id: "orig", kind: "judge", dupFlag: false, dupSimilarity: 0 },
+      { id: "later", kind: "upgrade", dupFlag: true, dupSimilarity: expect.closeTo(0.95, 5) },
+    ]);
+  });
+
+  it("後発でも閾値未満や既に dup の行は格上げしない", () => {
+    const r = judgeUnjudgedRows([
+      row("orig", 0, true),
+      row("far", Math.acos(0.5), false),
+      row("already", Math.acos(0.95), false, true),
+    ]);
+    expect(r.filter((j) => j.kind === "upgrade")).toEqual([]);
+  });
+
+  it("判定欠落行より前の判定済み行は格上げしない（それは判定欠落行の側の母集団）", () => {
+    const r = judgeUnjudgedRows([row("earlier", 0, false), row("x", Math.acos(0.95), true)]);
+    expect(r.map((j) => j.kind)).toEqual(["judge"]);
+  });
+
+  it("対象外の行は結果に出さないが、母集団には入る", () => {
+    const r = judgeUnjudgedRows([
+      row("legacy", 0, false),
+      row("judged", Math.PI / 2, false),
+      row("x", Math.acos(QUIZ_DEDUP_THRESHOLD) - 0.01, true),
+    ]);
+    expect(r.map((j) => j.id)).toEqual(["x"]);
+    expect(r[0].dupFlag).toBe(true);
+  });
+
+  it("同じ回に埋まった判定欠落行どうしも、先の行を母集団にして判定する", () => {
+    const r = judgeUnjudgedRows([row("p1", 0, true), row("p2", Math.acos(0.9), true)]);
+    expect(r.map((j) => j.dupFlag)).toEqual([false, true]);
+  });
+});
+
+// 再判定で書き換える行を決める述語。書き戻した dup_similarity は null に戻らないので、
+// 境界前の行（0013 が遡って判定しない方針とした行）を誤って対象にすると取り消せない。
+describe("toJudgeRow", () => {
+  const era = Date.parse(DUP_JUDGE_ERA_START);
+  const base = { id: "q", embedding: "[1,0]", dup_flag: false };
+
+  it("境界の直前の null 行は対象外", () => {
+    const r = toJudgeRow({ ...base, created_at: "2026-07-22T23:59:59Z", dup_similarity: null }, era);
+    expect(r?.unjudged).toBe(false);
+  });
+
+  it("境界ちょうどの null 行は対象", () => {
+    const r = toJudgeRow({ ...base, created_at: DUP_JUDGE_ERA_START, dup_similarity: null }, era);
+    expect(r?.unjudged).toBe(true);
+  });
+
+  it("判定済み（類似度 0 を含む）は対象外", () => {
+    const r = toJudgeRow({ ...base, created_at: "2026-08-17T00:00:00Z", dup_similarity: 0 }, era);
+    expect(r?.unjudged).toBe(false);
+  });
+
+  it("embedding を読めない行は除く", () => {
+    const r = toJudgeRow(
+      { ...base, embedding: "", created_at: "2026-08-17T00:00:00Z", dup_similarity: null },
+      era,
+    );
+    expect(r).toBeNull();
+  });
+});
+
+// YAT-82: 常に先頭 2 万字だけを渡していたため、長いソースでも冒頭の章からしか出題されなかった。
+describe("pickBodyWindow", () => {
+  const words = Array.from({ length: 2000 }, (_, i) => `w${i}`).join(" ");
+
+  it("上限以下の本文はそのまま返す", () => {
+    expect(pickBodyWindow("short text", 100, () => 0.99)).toBe("short text");
+  });
+
+  it("窓は上限を超えない", () => {
+    for (const x of [0, 0.3, 0.7, 0.999]) {
+      expect(pickBodyWindow(words, 500, () => x).length).toBeLessThanOrEqual(500);
+    }
+  });
+
+  it("rng=0 は先頭、rng→1 は末尾側を読む（長いソースの後半も素材になる）", () => {
+    expect(pickBodyWindow(words, 500, () => 0).startsWith("w0 ")).toBe(true);
+    expect(pickBodyWindow(words, 500, () => 0.999)).toContain("w1990 ");
+  });
+
+  it("語の途中から始めない", () => {
+    const w = pickBodyWindow(words, 500, () => 0.5);
+    expect(w).toMatch(/^w\d+ /);
+    expect(words.includes(w)).toBe(true); // 逐語照合の母体なので原文の部分文字列であること
   });
 });

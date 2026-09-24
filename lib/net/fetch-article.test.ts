@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { isHtmlContentType, extractedTextLength } from "@/lib/net/fetch-article";
+import { isHtmlContentType, extractedTextLength, linkTextRatio } from "@/lib/net/fetch-article";
 
 // fetchAndExtractArticle 自体はネットワーク IO を持つのでテスト対象外（YAT-46 の選定基準）。
 // ここでは IO を伴わない述語だけを固定する。
@@ -56,5 +56,27 @@ describe("extractedTextLength", () => {
 
   it("空文字は 0", () => {
     expect(extractedTextLength("")).toBe(0);
+  });
+
+  // YAT-82: 以前は htmlToInputText の既定上限で 2000 字に頭打ちし、2000 を超える足切り値が効かなかった。
+  it("2000 字を超える本文も全長を数える", () => {
+    expect(extractedTextLength(`<p>${"a".repeat(6000)}</p>`)).toBe(6000);
+  });
+});
+
+// YAT-82: 目次・講座一覧（リンク集）を学習ソースから外すための指標。
+describe("linkTextRatio", () => {
+  it("本文がリンクばかりなら 1 に近い", () => {
+    const html = "<ul>" + "<li><a href='/x'>Some guide title</a></li>".repeat(20) + "</ul>";
+    expect(linkTextRatio(html)).toBeGreaterThan(0.9);
+  });
+
+  it("解説本文の中にリンクが少しあるだけなら小さい", () => {
+    const html = `<p>${"prose ".repeat(200)}<a href="/x">see also</a></p>`;
+    expect(linkTextRatio(html)).toBeLessThan(0.05);
+  });
+
+  it("空本文は 0", () => {
+    expect(linkTextRatio("")).toBe(0);
   });
 });

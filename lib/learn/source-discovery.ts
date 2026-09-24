@@ -8,6 +8,7 @@ import {
 import {
   fetchAndExtractArticle,
   extractedTextLength,
+  linkTextRatio,
 } from "@/lib/net/fetch-article";
 import { normalizeUrl } from "@/lib/net/normalize-url";
 
@@ -16,7 +17,15 @@ import { normalizeUrl } from "@/lib/net/normalize-url";
 // （幻覚 URL/リンク切れ/ナビだけの薄いページはここで死ぬ）。承認は人が別途行う（reviewLearnSource）。
 
 // 抽出本文（タグ除去後テキスト）がこの長さ未満なら「薄い＝学習素材に不適」として捨てる。
-const MIN_SOURCE_TEXT_CHARS = 500;
+// YAT-82: 500 → 5000。500 では docs のトップページや目次（リンク＋一行説明の並び）が通り、そこから
+// 作った設問は「このページは何を提供しているか」を問うものばかりになって、すぐ近重複で頭打ちになった
+// （tech/web の承認 5 件は計 1.7 万字しかなく、未回答が 2 問まで枯れた）。承認済み 22 件で見ると
+// 5000 未満はすべて目次・入口ページだった（MDN Web/Guide 3625 / Web/CSS 3204 / redis docs 2593 等）。
+const MIN_SOURCE_TEXT_CHARS = 5000;
+// 本文のうちリンク文字の割合がこれを超えるものはリンク集として捨てる（YAT-82）。長さだけでは
+// 講座一覧（deeplearning.ai 0.97）やリファレンス索引（scikit-learn user guide 1.00）が通るため。
+// 実測で個別の解説ページは 0.02〜0.24、仕様書でも 0.48 だった。
+const MAX_LINK_TEXT_RATIO = 0.5;
 // 並列 fetch のチャンクサイズ（maxDuration=60 内に収める。enrich と同値）。
 const FETCH_CONCURRENCY = 4;
 
@@ -120,6 +129,13 @@ export async function discoverLearnSources(
           // ナビだけ等の薄いページ
           console.warn(
             `[learn] 候補が短すぎる: ${c.url}: ${textLen} < ${MIN_SOURCE_TEXT_CHARS} 文字`,
+          );
+          return null;
+        }
+        const linkRatio = linkTextRatio(fetched.article.contentHtml);
+        if (linkRatio > MAX_LINK_TEXT_RATIO) {
+          console.warn(
+            `[learn] 候補がリンク集: ${c.url}: リンク文字率 ${linkRatio.toFixed(2)} > ${MAX_LINK_TEXT_RATIO}`,
           );
           return null;
         }
