@@ -59,9 +59,9 @@ export type QuizGenResult = {
   passed: number; // 形式＋grounding を通過した数
   inserted: QuizQuestion[]; // quiz_questions へ積んだ問題（dup_flag=true の行も含む）
   dupFlagged: number; // うち近重複として dup_flag を立てた数（出題プールには乗らない）
-  // YAT-63: embed に失敗し embedding=null で積んだ数。この行は dup 判定を受けず、後追いの
-  // backfill が embedding を埋めても判定はやり直されない＝近重複でも出題プールに残る（安全側に
-  // 倒した既知の穴）。embed 失敗そのものは quiz-gate:embedAndDedupQuizRows と llm/embed の
+  // YAT-63: embed に失敗し embedding=null で積んだ数。この行は dup 判定を受けないまま出題プールに入り、
+  // 次の cron で backfill が embedding を埋めた後に rejudgeUnjudgedQuizRows が判定する（YAT-82 までは
+  // 判定をやり直さず、近重複でも残り続けた）。embed 失敗そのものは quiz-gate:embedAndDedupQuizRows と llm/embed の
   // チャンク失敗が元から warn を出していたので、ここで新たに得られるのは**件数**（何問が dup 未判定で
   // プールに入ったか）であって、失敗の検知自体ではない。cron は QuizPoolResult.embedFailed で
   // 持っていたが、オンデマンドは受け取っておきながら捨てていたため揃える。
@@ -69,6 +69,53 @@ export type QuizGenResult = {
   embedSkipped: boolean; // VOYAGE_API_KEY 未設定で embed を呼ばなかった（embedFailed の全件がこれ）
   skipped: boolean; // ANTHROPIC_API_KEY 未設定でスキップ
 };
+
+// ── 同一ソースからの再生成を避ける（YAT-82）───────────────────────
+// 生成はソースごとに同じ本文を LLM に渡すので、既出を知らせないと毎回ほぼ同じ設問が返り、dedup で
+// dup_flag が立つだけで未回答が増えない（09-21 の cron は 9 問中 8 問が dup）。既出の設問を渡して
+// 別の論点へ向かわせる。件数と長さはプロンプト長の上限（1 ソース ≈ 30 × 120 字）。
+const AVOID_STEMS_PER_SOURCE = 30;
+const AVOID_STEM_MAX_CHARS = 120;
+
+// ソースから作成済みの設問（新しい順）。dup 行も含める＝「既に作った」事実は dup でも変わらない。
+// 失敗は空で続行（既出提示は再生成を減らすための補助で、無くても生成自体は成立する）。
+async function loadSourceStems(
+  supabase: SupabaseClient,
+  sourceId: string,
+): Promise<string[]> {
+  const { data, error } = await supabase
+    .from("quiz_questions")
+    .select("stem")
+    .eq("source_ref", sourceId)
+    .eq("status", "active")
+    .order("created_at", { ascending: false })
+    .order("id", { ascending: true })
+    .limit(AVOID_STEMS_PER_SOURCE);
+  if (error) {
+    console.warn(`既出設問の取得に失敗 [${sourceId}]（既出提示なしで続行）:`, error);
+    return [];
+  }
+  return (data ?? []).map((r) => (r.stem as string).slice(0, AVOID_STEM_MAX_CHARS));
+}
+
+// 本文が照合母体の上限より長いとき、どこを読ませるかを選ぶ（pure。rng 注入でテスト可能）。
+// 以前は常に先頭 GROUND_BODY_MAX_CHARS 字だけを渡しており、9.3 万字ある CUDA ガイドでも
+// 冒頭 2 万字（スレッド階層の章）からしか出題されず、同じ設問の再生成が続いた。
+// 開始位置をランダムにずらし、長いソースの後半も素材にする。語の途中から始めないよう直後の空白へ寄せる
+// （窓の先頭の断片語は逐語照合の母体に残っても害は無いが、LLM に渡す文として不自然なため）。
+export function pickBodyWindow(
+  text: string,
+  maxChars: number,
+  rng: () => number,
+): string {
+  if (text.length <= maxChars) return text;
+  let start = Math.floor(rng() * (text.length - maxChars + 1));
+  if (start > 0) {
+    const sp = text.indexOf(" ", start);
+    if (sp !== -1 && sp - start < 200) start = sp + 1;
+  }
+  return text.slice(start, start + maxChars).trim();
+}
 
 // 既存 concept_label の候補一覧（生成時に LLM へ提示して表記の再利用を促す・F3）。
 async function loadExistingConcepts(supabase: SupabaseClient): Promise<string[]> {
@@ -208,6 +255,7 @@ export async function generateGatedQuizRows(
     count: number; // 目標生成数
     generator?: QuizGenerator | null;
     maxSources?: number; // 素材ソースの上限（cron は絞って LLM 呼び出し数を抑える）
+    rng?: () => number; // 本文窓の選択（pickBodyWindow）。テストで固定する用
   },
 ): Promise<QuizGenCoreResult> {
   const generator =
@@ -246,7 +294,12 @@ export async function generateGatedQuizRows(
   for (const source of sources) {
     if (result.rows.length >= opts.count) break;
     try {
-      const rawBody = htmlToInputText(source.content_html, GROUND_BODY_MAX_CHARS);
+      // 照合母体（groundBody）は LLM に渡した窓そのものから作る（窓の外の文を quote しても落ちる）。
+      const rawBody = pickBodyWindow(
+        htmlToInputText(source.content_html, Number.POSITIVE_INFINITY),
+        GROUND_BODY_MAX_CHARS,
+        opts.rng ?? Math.random,
+      );
       if (!rawBody) continue;
       const groundBody = norm(rawBody);
 
@@ -257,6 +310,7 @@ export async function generateGatedQuizRows(
         categoryLabel,
         count: Math.min(remaining, MAX_MCQ_PER_ARTICLE),
         existingConcepts,
+        avoidStems: await loadSourceStems(supabase, source.id),
       });
       result.generated += mcqs.length;
 
@@ -379,8 +433,9 @@ export function markQuizDuplicates(
   candidates.forEach((row, i) => {
     const vec = vectors[i];
     if (!vec) {
-      // embed 失敗は embedding=null・dup_flag=false で積み、次回バックフィルが embedding を埋めて
-      // 以降の母集団に乗せる。dup 判定はやり直さない＝未判定分は出題プールに残る（安全側）。
+      // embed 失敗は embedding=null・dup_flag=false・dup_similarity=null で積む。次の cron で backfill が
+      // embedding を埋め、rejudgeUnjudgedQuizRows が判定する（それまでは出題プールに残る＝安全側）。
+      // dup_similarity=null は再判定の対象を示す印なので、0 等に変えないこと（YAT-82）。
       result.embedFailed += 1;
       result.rows.push({ ...row, embedding: null, dup_flag: false, dup_similarity: null });
       return;
@@ -441,6 +496,178 @@ export async function embedAndDedupQuizRows(
   }
 
   return { ...markQuizDuplicates(candidates, vectors, population), embedSkipped: !embedder };
+}
+
+// ── 判定を受け損ねた行の再判定（YAT-82）─────────────────────────────
+// embed に失敗した行は embedding=null・dup_flag=false・dup_similarity=null で積まれ、cron の backfill が
+// 後から embedding だけを埋める。以前は判定をやり直さなかったため、近重複でも出題プールに残り続けた。
+// 実測（2026-09-24）: 08-17 のオンデマンド補充 3 回で入った 11 行がすべてこの状態で、tech/web では
+// 既存問題と類似度 0.905〜0.960 の言い換え問題が「別の問題」として出題され続けていた。
+//
+// dup_similarity 列（0013）と dup_flag 方式（YAT-61）が入る前の行は、ゲートを一度も通っていないので
+// null が正常（0013 が遡って flag を立てない方針を取った行）。この境界より後で null の行だけが
+// 「判定を受け損ねた」行。境界は YAT-61 のマージ日。実データでは 07-20 の行が最後の null、
+// 07-27 の行が最初の非 null で、その間に行は無い。
+export const DUP_JUDGE_ERA_START = "2026-07-23T00:00:00Z";
+
+export type JudgeRow = {
+  id: string;
+  vec: number[];
+  unjudged: boolean; // 再判定の対象か（判定欠落かつ境界以降）
+  dupFlag: boolean; // 現在の dup_flag（判定済み行を格上げするかの判断に使う）
+};
+
+// judge = 判定欠落行への初回判定 / upgrade = 判定済みの後発行を dup へ格上げ（false→true の片方向のみ）
+export type Judgment = {
+  id: string;
+  kind: "judge" | "upgrade";
+  dupFlag: boolean;
+  dupSimilarity: number;
+};
+
+// DB の行を JudgeRow に変換する（pure）。判定欠落 = 境界以降で dup_similarity が null。
+// embedding を読めない行は照合できないので除く（null を返す）。
+export function toJudgeRow(
+  r: { id: string; created_at: string; embedding: unknown; dup_similarity: number | null; dup_flag: boolean },
+  eraStartMs: number,
+): JudgeRow | null {
+  const vec = parseEmbedding(r.embedding);
+  if (!vec) return null;
+  return {
+    id: r.id,
+    vec,
+    unjudged: r.dup_similarity === null && Date.parse(r.created_at) >= eraStartMs,
+    dupFlag: r.dup_flag,
+  };
+}
+
+// 時系列順（created_at 昇順・同時刻は id 昇順）に並んだ行を再判定する（pure）。
+// ① 判定欠落行はそれより**前の行**と照合する。insert 時の判定と同じく「その時点で既にあった問題」が
+//   母集団で、後から入った問題と照合すると、元の問題の方を後発の言い換えの重複として落としかねない。
+//   母集団には対象外の行も dup 行も含める（insert 時の keep-all と同じ）。
+// ② 判定欠落行 X が embedding を持たない間に入った後発の行 Y は、X 抜きの母集団で判定されている。
+//   ①だけでは X と Y が一度も照合されずに残るので、X と閾値以上に近い後発の非 dup 行は Y の側を
+//   dup に格上げする（元の問題 X を残し、後発を外す＝①と同じ向き）。
+export function judgeUnjudgedRows(rows: JudgeRow[]): Judgment[] {
+  const out: Judgment[] = [];
+  const upgraded = new Map<string, number>(); // 格上げする行 id → 最大類似度
+  const unjudgedBefore: JudgeRow[] = [];
+  const population: number[][] = [];
+  for (const r of rows) {
+    if (r.unjudged) {
+      let maxSim = 0;
+      for (const p of population) {
+        if (p.length !== r.vec.length) continue;
+        const sim = cosineSim(r.vec, p);
+        if (sim > maxSim) maxSim = sim;
+      }
+      out.push({
+        id: r.id,
+        kind: "judge",
+        dupFlag: maxSim >= QUIZ_DEDUP_THRESHOLD,
+        dupSimilarity: maxSim,
+      });
+      unjudgedBefore.push(r);
+    } else if (!r.dupFlag) {
+      for (const x of unjudgedBefore) {
+        if (x.vec.length !== r.vec.length) continue;
+        const sim = cosineSim(r.vec, x.vec);
+        if (sim >= QUIZ_DEDUP_THRESHOLD && sim > (upgraded.get(r.id) ?? 0)) {
+          upgraded.set(r.id, sim);
+        }
+      }
+    }
+    population.push(r.vec);
+  }
+  for (const [id, sim] of upgraded) {
+    out.push({ id, kind: "upgrade", dupFlag: true, dupSimilarity: sim });
+  }
+  return out;
+}
+
+export type RejudgeResult = {
+  judged: number; // 判定欠落行に判定を書き戻した行数
+  dupFlagged: number; // うち近重複として dup_flag を立てた行数（出題プールから外れる）
+  upgraded: number; // 判定欠落行の後発の言い換えとして dup へ格上げした判定済み行の数
+  failed: number; // 書き戻しに失敗した行数（次回 run で再試行される）
+};
+
+// embedding はあるのに判定を受けていない行を探して再判定し、dup_flag / dup_similarity を書き戻す。
+// cron（runQuizPool）が backfill の直後に呼ぶ。失敗は fail-soft（この回は再判定しないだけ）。
+//
+// 観測上の注意: 以前は「境界以降で dup_similarity が null の行数」が embed 失敗の永続的な痕跡だった
+// （scripts/diagnose-dedup.ts の reportUnjudged）。再判定がこの null を埋めるので、DB に残るのは
+// backfill・再判定がまだ済んでいない行だけになる。embed 失敗の累計は cron ログの「再判定 N」で追う。
+export async function rejudgeUnjudgedQuizRows(
+  supabase: SupabaseClient,
+): Promise<RejudgeResult> {
+  const result: RejudgeResult = { judged: 0, dupFlagged: 0, upgraded: 0, failed: 0 };
+
+  // 対象が無い回（常態）は全件の embedding を読まずに抜ける。
+  const probe = await supabase
+    .from("quiz_questions")
+    .select("id")
+    .eq("status", "active")
+    .is("dup_similarity", null)
+    .not("embedding", "is", null)
+    .gte("created_at", DUP_JUDGE_ERA_START)
+    .limit(1);
+  if (probe.error) {
+    console.warn("判定欠落行の確認に失敗（再判定をスキップ）:", probe.error);
+    return result;
+  }
+  if ((probe.data ?? []).length === 0) return result;
+
+  const rows: JudgeRow[] = [];
+  const eraStartMs = Date.parse(DUP_JUDGE_ERA_START);
+  try {
+    for (let from = 0; ; from += SELECT_PAGE) {
+      const { data, error } = await supabase
+        .from("quiz_questions")
+        .select("id, created_at, embedding, dup_similarity, dup_flag")
+        .eq("status", "active")
+        .not("embedding", "is", null)
+        // 時系列の全順序が判定の意味を決めるので、id を最終キーにして同時刻（同一バッチ）も確定させる。
+        .order("created_at", { ascending: true })
+        .order("id", { ascending: true })
+        .range(from, from + SELECT_PAGE - 1);
+      if (error) throw error;
+      const batch = (data ?? []) as unknown as Parameters<typeof toJudgeRow>[0][];
+      for (const r of batch) {
+        const row = toJudgeRow(r, eraStartMs);
+        if (row) rows.push(row);
+      }
+      if (batch.length < SELECT_PAGE) break;
+    }
+  } catch (e) {
+    console.warn("再判定の母集団取得に失敗（再判定をスキップ）:", e);
+    return result;
+  }
+
+  for (const j of judgeUnjudgedRows(rows)) {
+    // 取得後に別経路が書き換えた行は上書きしない: judge は dup_similarity が null のまま、
+    // upgrade は dup_flag が false のままの行だけを更新する。一致 0 行はエラーにならないので
+    // select で実際に更新された行を数える。
+    let q = supabase
+      .from("quiz_questions")
+      .update({ dup_flag: j.dupFlag, dup_similarity: j.dupSimilarity })
+      .eq("id", j.id);
+    q = j.kind === "judge" ? q.is("dup_similarity", null) : q.eq("dup_flag", false);
+    const { data, error } = await q.select("id");
+    if (error) {
+      console.warn(`再判定の書き戻しに失敗 [${j.id}]:`, error);
+      result.failed += 1;
+      continue;
+    }
+    if ((data ?? []).length === 0) continue;
+    if (j.kind === "upgrade") {
+      result.upgraded += 1;
+      continue;
+    }
+    result.judged += 1;
+    if (j.dupFlag) result.dupFlagged += 1;
+  }
+  return result;
 }
 
 // カテゴリの素材から count 問を目標に生成し、embed → dedup を通して quiz_questions へ積んで返す。

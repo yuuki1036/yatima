@@ -94,6 +94,7 @@ async function main() {
         categoryLabel: "エンジニア技術全般",
         count: MAX_MCQ_PER_ARTICLE,
         existingConcepts: [],
+        avoidStems: [],
       });
     } catch (e) {
       console.warn(`生成に失敗 [${article.id}]:`, e);
