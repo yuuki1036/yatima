@@ -169,7 +169,7 @@ export async function findUntaggedSummarized(
   return out;
 }
 
-// YAT-79: annotate の JSON パースに失敗し、生テキスト（JSON 断片やモデルの注記）が
+// YAT-81: annotate の JSON パースに失敗し、生テキスト（JSON 断片やモデルの注記）が
 // そのまま要約として保存された行を拾う。haiku.ts のフォールバックは「要約だけ救済」する
 // 設計なので、モデルが JSON を返そうとして壊れた場合はその生テキストが summary に入る。
 //
@@ -268,7 +268,7 @@ export async function annotateUntagged(
 //
 // forceSummary: 既存要約を必ず上書きするか。既定 false は「本文を補完したときだけ要約も作り直す」
 //   ＝既読の要約を不用意に書き換えない（YAT-13 の retag 契約）。要約自体が壊れている行を直す
-//   ときだけ true にする（YAT-79）——このとき本文が同じでも上書きが要る。
+//   ときだけ true にする（YAT-81）——このとき本文が同じでも上書きが要る。
 export async function annotateRows(
   supabase: SupabaseClient,
   targets: UntaggedRow[],

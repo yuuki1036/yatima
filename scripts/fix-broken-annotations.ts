@@ -9,7 +9,7 @@ import {
   annotateRows,
 } from "../lib/llm/summarize-batch";
 
-// YAT-79: annotate の JSON パース失敗で「生テキスト（JSON 断片やモデルの注記）が要約に漏れた」
+// YAT-81: annotate の JSON パース失敗で「生テキスト（JSON 断片やモデルの注記）が要約に漏れた」
 // 記事をピンポイントに直す保守スクリプト。
 //
 // なぜ retag / ingest では直らないか:
