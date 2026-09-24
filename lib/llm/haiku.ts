@@ -92,6 +92,9 @@ class HaikuSummarizer implements Summarizer {
         "annotate の JSON パース失敗。要約のみ救済しタグは空にフォールバック:",
         text.slice(0, 120),
       );
+      // ただし JSON を返そうとした形跡（"summary" キー）があるなら生テキストは JSON 断片や
+      // モデルの注記を含むため救済しない。throw → summary NULL のまま次回 cron で再試行させる。
+      if (/"summary"\s*:/.test(text)) throw new Error("annotate の JSON が壊れている");
       const summary = sanitizeSummary(text);
       if (!summary) throw new Error("要約が空");
       return { summary, tags: [] };

@@ -41,4 +41,19 @@ describe("parseAnnotation", () => {
   it("不正な JSON は null", () => {
     expect(parseAnnotation('{"summary": }')).toBeNull();
   });
+
+  it("JSON の後ろに注記と別の JSON 例が続いても最初のオブジェクトを採る", () => {
+    const raw =
+      '```json\n{"summary": "S", "tags": ["tech/ai", "science/math"]}\n```\n\n' +
+      '注：「science/math」はタグ候補リストに存在しないため…以下が適切です:\n' +
+      '```json\n{"summary": "S", "tags": ["tech/ai"]}\n```';
+    expect(parseAnnotation(raw)).toEqual({ summary: "S", tags: ["tech/ai", "science/math"] });
+  });
+
+  it("summary 文字列内の { } は括弧カウントに含めない", () => {
+    expect(parseAnnotation('{"summary":"a}b{c","tags":[]} 補足 {x}')).toEqual({
+      summary: "a}b{c",
+      tags: [],
+    });
+  });
 });
