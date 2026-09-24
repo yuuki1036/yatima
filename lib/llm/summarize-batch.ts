@@ -171,7 +171,12 @@ export async function findUntaggedSummarized(
 
 // YAT-81: annotate の JSON パースに失敗し、生テキスト（JSON 断片やモデルの注記）が
 // そのまま要約として保存された行を拾う。haiku.ts のフォールバックは「要約だけ救済」する
-// 設計なので、モデルが JSON を返そうとして壊れた場合はその生テキストが summary に入る。
+// 設計なので、パースに失敗した出力の生テキストがそのまま summary に入っていた。
+//
+// 主な発生源だった「`"summary"` キーを含む壊れた JSON」は haiku.ts のガードが throw する
+// ようになったので新規には生まれない。拾う対象は (a) そのガード以前に保存された行と、
+// (b) `"summary"` キーを含まない壊れ方——`sanitizeSummary` はコードフェンスを剥がさないので
+// ```json で始まる出力や `"tags"` だけの出力は今も素通りする。
 //
 // 署名は「日本語の要約には現れないが、壊れた JSON 出力には現れる」文字列に絞る:
 //   "summary": / "tags": … JSON のキーがそのまま残っている
@@ -187,8 +192,9 @@ const BROKEN_FETCH_CHUNK = 100; // 本文込みで取り直すときの .in() �
 
 // 壊れた要約を持つ記事を返す。
 //
-// DB 側の like '%...%' で絞れない: 前方一致でないため index が使えず、articles 全体（約 5 万行）の
-// seq scan になって statement timeout（57014）に達する。かわりに **id + summary だけ**を
+// DB 側の like '%...%' で絞れない: summary に index が無く（あっても後方一致には効かない）、
+// articles 全体（約 5 万行）の seq scan になって statement timeout（57014）に達する。
+// かわりに **id + summary だけ**を
 // キーセットページングで走査し（pk index の range scan なので深いページでも劣化しない）、
 // 判定は JS で行う。content_html を載せないのが肝——載せると TOAST の解凍で重くなる（0018 と同じ罠）。
 // 本文は当たった行のぶんだけ後から取り直す。

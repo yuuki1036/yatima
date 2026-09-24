@@ -16,8 +16,9 @@ import {
 //   - npm run retag …… 対象は「タグ空」だが、要約の上書きは本文を補完したときだけ。要約自体が
 //     壊れている行はタグが付くだけで要約は壊れたまま残る。
 //   - npm run ingest … summary を手で NULL に戻せば対象にはなるが、annotateMissing が見るのは
-//     「published_at が新しい順に最大 300 件の母集団」から credibility + recency で選んだ上位
-//     20 件/run。新着が毎時入り続けるため、古い記事を NULL に戻しても母集団から押し出されて
+//     「published_at が新しい順に limit × POOL_FACTOR 件」の母集団（cron 経路は 20 × 8 = 160 件。
+//     ANNOTATE_POOL_CAP=300 には現状どの経路も届かない）から credibility + recency で選んだ
+//     上位 20 件/run。新着が毎時入り続けるため、古い記事を NULL に戻しても母集団から押し出されて
 //     いつまでも拾われないことがある（静かな取りこぼし）。
 //   - このスクリプトは対象 ID を直接アノテートするので、母集団にも日次上限にも依存しない。
 //
