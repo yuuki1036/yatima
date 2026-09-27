@@ -17,6 +17,11 @@ import {
   DAY_MS,
 } from "../lib/ranking/feed-health-observation";
 import { WINDOW_DAYS, MIN_OWN_ARTICLES, FETCH_CAP } from "../lib/ranking/near-dup-window";
+import {
+  explainAllNullNearDup,
+  RECIPE_MAJORITY_SHARE,
+  type NearDupFreshReason,
+} from "../lib/ranking/embed-recipe";
 import { padEndWide } from "./_report-format";
 
 // YAT-60: feed 引退推奨スコアリングの較正用診断スクリプト。
@@ -135,9 +140,9 @@ async function main() {
   );
   // レシピ混在中（share < 0.8）は compute-dedup-rate が全 feed を null にする。これは既知の空白で
   // あって障害ではないことを明示する（YAT-77）。
-  if (win.majority.total > 0 && win.majority.share < 0.8) {
+  if (win.majority.total > 0 && win.majority.share < RECIPE_MAJORITY_SHARE) {
     console.log(
-      `⚠ レシピ混在中（多数派 ${win.majority.recipe} ${win.majority.share.toFixed(2)} < 0.80）。` +
+      `⚠ レシピ混在中（多数派 ${win.majority.recipe} ${win.majority.share.toFixed(2)} < ${RECIPE_MAJORITY_SHARE}）。` +
         `compute-dedup-rate は全 feed を null にしている＝これは既知の空白であって障害ではない`,
     );
   }
@@ -223,18 +228,51 @@ async function main() {
     `\n--- near_dup_rate = null の内訳（${nullRows.length} / ${rows.length} feed）` +
       `｜母集団: 直近 ${WINDOW_DAYS}d の embedding 付き記事 ${win.embedded} 件 ---`,
   );
+  // 全件 null の理由は直近の cron snapshot が記録している（YAT-77: レシピ混在の週は設計どおり全件 null）。
+  // knownBlank は下の「母数は足りているのに null」の案内にも効かせる（混在期に障害扱いしないため）。
+  let knownBlank = false;
   if (nonNull === 0 && rows.length > 0) {
-    console.log(
-      "  ⚠ active feed の全件が null。compute-dedup-rate の cron が一度も回っていない可能性が高い",
-    );
-    console.log("    （このジョブは active feed 全件を必ず update するため、1 件でも非 null なら実行済み）");
+    const { data: snap, error: snapErr } = await supabase
+      .from("feed_health_snapshots")
+      .select("captured_at, near_dup_fresh, thresholds")
+      .eq("run_kind", "cron")
+      .order("captured_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (snapErr) console.warn("  直近 snapshot の取得に失敗（理由を判別できない）:", snapErr);
+    const th = (snap?.thresholds ?? {}) as {
+      near_dup_fresh_reason?: NearDupFreshReason;
+      recipe?: { share?: number; legacy?: number; lead?: number };
+    };
+    const snapTotal =
+      th.recipe?.legacy === undefined || th.recipe?.lead === undefined
+        ? null
+        : th.recipe.legacy + th.recipe.lead;
+    const explained = snapErr
+      ? { lines: ["compute-dedup-rate の直近結果を判別できない（snapshot 取得失敗）"], knownBlank: false }
+      : explainAllNullNearDup(
+          snap
+            ? {
+                capturedAt: snap.captured_at as string,
+                nearDupFresh: snap.near_dup_fresh as boolean,
+                reason: th.near_dup_fresh_reason ?? null,
+                share: th.recipe?.share ?? null,
+                total: snapTotal,
+              }
+            : null,
+          win.majority.share,
+          win.majority.total,
+        );
+    knownBlank = explained.knownBlank;
+    console.log(`  ⚠ active feed の全件が null。${explained.lines[0]}`);
+    for (const l of explained.lines.slice(1)) console.log(`    ${l}`);
   }
   let noArticle = 0;
   let onlyNullPublished = 0;
   let noEmbed = 0;
   let noEmbedGateFail = 0; // うち窓内にゲート（body_text_len >= 250）を通る記事が 0 件（構造的）
   let tooFew = 0;
-  // 母数は足りているのに null ＝ cron 未実行 / 途中失敗。件数だけでは「直近追加の feed だから
+  // 母数は足りているのに null ＝ cron 未実行 / 途中失敗（レシピ混在の週＝knownBlank を除く）。件数だけでは「直近追加の feed だから
   // まだ月曜 cron を通っていない（無害）」と「update が途中で落ちた（要調査）」を切り分けられない
   // ので、該当 feed を名前・embedding 件数・feed 齢つきで挙げる。
   const enoughButNullRows: typeof nullRows = [];
@@ -270,16 +308,22 @@ async function main() {
         `    - ${pad(r.input.title ?? r.input.url, 27)} embedding ${r.windowOwnEmbedded} 件 / ${age}`,
       );
     }
-    console.log(
-      `  ⚠ 母数は足りているので「MIN_OWN_ARTICLES を下げる」は対処にならない。` +
-        `疑う順は ①算出側を直した直後で cron がまだ回っていない ②直近に追加した feed ` +
-        `③update 失敗でループが途中終了、の順`,
-    );
-    console.log(
-      `    （near_dup_rate は DB に保存された値、母数はいま数えた値なので、両者は算出時点の` +
-        `母集団がズレていれば食い違う。まず \`npm run compute-dedup-rate\` を回して` +
-        `再測定し、それでも残る feed だけが本当の異常）`,
-    );
+    if (knownBlank) {
+      console.log(
+        "  （レシピ混在の週なので、この null は設計どおり。compute を回し直しても混在中は null のまま。件数は参考値）",
+      );
+    } else {
+      console.log(
+        `  ⚠ 母数は足りているので「MIN_OWN_ARTICLES を下げる」は対処にならない。` +
+          `疑う順は ①算出側を直した直後で cron がまだ回っていない ②直近に追加した feed ` +
+          `③update 失敗でループが途中終了、の順`,
+      );
+      console.log(
+        `    （near_dup_rate は DB に保存された値、母数はいま数えた値なので、両者は算出時点の` +
+          `母集団がズレていれば食い違う。まず \`npm run compute-dedup-rate\` を回して` +
+          `再測定し、それでも残る feed だけが本当の異常）`,
+      );
+    }
   }
   if (onlyNullPublished > 0) {
     console.log(

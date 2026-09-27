@@ -4,6 +4,7 @@ import {
   majorityRecipe,
   judgeRecipe,
   nearDupFreshness,
+  explainAllNullNearDup,
   EMBED_RECIPE_EPOCH,
   EMBED_STAMP_INTRODUCED,
   RECIPE_MAJORITY_SHARE,
@@ -150,5 +151,78 @@ describe("nearDupFreshness", () => {
       fresh: false,
       reason: "compute_failed",
     });
+  });
+});
+
+// YAT-77: 全件 null の案内。レシピ混在で compute が設計どおり全件 null にした週に
+// 「cron が一度も回っていない」と出して調査を誤誘導していた（2026-09-27 に実際に踏んだ）。
+describe("explainAllNullNearDup", () => {
+  const snap = (
+    reason: "fresh" | "compute_failed" | "recipe_mixed" | null,
+    fresh = false,
+    total: number | null = 4174,
+  ) => ({
+    capturedAt: "2026-09-21T09:22:27Z",
+    nearDupFresh: fresh,
+    reason,
+    share: 0.72,
+    total,
+  });
+
+  it("cron の snapshot が無ければ未実行を疑う", () => {
+    const r = explainAllNullNearDup(null, 0.9, 100);
+    expect(r.lines[0]).toContain("一度も回っていない");
+    expect(r.knownBlank).toBe(false);
+  });
+
+  it("直近がレシピ混在なら既知の空白と案内し、未実行とは言わない", () => {
+    const r = explainAllNullNearDup(snap("recipe_mixed"), 0.84, 7515);
+    expect(r.knownBlank).toBe(true);
+    expect(r.lines[0]).toContain("既知の空白");
+    expect(r.lines[0]).toContain("0.72");
+    expect(r.lines.join()).not.toContain("一度も回っていない");
+    expect(r.lines[1]).toContain("次回の cron から算出される");
+  });
+
+  // 境界は judgeRecipe / nearDupFreshness と同じ「以上」。> に変わると 0.8 ちょうどの週を取り違える。
+  it("現在の share が閾値ちょうどなら次回算出の見込みを出す", () => {
+    const r = explainAllNullNearDup(snap("recipe_mixed"), RECIPE_MAJORITY_SHARE, 100);
+    expect(r.lines[1]).toContain("次回の cron から算出される");
+  });
+
+  it("今も混在中なら次回算出の見込みは出さない", () => {
+    expect(explainAllNullNearDup(snap("recipe_mixed"), 0.6, 100).lines[1]).toContain(
+      "混在が続いている",
+    );
+  });
+
+  // snapshot は窓の embedding 0 件でも share=0 を recipe_mixed と記録する。embed が止まっているのに
+  // 「障害ではない」と案内しない。
+  it("窓の embedding が 0 件なら既知の空白とせず embed 停止を疑う", () => {
+    for (const r of [
+      explainAllNullNearDup(snap("recipe_mixed", false, 0), 0, 0),
+      explainAllNullNearDup(snap("recipe_mixed"), 0, 0),
+    ]) {
+      expect(r.knownBlank).toBe(false);
+      expect(r.lines[0]).toContain("embed が止まっている疑い");
+      expect(r.lines[0]).not.toContain("障害ではない");
+    }
+  });
+
+  it("compute 失敗、または理由の無い旧行で fresh=false ならログ確認を促す", () => {
+    expect(explainAllNullNearDup(snap("compute_failed"), 0.9, 100).lines[0]).toContain(
+      "成功していない",
+    );
+    expect(explainAllNullNearDup(snap(null), 0.9, 100).lines[0]).toContain("成功していない");
+  });
+
+  it("fresh なのに全件 null は要調査（理由の無い旧行で fresh=true も同じ）", () => {
+    for (const r of [
+      explainAllNullNearDup(snap("fresh", true), 0.9, 100),
+      explainAllNullNearDup(snap(null, true), 0.9, 100),
+    ]) {
+      expect(r.lines[0]).toContain("要調査");
+      expect(r.knownBlank).toBe(false);
+    }
   });
 });
