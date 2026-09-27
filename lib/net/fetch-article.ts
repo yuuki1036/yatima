@@ -64,6 +64,20 @@ export async function fetchAndExtractArticle(
 }
 
 // 抽出本文の実テキスト長（タグ除去後）。「薄いページ（ナビだけ等）」の足切り判定に使う共通基準。
+// YAT-82: 以前は htmlToInputText の既定上限（2000 字）で切った長さを返しており、2000 を超える
+// 足切り値を置いても判定できなかった。上限なしで数える。
 export function extractedTextLength(contentHtml: string): number {
-  return htmlToInputText(contentHtml).length;
+  return htmlToInputText(contentHtml, Number.POSITIVE_INFINITY).length;
+}
+
+// 本文テキストのうちリンク（<a>）内の文字が占める割合（0..1）。リンク集・目次ページの検出に使う。
+// 空本文は 0（長さの足切りが別に落とすので、ここで判定を重ねない）。
+export function linkTextRatio(contentHtml: string): number {
+  const total = extractedTextLength(contentHtml);
+  if (total === 0) return 0;
+  let linked = 0;
+  for (const m of contentHtml.matchAll(/<a\b[^>]*>([\s\S]*?)<\/a>/gi)) {
+    linked += htmlToInputText(m[1], Number.POSITIVE_INFINITY).length;
+  }
+  return Math.min(1, linked / total);
 }

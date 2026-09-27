@@ -134,7 +134,8 @@ export async function summarizeMissing(
 // `npm run retag` からのみ呼ばれ（cron からは呼ばれない）、summary IS NOT NULL が対象で
 // claim_summary_candidates（summary IS NULL 前提）も通らない別経路。annotate() で課金は
 // 発生するが、手動・低頻度で月額寄与はほぼゼロなので llm_batches には記録せず DAILY_SUMMARIZE_CAP
-// も消費しない。「llm_batches が唯一の支出台帳」の唯一の例外＝retag の再アノテート。
+// も消費しない。「llm_batches が唯一の支出台帳」の例外は手動の保守経路 2 つ＝retag の再アノテートと、
+// `npm run fix-annotations`（YAT-81・壊れた要約の修復。annotateRows を直接呼ぶ）。
 export type UntaggedRow = {
   id: string;
   title: string | null;
@@ -178,6 +179,72 @@ export async function findUntaggedSummarized(
   return out;
 }
 
+// YAT-81: annotate の JSON パースに失敗し、生テキスト（JSON 断片やモデルの注記）が
+// そのまま要約として保存された行を拾う。haiku.ts のフォールバックは「要約だけ救済」する
+// 設計なので、パースに失敗した出力の生テキストがそのまま summary に入っていた。
+//
+// 主な発生源だった「`"summary"` キーを含む壊れた JSON」は haiku.ts のガードが throw する
+// ようになったので新規には生まれない。拾う対象は (a) そのガード以前に保存された行と、
+// (b) `"summary"` キーを含まない壊れ方——`sanitizeSummary` はコードフェンスを剥がさないので
+// ```json で始まる出力や `"tags"` だけの出力は今も素通りする。
+//
+// 署名は「日本語の要約には現れないが、壊れた JSON 出力には現れる」文字列に絞る:
+//   "summary": / "tags": … JSON のキーがそのまま残っている
+//   ```               … コードフェンスが剥がれずに残っている
+// 誤検出は皆無にはできない（引用で出現しうる）ため、呼び出し側は dry-run で目視させること。
+export function isBrokenSummary(summary: string | null): boolean {
+  if (!summary) return false;
+  return /"(summary|tags)"\s*:|```/.test(summary);
+}
+
+const BROKEN_SCAN_PAGE = 1000; // 1 ページの走査件数（PostgREST 既定上限）
+const BROKEN_FETCH_CHUNK = 100; // 本文込みで取り直すときの .in() 分割幅（URL 長対策）
+
+// 壊れた要約を持つ記事を返す。
+//
+// DB 側の like '%...%' で絞れない: summary に index が無く（あっても後方一致には効かない）、
+// articles 全体（約 5 万行）の seq scan になって statement timeout（57014）に達する。
+// かわりに **id + summary だけ**を
+// キーセットページングで走査し（pk index の range scan なので深いページでも劣化しない）、
+// 判定は JS で行う。content_html を載せないのが肝——載せると TOAST の解凍で重くなる（0018 と同じ罠）。
+// 本文は当たった行のぶんだけ後から取り直す。
+export async function findBrokenAnnotations(
+  supabase: SupabaseClient,
+): Promise<UntaggedRow[]> {
+  const brokenIds: string[] = [];
+  let cursor = "";
+  for (;;) {
+    let q = supabase
+      .from("articles")
+      .select("id, summary")
+      .not("summary", "is", null)
+      .order("id", { ascending: true })
+      .limit(BROKEN_SCAN_PAGE);
+    if (cursor) q = q.gt("id", cursor);
+    const { data, error } = await q;
+    if (error) throw error;
+    const page = (data ?? []) as { id: string; summary: string | null }[];
+    for (const r of page) {
+      if (isBrokenSummary(r.summary)) brokenIds.push(r.id);
+    }
+    if (page.length < BROKEN_SCAN_PAGE) break; // 最終ページ
+    cursor = page[page.length - 1].id;
+  }
+
+  // 当たった行だけ本文込みで取り直す（アノテートの入力に content_html が要る）。
+  const out: UntaggedRow[] = [];
+  for (let i = 0; i < brokenIds.length; i += BROKEN_FETCH_CHUNK) {
+    const { data, error } = await supabase
+      .from("articles")
+      .select("id, title, url, content_html, summary")
+      .in("id", brokenIds.slice(i, i + BROKEN_FETCH_CHUNK))
+      .order("published_at", { ascending: false, nullsFirst: false });
+    if (error) throw error;
+    out.push(...((data ?? []) as UntaggedRow[]));
+  }
+  return out;
+}
+
 export type RetagResult = {
   targeted: number; // タグ空で再アノテート対象になった件数
   enriched: number; // 本文補完できた件数
@@ -195,22 +262,6 @@ export async function annotateUntagged(
     enrich?: boolean; // 本文が薄い記事をリンク先から補完してからアノテートする（既定 true）
   } = {},
 ): Promise<RetagResult> {
-  const concurrency = opts.concurrency ?? DEFAULT_CONCURRENCY;
-  const enrich = opts.enrich ?? true;
-  const summarizer =
-    opts.summarizer !== undefined ? opts.summarizer : createHaikuSummarizer();
-
-  if (!summarizer) {
-    return {
-      targeted: 0,
-      enriched: 0,
-      tagged: 0,
-      stillEmpty: 0,
-      failed: 0,
-      skipped: true,
-    };
-  }
-
   let targets: UntaggedRow[];
   try {
     targets = await findUntaggedSummarized(supabase);
@@ -223,6 +274,41 @@ export async function annotateUntagged(
       stillEmpty: 0,
       failed: 0,
       skipped: false,
+    };
+  }
+  return annotateRows(supabase, targets, opts);
+}
+
+// 指定した行だけを再アノテートする共通ルーチン。対象の選び方（タグ空 / 要約が壊れている）は
+// 呼び出し側が決め、ここは「アノテートして保存する」だけを受け持つ。
+//
+// forceSummary: 既存要約を必ず上書きするか。既定 false は「本文を補完したときだけ要約も作り直す」
+//   ＝既読の要約を不用意に書き換えない（YAT-13 の retag 契約）。要約自体が壊れている行を直す
+//   ときだけ true にする（YAT-81）——このとき本文が同じでも上書きが要る。
+export async function annotateRows(
+  supabase: SupabaseClient,
+  targets: UntaggedRow[],
+  opts: {
+    concurrency?: number;
+    summarizer?: Summarizer | null;
+    enrich?: boolean;
+    forceSummary?: boolean;
+  } = {},
+): Promise<RetagResult> {
+  const concurrency = opts.concurrency ?? DEFAULT_CONCURRENCY;
+  const enrich = opts.enrich ?? true;
+  const forceSummary = opts.forceSummary ?? false;
+  const summarizer =
+    opts.summarizer !== undefined ? opts.summarizer : createHaikuSummarizer();
+
+  if (!summarizer) {
+    return {
+      targeted: 0,
+      enriched: 0,
+      tagged: 0,
+      stillEmpty: 0,
+      failed: 0,
+      skipped: true,
     };
   }
 
@@ -269,11 +355,12 @@ export async function annotateUntagged(
         });
         if (!summary) throw new Error("要約が空");
 
-        // 本文を補完したときだけ要約も作り直す（薄い本文由来の古い要約を更新）。補完していなければ
-        // 既存要約は温存しタグだけ付ける（既読の要約を不用意に書き換えない）。
+        // 本文を補完したとき（または forceSummary）だけ要約も作り直す。補完しておらず
+        // forceSummary でもなければ既存要約は温存しタグだけ付ける（既読の要約を不用意に
+        // 書き換えない）。
         // 順序は要約 → タグ。findUntaggedSummarized は「タグ有り = 処理済み」とみなすため、
         // タグ付与で部分失敗（要約だけ更新）しても未タグのまま残り、次回再収束する（自己回復）。
-        if (content !== row.content_html) {
+        if (forceSummary || content !== row.content_html) {
           const { error: upErr } = await supabase
             .from("articles")
             .update({ summary })

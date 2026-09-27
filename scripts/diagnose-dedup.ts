@@ -344,11 +344,12 @@ function report(title: string, a: Analysis, current: number, note?: string) {
 // 共に増えるため、古い行ほど「当時は非 dup だったが今なら dup」になりうる。閾値を動かしたときに
 // **その時点で何件が dup 側へ移るか**を測れるのは保存値のほうなので、両方を出す。
 // YAT-63: dup_similarity が付くようになった時点（dupSince）以降に積まれたのに、それでも
-// dup_similarity が無い行 = insert 時の embed に失敗した行。この列は backfill が embedding を
-// 埋めても NULL のまま残る（dup 判定はやり直されないため）＝ **embed 失敗の唯一の永続的な痕跡**。
-// ログは cron の GitHub Actions 分しか遡れず、オンデマンド（Vercel runtime log）は事後に列挙する
-// 手段が無いので、経路に依存しないこの件数を出す。dupSince=null のテーブル（card は 0007 から
-// この列を持つ）は境界が無いので出さない。
+// dup_similarity が無い行 = insert 時の embed に失敗した行。YAT-63 時点ではこの列が backfill 後も
+// NULL のまま残る＝ embed 失敗の唯一の永続的な痕跡だった。**YAT-82 で cron が backfill 直後に
+// 再判定（rejudgeUnjudgedQuizRows）して NULL を埋めるようになったため、quiz ではこの件数は
+// 「backfill・再判定がまだ済んでいない行」だけを数える**（平常は 0 に近い）。embed 失敗の累計は
+// cron ログの「再判定 N」で追うこと。card は再判定しないので従来どおりの痕跡のまま。
+// dupSince=null のテーブル（card は 0007 からこの列を持つ）は境界が無いので出さない。
 function reportUnjudged(rows: Row[], dupSince: string | null) {
   if (!dupSince) return;
   const after = rows.filter((r) => r.created_at >= dupSince);
@@ -360,8 +361,8 @@ function reportUnjudged(rows: Row[], dupSince: string | null) {
   );
   if (unjudged.length > 0) {
     console.log(
-      "      ※ 非ゼロなら embed 失敗が実際に起きている。YAT-63 は観測実績ゼロを根拠に" +
-        "backfill 後の dup 再判定を作らない判断をしたので、その前提が崩れている",
+      "      ※ 非ゼロなら embed 失敗が実際に起きている。quiz は次の cron で再判定される（YAT-82）。" +
+        "0 でも失敗が無かったとは限らない（再判定済みの分は数えない。累計は cron ログの「再判定 N」）",
     );
   }
 }

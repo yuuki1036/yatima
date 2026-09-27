@@ -10,7 +10,8 @@ import { runQuizPool } from "../lib/learn/quiz-pool";
 // 適応クイズのコアプール生成 cron（YAT-29）。週次 cron（learn.yml）と手動実行から呼ぶ。
 // 旧カード生成（generate-cards）を差し替えたエントリ。カテゴリ別の未回答バッファの不足分を生成し、
 // その場 embed → dedup（近重複は dup_flag=true で積む。YAT-61）→ quiz_questions(active) に積む。
-// その場 embed に失敗して embedding=null で残った行は、先頭でバックフィルしてから dedup 母集団に載せる。
+// その場 embed に失敗して embedding=null で残った行は、先頭でバックフィルしてから dedup 母集団に載せ、
+// 判定を受け損ねていた行はそこで再判定する（YAT-82）。
 async function main() {
   const supabase = createAdminClient();
 
@@ -32,7 +33,11 @@ async function main() {
     `不足カテゴリ ${r.deficitCategories} / 生成 ${r.generated} / grounding通過 ${r.passed}\n` +
       `dup flag ${r.dupFlagged} / embed失敗 ${r.embedFailed}${embedNote} / 登録 ${r.inserted}${breakdown}\n` +
       `embed 補完 ${r.backfill.succeeded}/${r.backfill.picked}` +
-      `${r.backfill.skipped ? "（VOYAGE_API_KEY 未設定でスキップ）" : ""}`,
+      `${r.backfill.skipped ? "（VOYAGE_API_KEY 未設定でスキップ）" : ""}\n` +
+      // YAT-82: 判定を受け損ねていた行の再判定。常態は 0（オンデマンドの embed 失敗があった週だけ動く）。
+      // embed 失敗の累計を追える唯一の記録でもある（再判定が DB 上の痕跡 dup_similarity=null を埋めるため）。
+      `再判定 ${r.rejudge.judged}（うち dup ${r.rejudge.dupFlagged}）/ 後発の格上げ ${r.rejudge.upgraded}` +
+      `${r.rejudge.failed > 0 ? ` / 書き戻し失敗 ${r.rejudge.failed}` : ""}`,
   );
 
   // ── LLM 全滅の検知（YAT-73）─────────────────────────────────────────────

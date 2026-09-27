@@ -7,7 +7,9 @@ import {
   embedAndDedupQuizRows,
   generateGatedQuizRows,
   insertQuizRows,
+  rejudgeUnjudgedQuizRows,
   type QuizInsertRow,
+  type RejudgeResult,
 } from "@/lib/learn/quiz-gate";
 import { hasApprovedLearnSources } from "@/lib/learn/learn-sources";
 
@@ -54,6 +56,7 @@ export type QuizPoolResult = {
   // 元から skipped でこれを判別していたのに、候補 embed 側は判別がなく embed失敗=N に潰れていた。
   embedSkipped: boolean;
   backfill: { picked: number; succeeded: number; skipped: boolean }; // 補完 embed の結果
+  rejudge: RejudgeResult; // 判定を受け損ねた行の再判定（YAT-82）
   skipped: boolean; // ANTHROPIC_API_KEY 未設定で生成スキップ
 };
 
@@ -219,6 +222,7 @@ export async function runQuizPool(
     embedFailed: 0,
     embedSkipped: false,
     backfill: { picked: 0, succeeded: 0, skipped: false },
+    rejudge: { judged: 0, dupFlagged: 0, upgraded: 0, failed: 0 },
     skipped: false,
   };
 
@@ -231,8 +235,6 @@ export async function runQuizPool(
   // ① バックフィル: その場 embed に失敗して embedding=null で積まれた行を先に埋め、今回の dedup
   // 母集団に載せる（Voyage 呼び出し 1 回目）。active のみ対象。YAT-56 以降は両経路が insert 前に
   // embed するので、ここに残るのは embed 失敗分だけ（オンデマンド由来という帰属はもう成立しない）。
-  // なお backfill は embedding を埋めるだけで dup 判定はやり直さないため、これらの行は
-  // dup_flag=false のまま出題プールに残る（安全側）。
   const backfill = await embedMissingQuizQuestions(supabase, {
     limit: BACKFILL_EMBED_LIMIT,
     embedder,
@@ -242,6 +244,11 @@ export async function runQuizPool(
     succeeded: backfill.succeeded,
     skipped: backfill.skipped,
   };
+
+  // ①' 再判定: backfill は embedding を埋めるだけなので、埋まった行（と過去の run で埋まったまま
+  // 判定されていない行）の dup 判定をここでやり直す（YAT-82）。やらないと近重複の言い換えが
+  // dup_flag=false のまま出題され続ける。Voyage は呼ばない（保存済み embedding 同士の照合のみ）。
+  result.rejudge = await rejudgeUnjudgedQuizRows(supabase);
 
   // ② deficit ベース生成: カテゴリ別の**未回答**件数を数え、目標への不足分だけ生成する（YAT-72）。
   // 未回答バッファが満ちたカテゴリは生成ゼロ（cron が無作業に収束）。解き進めた分だけ不足が開く。

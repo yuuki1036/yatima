@@ -19,7 +19,7 @@ import { todayJst } from "../lib/format";
 //
 // **台帳・日次上限の対象外（YAT-78・design doc open 8 の (b)）。** この経路（annotateUntagged）は
 // llm_batches に記録せず DAILY_SUMMARIZE_CAP も消費しない。手動・低頻度で月額寄与がほぼゼロのため、
-// 「llm_batches が唯一の支出台帳」の唯一の例外として台帳外に置く。annotate() で課金は発生する
+// 「llm_batches が唯一の支出台帳」の例外（もう 1 つは fix-annotations）として台帳外に置く。annotate() で課金は発生する
 // ので、大量に回すときは Anthropic の Usage を直接確認すること。
 //
 // 使い方:
