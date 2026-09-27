@@ -421,8 +421,15 @@ export async function annotateRows(
 export type SummarizeSkipReason = "no_api_key" | "daily_capped";
 
 type AnnotateBatchCounts = {
-  /** claim が返した絞り込み前の母数。-1 は取得不能（判定不能・isSelectionDead を発火させない）。 */
+  /**
+   * claim が返した絞り込み前の母数。-1 は取得不能（判定不能・isSelectionDead を発火させない）。
+   * migration 0021 から「feed ごとの上位 per_feed 件の合計（真の母数の下界）」。全件 count は heap の
+   * 全走査で statement timeout を越えたため。**pool > 0 ⇔ 真の母数 > 0** は保たれるので、
+   * isSelectionDead（pool>0 ∧ selected=0）の判定は変わらない。
+   */
   pool: number;
+  /** pool が下界（どこかの feed に per_feed 件を超える候補がある）なら true。ログで「+」を付ける。 */
+  poolCapped: boolean;
   /** claim で予約できた件数（= この run の llm_batches.request_count）。 */
   selected: number;
   succeeded: number;
@@ -453,6 +460,7 @@ export type AnnotateBatchResult =
 // 全フィールド 0/null のベース。各 return はここから必要な列だけ上書きする。
 const EMPTY_ANNOTATE_COUNTS: AnnotateBatchCounts = {
   pool: 0,
+  poolCapped: false,
   selected: 0,
   succeeded: 0,
   failed: 0,
@@ -587,6 +595,7 @@ export async function annotateMissing(
   // 並べ替えは RPC 側が担う（JS の credibility リランクは廃止）。claim 失敗は poolError に残し、
   // pool=-1 を返して isSelectionDead で赤くする（embed 側 selectError / isEmbedSelectStalled と同型）。
   let pool = 0;
+  let poolCapped = false;
   let ids: string[] = [];
   let leaseDeadline: string;
   try {
@@ -597,10 +606,12 @@ export async function annotateMissing(
     if (error) throw error;
     const claim = (data ?? {}) as {
       pool?: number;
+      pool_capped?: boolean;
       ids?: string[];
       lease_deadline?: string;
     };
     pool = claim.pool ?? 0;
+    poolCapped = claim.pool_capped === true;
     ids = claim.ids ?? [];
     leaseDeadline = claim.lease_deadline ?? "";
   } catch (e) {
@@ -616,7 +627,7 @@ export async function annotateMissing(
   }
   if (ids.length === 0) {
     // pool>0 ∧ selected=0 は選抜の全閉（isSelectionDead が拾う）。pool=0 は対象ゼロ＝正常。
-    return { ...EMPTY_ANNOTATE_COUNTS, skipped: false, pool, dailyUsed };
+    return { ...EMPTY_ANNOTATE_COUNTS, skipped: false, pool, poolCapped, dailyUsed };
   }
 
   // [3] 台帳 insert（**LLM を呼ぶ前・fail-closed の要**）。ここを LLM の後に置くと insert 失敗時に
@@ -635,6 +646,7 @@ export async function annotateMissing(
         run_kind: runKind,
         selection: {
           pool,
+          pool_capped: poolCapped,
           per_feed: SUMMARIZE_PER_FEED,
           max_rows: effectiveLimit,
           picked: ids.length,
@@ -659,6 +671,7 @@ export async function annotateMissing(
       ...EMPTY_ANNOTATE_COUNTS,
       skipped: false,
       pool,
+      poolCapped,
       selected: ids.length,
       released: ids.length,
       ledgerError: msg,
@@ -691,6 +704,7 @@ export async function annotateMissing(
       ...EMPTY_ANNOTATE_COUNTS,
       skipped: false,
       pool,
+      poolCapped,
       selected: ids.length,
       released: ids.length,
       poolError: msg,
@@ -787,6 +801,7 @@ export async function annotateMissing(
   return {
     skipped: false,
     pool,
+    poolCapped,
     selected: ids.length,
     succeeded,
     failed: failures.length,

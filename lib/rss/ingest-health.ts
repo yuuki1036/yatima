@@ -170,6 +170,8 @@ export function isDeckStarved(candidateCount: number): boolean {
 // skip 理由を判別可能ユニオンで持ち、生存系ガードから明示的に外す（design doc 設計判断）。
 // capUnavailable（台帳 read 失敗）は pool を -1 で返すので pool>0 が偽になり、ここでは
 // 発火しない（capUnavailable は呼び出し側が別途 exit 1 する障害）。
+// pool は migration 0021 から真の母数の下界（feed ごとの上位 per_feed 件の合計）。下界が 0 になるのは
+// 真の母数が 0 のときだけなので、ここで使う pool>0 の意味は変わらない。
 export function isSelectionDead(s: {
   skipped: boolean;
   pool: number;

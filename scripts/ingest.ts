@@ -69,7 +69,7 @@ async function main() {
   // 当日 request_count 合計（投入基準・YAT-78）。
   const s = await annotateMissing(supabase, { runKind: "cron" });
   console.log(
-    `要約+タグ: 母数 ${s.pool} → 選抜 ${s.selected} / 成功 ${s.succeeded} / 失敗 ${s.failed}` +
+    `要約+タグ: 母数 ${s.pool}${s.poolCapped ? "+" : ""} → 選抜 ${s.selected} / 成功 ${s.succeeded} / 失敗 ${s.failed}` +
       `（課金 ${s.charged} / 解放 ${s.released}）` +
       (s.skipped ? ` (skip: ${s.skipReason})` : ""),
   );
@@ -207,10 +207,10 @@ async function main() {
   const selectionDead = isSelectionDead(s);
   if (selectionDead) {
     console.error(
-      `\n⚠ 要約の選抜が死んでいる（母数 ${s.pool} / 選抜 ${s.selected}${s.poolError ? ` / エラー: ${s.poolError}` : ""}）`,
+      `\n⚠ 要約の選抜が死んでいる（母数 ${s.pool}${s.poolCapped ? "+" : ""} / 選抜 ${s.selected}${s.poolError ? ` / エラー: ${s.poolError}` : ""}）`,
     );
     console.error(
-      `  claim_summary_candidates の失敗 / migration 0017 未適用 / RPC 権限（service_role）を疑う`,
+      `  claim_summary_candidates の失敗（timeout なら migration 0021 未適用）/ migration 0017 未適用 / RPC 権限（service_role）を疑う`,
     );
   }
 
