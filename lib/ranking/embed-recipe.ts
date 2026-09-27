@@ -120,37 +120,77 @@ export type LatestCronSnapshot = {
   nearDupFresh: boolean;
   reason: NearDupFreshReason | null;
   share: number | null; // その回の多数派 share
+  total: number | null; // その回の窓の embedding 件数（legacy + lead）
 };
+
+// knownBlank = 全件 null が設計どおりの空白（レシピ混在）で、feed ごとの null を異常として扱わなくてよい。
+export type AllNullExplanation = { lines: string[]; knownBlank: boolean };
 
 // active feed の near_dup_rate が全件 null のとき、なぜ null なのかを snapshot から説明する（pure）。
 // 以前は無条件に「cron が一度も回っていない可能性が高い」と出しており、レシピ混在で compute が
 // 設計どおり全件 null にした週（既知の空白）にも同じ警告になって調査を誤誘導した（YAT-77）。
-// currentShare = 診断を実行した今の窓の多数派 share（次回 cron で算出に入るかの見込みに使う）。
+// currentShare / currentTotal = 診断を実行した今の窓の多数派 share と embedding 件数。
+//
+// 窓の embedding が 0 件の回も snapshot は recipe_mixed と記録する（nearDupFreshness は share=0 を
+// 混在と区別しない）。embed が止まっているのに「障害ではない」と案内しないよう、件数 0 は別扱いにする。
 export function explainAllNullNearDup(
   latest: LatestCronSnapshot | null,
   currentShare: number,
-): string[] {
+  currentTotal: number,
+): AllNullExplanation {
   if (!latest) {
-    return ["cron の snapshot が 1 件も無い。compute-dedup-rate の cron が一度も回っていない可能性が高い"];
+    return {
+      lines: ["cron の snapshot が 1 件も無い。compute-dedup-rate の cron が一度も回っていない可能性が高い"],
+      knownBlank: false,
+    };
   }
   const at = latest.capturedAt.slice(0, 10);
-  const next =
-    currentShare >= RECIPE_MAJORITY_SHARE
-      ? `現在の share ${currentShare.toFixed(2)} は ${RECIPE_MAJORITY_SHARE} 以上なので、次回の cron から算出される見込み`
-      : `現在の share ${currentShare.toFixed(2)} もまだ ${RECIPE_MAJORITY_SHARE} 未満（混在が続いている）`;
-  if (latest.reason === "recipe_mixed") {
-    const shareText = latest.share === null ? "" : ` ${latest.share.toFixed(2)}`;
-    return [
-      `直近の cron（${at}）はレシピ混在（多数派 share${shareText} < ${RECIPE_MAJORITY_SHARE}）で全 feed を null にした＝既知の空白であって障害ではない`,
-      next,
-    ];
-  }
-  if (latest.reason === "compute_failed" || (latest.reason === null && !latest.nearDupFresh)) {
-    return [
+  const failed = {
+    lines: [
       `直近の cron（${at}）で compute-dedup-rate が成功していない（near_dup_fresh=false）。learn workflow のログを確認すること`,
-    ];
+    ],
+    knownBlank: false,
+  };
+  const unexpected = {
+    lines: [
+      `直近の cron（${at}）は near_dup_fresh=true なのに全件 null。compute の update が途中で失敗したか、その後に値が消された可能性がある（要調査）`,
+    ],
+    knownBlank: false,
+  };
+  switch (latest.reason) {
+    case "recipe_mixed": {
+      if (latest.total === 0 || currentTotal === 0) {
+        return {
+          lines: [
+            `窓の embedding が 0 件（直近の cron ${at} 時点: ${latest.total ?? "不明"} 件 / 現在: ${currentTotal} 件）。` +
+              "レシピ混在ではなく embed が止まっている疑いがある（ingest の embed ログを確認すること）",
+          ],
+          knownBlank: false,
+        };
+      }
+      const shareText = latest.share === null ? "" : ` ${latest.share.toFixed(2)}`;
+      const next =
+        currentShare >= RECIPE_MAJORITY_SHARE
+          ? `現在の share ${currentShare.toFixed(2)} は ${RECIPE_MAJORITY_SHARE} 以上なので、次回の cron から算出される見込み`
+          : `現在の share ${currentShare.toFixed(2)} もまだ ${RECIPE_MAJORITY_SHARE} 未満（混在が続いている）`;
+      return {
+        lines: [
+          `直近の cron（${at}）はレシピ混在（多数派 share${shareText} < ${RECIPE_MAJORITY_SHARE}）で全 feed を null にした＝既知の空白であって障害ではない`,
+          next,
+        ],
+        knownBlank: true,
+      };
+    }
+    case "compute_failed":
+      return failed;
+    case "fresh":
+      return unexpected;
+    case null:
+      // YAT-77 以前の行（理由を持たない）。fresh の真偽だけで振り分ける。
+      return latest.nearDupFresh ? unexpected : failed;
+    default: {
+      const unreachable: never = latest.reason;
+      return unreachable;
+    }
   }
-  return [
-    `直近の cron（${at}）は near_dup_fresh=true なのに全件 null。compute の update が途中で失敗したか、その後に値が消された可能性がある（要調査）`,
-  ];
 }
