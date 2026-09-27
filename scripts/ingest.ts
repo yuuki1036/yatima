@@ -136,7 +136,7 @@ async function main() {
   } else {
     console.log(
       `embedding: 成功 ${em.succeeded} / 失敗 ${em.failed} / 締切持ち越し ${em.deferred}` +
-        `（候補 ${em.pending} → 選抜 ${em.eligible} → 取得 ${em.picked}）` +
+        `（候補 ${em.pending}${em.pendingCapped ? "+" : ""} → 選抜 ${em.eligible} → 取得 ${em.picked}）` +
         (em.skipped ? " (VOYAGE_API_KEY 未設定でスキップ)" : ""),
     );
   }

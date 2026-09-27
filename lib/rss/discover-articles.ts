@@ -300,9 +300,11 @@ export async function collectCandidatesFromArticles(
     .from("articles")
     .select("url, content_html")
     .not("content_html", "is", null)
-    // published_at は nullable。Postgres は DESC で NULLS FIRST がデフォルトのため、
-    // 明示しないと日付欠落記事が先頭に滞留し lookback 枠を食う（enrich.ts / embed.ts と同作法）。
-    .order("published_at", { ascending: false, nullsFirst: false })
+    // published_at は nullable。日付欠落記事が先頭に滞留して lookback 枠を食わないよう null を除き、
+    // 並びは idx_articles_published_at（desc = nulls first）と揃える。nulls last を指定すると index と
+    // 並びが合わず、articles の全件 seq scan ＋ ソートになって timeout に近づく（YAT-84）。
+    .not("published_at", "is", null)
+    .order("published_at", { ascending: false })
     .limit(lookback);
   if (error) throw error;
   const articles = (data ?? []) as ArticleRow[];

@@ -38,6 +38,9 @@ async function main() {
       count: "exact",
     })
     .gte("summary_attempts", SUMMARY_MAX_ATTEMPTS)
+    // attempts を増やす settle は必ず summary_last_failed_at も入れるので、隔離中の行はこれを満たす。
+    // 対象は変わらず、migration 0022 の部分 index（failed_at is not null）に乗って全件走査を避ける。
+    .not("summary_last_failed_at", "is", null)
     .order("summary_last_failed_at", { ascending: false, nullsFirst: false })
     .limit(PREVIEW);
   if (error) throw error;
@@ -70,7 +73,8 @@ async function main() {
   const { error: updErr } = await supabase
     .from("articles")
     .update({ summary_attempts: 0 })
-    .gte("summary_attempts", SUMMARY_MAX_ATTEMPTS);
+    .gte("summary_attempts", SUMMARY_MAX_ATTEMPTS)
+    .not("summary_last_failed_at", "is", null); // 上の列挙と同じ理由（対象は変わらず index に乗る）
   if (updErr) throw updErr;
 
   console.log(`\n完了: ${total} 件の summary_attempts を 0 に戻しました（痕跡は温存）。`);
