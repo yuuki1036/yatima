@@ -17,6 +17,7 @@ import {
   DAY_MS,
 } from "../lib/ranking/feed-health-observation";
 import { WINDOW_DAYS, MIN_OWN_ARTICLES, FETCH_CAP } from "../lib/ranking/near-dup-window";
+import { explainAllNullNearDup, type NearDupFreshReason } from "../lib/ranking/embed-recipe";
 import { padEndWide } from "./_report-format";
 
 // YAT-60: feed 引退推奨スコアリングの較正用診断スクリプト。
@@ -224,10 +225,34 @@ async function main() {
       `｜母集団: 直近 ${WINDOW_DAYS}d の embedding 付き記事 ${win.embedded} 件 ---`,
   );
   if (nonNull === 0 && rows.length > 0) {
-    console.log(
-      "  ⚠ active feed の全件が null。compute-dedup-rate の cron が一度も回っていない可能性が高い",
-    );
-    console.log("    （このジョブは active feed 全件を必ず update するため、1 件でも非 null なら実行済み）");
+    // 全件 null の理由は直近の cron snapshot が記録している（YAT-77: レシピ混在の週は設計どおり全件 null）。
+    const { data: snap, error: snapErr } = await supabase
+      .from("feed_health_snapshots")
+      .select("captured_at, near_dup_fresh, thresholds")
+      .eq("run_kind", "cron")
+      .order("captured_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (snapErr) console.warn("  直近 snapshot の取得に失敗（理由を判別できない）:", snapErr);
+    const th = (snap?.thresholds ?? {}) as {
+      near_dup_fresh_reason?: NearDupFreshReason;
+      recipe?: { share?: number };
+    };
+    const lines = snapErr
+      ? ["compute-dedup-rate の直近結果を判別できない（snapshot 取得失敗）"]
+      : explainAllNullNearDup(
+          snap
+            ? {
+                capturedAt: snap.captured_at as string,
+                nearDupFresh: snap.near_dup_fresh as boolean,
+                reason: th.near_dup_fresh_reason ?? null,
+                share: th.recipe?.share ?? null,
+              }
+            : null,
+          win.majority.share,
+        );
+    console.log(`  ⚠ active feed の全件が null。${lines[0]}`);
+    for (const l of lines.slice(1)) console.log(`    ${l}`);
   }
   let noArticle = 0;
   let onlyNullPublished = 0;

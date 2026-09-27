@@ -113,3 +113,44 @@ export function nearDupFreshness(
     return { fresh: false, reason: "recipe_mixed" };
   return { fresh: true, reason: "fresh" };
 }
+
+// 直近の週次 cron が撮った snapshot（run_kind='cron'）の要約。reason は YAT-77 以前の行には無い。
+export type LatestCronSnapshot = {
+  capturedAt: string;
+  nearDupFresh: boolean;
+  reason: NearDupFreshReason | null;
+  share: number | null; // その回の多数派 share
+};
+
+// active feed の near_dup_rate が全件 null のとき、なぜ null なのかを snapshot から説明する（pure）。
+// 以前は無条件に「cron が一度も回っていない可能性が高い」と出しており、レシピ混在で compute が
+// 設計どおり全件 null にした週（既知の空白）にも同じ警告になって調査を誤誘導した（YAT-77）。
+// currentShare = 診断を実行した今の窓の多数派 share（次回 cron で算出に入るかの見込みに使う）。
+export function explainAllNullNearDup(
+  latest: LatestCronSnapshot | null,
+  currentShare: number,
+): string[] {
+  if (!latest) {
+    return ["cron の snapshot が 1 件も無い。compute-dedup-rate の cron が一度も回っていない可能性が高い"];
+  }
+  const at = latest.capturedAt.slice(0, 10);
+  const next =
+    currentShare >= RECIPE_MAJORITY_SHARE
+      ? `現在の share ${currentShare.toFixed(2)} は ${RECIPE_MAJORITY_SHARE} 以上なので、次回の cron から算出される見込み`
+      : `現在の share ${currentShare.toFixed(2)} もまだ ${RECIPE_MAJORITY_SHARE} 未満（混在が続いている）`;
+  if (latest.reason === "recipe_mixed") {
+    const shareText = latest.share === null ? "" : ` ${latest.share.toFixed(2)}`;
+    return [
+      `直近の cron（${at}）はレシピ混在（多数派 share${shareText} < ${RECIPE_MAJORITY_SHARE}）で全 feed を null にした＝既知の空白であって障害ではない`,
+      next,
+    ];
+  }
+  if (latest.reason === "compute_failed" || (latest.reason === null && !latest.nearDupFresh)) {
+    return [
+      `直近の cron（${at}）で compute-dedup-rate が成功していない（near_dup_fresh=false）。learn workflow のログを確認すること`,
+    ];
+  }
+  return [
+    `直近の cron（${at}）は near_dup_fresh=true なのに全件 null。compute の update が途中で失敗したか、その後に値が消された可能性がある（要調査）`,
+  ];
+}
