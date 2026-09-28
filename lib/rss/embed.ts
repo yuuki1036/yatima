@@ -41,7 +41,10 @@ export type EmbedBatchResult =
 // skipped/skipReason の判別可能性は保たれる。card/quiz 経路の EmbedBatchResult には付かない。
 export type ArticleEmbedResult = EmbedBatchResult & {
   // ゲート前の候補数（select_embed_candidates.pending）。-1 は取得不能（判定不能）。
+  // migration 0023 から、選抜が 1 件以上ある回は下界（pendingCapped=true）。pending > 0 の意味は不変。
   pending: number;
+  // pending が下界なら true。ログで「候補 N+」と表示する。
+  pendingCapped: boolean;
   // ゲート後＝実際に選ばれうる件数（.eligible）。-1 は取得不能。embedHealthCounts の分母に運ぶ。
   eligible: number;
   // 選抜 RPC（または天井 RPC）が落ちたときの理由。null なら正常。isEmbedSelectStalled が読む。
@@ -305,6 +308,7 @@ export async function embedMissing(
       skipped: true,
       skipReason: "disk_ceiling",
       pending: -1,
+      pendingCapped: false,
       eligible: -1,
       selectError: null,
     };
@@ -315,6 +319,7 @@ export async function embedMissing(
 
   // ② 選抜 RPC。キー未設定でも呼ぶ（eligible が embedHealthCounts の分母に要る）。
   let pending = -1;
+  let pendingCapped = false;
   let eligible = -1;
   let selectError: string | null = null;
   let rows: Record<string, unknown>[] = [];
@@ -329,10 +334,12 @@ export async function embedMissing(
     // （match_articles / feed_recent_published と同じ作法）。
     const res = (data ?? {}) as unknown as {
       pending?: number;
+      pending_capped?: boolean;
       eligible?: number;
       rows?: Record<string, unknown>[];
     };
     pending = res.pending ?? -1;
+    pendingCapped = res.pending_capped === true;
     eligible = res.eligible ?? -1;
     rows = res.rows ?? [];
   } catch (e) {
@@ -349,13 +356,14 @@ export async function embedMissing(
       skipped: true,
       skipReason: "no_api_key",
       pending,
+      pendingCapped,
       eligible,
       selectError,
     };
   }
 
   if (rows.length === 0) {
-    return { ...EMPTY_COUNTS, skipped: false, pending, eligible, selectError };
+    return { ...EMPTY_COUNTS, skipped: false, pending, pendingCapped, eligible, selectError };
   }
 
   const counts = await embedRows(supabase, rows, {
@@ -365,7 +373,7 @@ export async function embedMissing(
     embedder,
     deadlineMs: now + (opts.budgetMs ?? EMBED_WALL_CLOCK_MS),
   });
-  return { ...counts, pending, eligible, selectError };
+  return { ...counts, pending, pendingCapped, eligible, selectError };
 }
 
 // カード候補の embedding 補完（YAT-17）。card-gate のその場 embed が embedder 無し/失敗で取り
