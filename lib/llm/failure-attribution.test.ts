@@ -8,7 +8,13 @@ import {
   AuthenticationError,
   PermissionDeniedError,
 } from "@anthropic-ai/sdk";
-import { chargeable, splitSettle } from "./failure-attribution";
+import {
+  chargeable,
+  chargeableErrorType,
+  errorText,
+  isBatchErrorResponse,
+  splitSettle,
+} from "./failure-attribution";
 
 // ADR-20260906205227 の分類表を固定する。error type が変わったときにここが落ちる＝人手判断の合図。
 // SDK のエラークラスはコンストラクタが Headers を要求するため new Headers() を渡す。
@@ -82,5 +88,60 @@ describe("splitSettle", () => {
 
   it("空配列は空を返す", () => {
     expect(splitSettle([], true)).toEqual({ charged: [], released: [] });
+  });
+});
+
+// YAT-79: Batches の errored 結果は素のオブジェクトで来る。同期の分類表と同じ意味に写せているかを固定する。
+const batchErr = (type: string, message = "m") => ({
+  type: "error" as const,
+  error: { type, message },
+  request_id: "req_1",
+});
+
+describe("Batches の errored 結果の帰責", () => {
+  it("環境起因の 6 型は非課金", () => {
+    for (const t of [
+      "rate_limit_error",
+      "overloaded_error",
+      "api_error",
+      "timeout_error",
+      "authentication_error",
+      "billing_error",
+    ]) {
+      expect(chargeableErrorType(t)).toBe(false);
+      expect(chargeable(batchErr(t))).toBe(false);
+    }
+  });
+
+  it("invalid_request / permission / not_found と未知の型は chargeable", () => {
+    for (const t of ["invalid_request_error", "permission_error", "not_found_error", "brand_new_error"]) {
+      expect(chargeableErrorType(t)).toBe(true);
+      expect(chargeable(batchErr(t))).toBe(true);
+    }
+  });
+
+  it("error を欠いたオブジェクトは Batches の結果とみなさず chargeable に倒す", () => {
+    expect(isBatchErrorResponse({ type: "error" })).toBe(false);
+    expect(chargeable({ type: "error" })).toBe(true);
+  });
+
+  it("PostgrestError（type を持たない）は Batches の結果とみなさない", () => {
+    expect(isBatchErrorResponse(pgErr())).toBe(false);
+    expect(chargeable(pgErr())).toBe(true);
+  });
+
+  it("痕跡は「型: メッセージ」にする", () => {
+    expect(errorText(batchErr("rate_limit_error", "slow down"))).toBe("rate_limit_error: slow down");
+    expect(errorText({ type: "error", error: { type: "api_error" } })).toBe("api_error");
+  });
+
+  it("証人ゲートは Batches の失敗にも同じく効く", () => {
+    const failures = [
+      { id: "a", reason: batchErr("invalid_request_error") },
+      { id: "b", reason: batchErr("overloaded_error") },
+    ];
+    expect(splitSettle(failures, true).charged.map((r) => r.id)).toEqual(["a"]);
+    expect(splitSettle(failures, true).released.map((r) => r.id)).toEqual(["b"]);
+    expect(splitSettle(failures, false).charged).toEqual([]);
   });
 });

@@ -32,6 +32,7 @@ export type SettleEntry = { id: string; error: string };
  * APIConnectionError は APIError のサブクラス（status は undefined）なので、先に判定する。
  */
 export function chargeable(e: unknown): boolean {
+  if (isBatchErrorResponse(e)) return chargeableErrorType(e.error.type);
   if (e instanceof APIConnectionError) return false;
   if (e instanceof APIError) {
     const s = e.status;
@@ -41,6 +42,47 @@ export function chargeable(e: unknown): boolean {
     return true;
   }
   return true;
+}
+
+// ── Batches の errored 結果（YAT-79）────────────────────────────────────────
+//
+// Message Batches の個別結果 `{ type: "errored", error }` の error は SDK の例外ではなく、
+// `{ type: "error", error: { type, message }, request_id }` の素のオブジェクトで来る。上の
+// instanceof 判定に掛からないので、そのまま渡すと全件 chargeable に倒れる（レート制限で落ちた
+// 記事まで課金される）。error.type で同期の分類表（ADR-20260906205227）に写す。
+export type BatchErrorResponse = {
+  type: "error";
+  error: { type: string; message?: string };
+  request_id?: string | null;
+};
+
+export function isBatchErrorResponse(e: unknown): e is BatchErrorResponse {
+  if (!e || typeof e !== "object") return false;
+  const o = e as { type?: unknown; error?: unknown };
+  return (
+    o.type === "error" &&
+    !!o.error &&
+    typeof o.error === "object" &&
+    typeof (o.error as { type?: unknown }).type === "string"
+  );
+}
+
+// 非課金（環境起因に確定できる）error type。同期の 429 / 5xx / 401 に当たるもの。
+// billing_error は同期では 400 invalid_request_error に落ちて区別できないが（ADR）、Batches の結果で
+// 型として返ってきたら環境起因に確定できる（ADR「billing_error 型が実際に返るようになったら足す」）。
+// permission_error は同期の 403 と同じく未観測なので chargeable のまま置く。
+const NON_CHARGEABLE_ERROR_TYPES: ReadonlySet<string> = new Set([
+  "rate_limit_error",
+  "overloaded_error",
+  "api_error",
+  "timeout_error",
+  "authentication_error",
+  "billing_error",
+]);
+
+/** Batches の errored 結果の error.type が課金対象か。未知の型は chargeable（同期の表と同じく課金側に倒す）。 */
+export function chargeableErrorType(type: string): boolean {
+  return !NON_CHARGEABLE_ERROR_TYPES.has(type);
 }
 
 /**
@@ -69,6 +111,9 @@ export function splitSettle(
 // Error・不明値のいずれも読める形に畳む。SQL 側で left(500) に切るのでここでは長さを制限しない。
 export function errorText(e: unknown): string {
   if (e instanceof Error) return e.message;
+  if (isBatchErrorResponse(e)) {
+    return e.error.message ? `${e.error.type}: ${e.error.message}` : e.error.type;
+  }
   if (typeof e === "string") return e;
   if (e && typeof e === "object" && "message" in e) {
     const m = (e as { message: unknown }).message;
