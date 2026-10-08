@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { buildClosePatch, buildSelection, tallyUsage } from "./summary-ledger";
+import {
+  buildClosePatch,
+  buildSelection,
+  parseRoundSelection,
+  recordBatchCreate,
+  resolveStaleLedger,
+  tallyUsage,
+} from "./summary-ledger";
+import { argOf, callName, createRecorder, isFrom, isRpc } from "./supabase-recorder.testkit";
 
 // 台帳（llm_batches）に書く形と読む形の契約（YAT-79）。同期の行の形は YAT-78 から変えない。
 
@@ -96,5 +104,127 @@ describe("buildClosePatch", () => {
       input_tokens: 40000,
       output_tokens: 9000,
     });
+  });
+});
+
+describe("parseRoundSelection", () => {
+  const sel = {
+    mode: "batch",
+    lease_hours: 36,
+    lease_deadline: "2026-10-10T12:00:00.000Z",
+    ids: ["a", "b"],
+  };
+
+  it("buildSelection が書いた Batches の selection を読み戻せる", () => {
+    const written = buildSelection(
+      "batch",
+      { pool: 1, poolCapped: false, maxRows: 2, ids: ["a", "b"], leaseDeadline: sel.lease_deadline },
+      36,
+    );
+    expect(parseRoundSelection(written)).toEqual({
+      ok: true,
+      ids: ["a", "b"],
+      leaseDeadline: "2026-10-10T12:00:00.000Z",
+    });
+  });
+
+  it("同期の selection・ids や lease_deadline を欠いたものは読めない", () => {
+    expect(parseRoundSelection({ pool: 1, picked: 1 }).ok).toBe(false);
+    expect(parseRoundSelection(null).ok).toBe(false);
+    expect(parseRoundSelection({ ...sel, ids: [] }).ok).toBe(false);
+    expect(parseRoundSelection({ ...sel, ids: "a" }).ok).toBe(false);
+    expect(parseRoundSelection({ ...sel, lease_deadline: undefined }).ok).toBe(false);
+  });
+});
+
+const round = { ledgerId: "L1", ids: ["a", "b"], leaseDeadline: "2026-10-10T12:00:00.000Z" };
+
+describe("recordBatchCreate", () => {
+  it("成功なら claimed の行にだけ batch_id と submitted を書く", async () => {
+    const w = createRecorder(() => ({}));
+    const r = await recordBatchCreate(w.client, round, { ok: true, batchId: "msgbatch_1" });
+    expect(r).toEqual({ ledgerWriteError: null });
+    expect(w.calls.map(callName)).toEqual(["llm_batches.update"]);
+    expect(argOf(w.calls[0], "update")).toEqual([{ batch_id: "msgbatch_1", status: "submitted" }]);
+    const c = w.calls[0] as { chain: { method: string; args: unknown[] }[] };
+    expect(c.chain.filter((s) => s.method === "eq").map((s) => s.args)).toEqual([
+      ["id", "L1"],
+      ["status", "claimed"],
+    ]);
+  });
+
+  it("batch_id を書けなければ ledgerWriteError（孤児）", async () => {
+    const w = createRecorder(() => ({ error: { message: "denied" } }));
+    expect(await recordBatchCreate(w.client, round, { ok: true, batchId: "msgbatch_1" })).toEqual({
+      ledgerWriteError: "denied",
+    });
+  });
+
+  it("作成に失敗したらその場で予約を解放し、台帳を expired_unknown で終端する", async () => {
+    const w = createRecorder((c) =>
+      isRpc(c, "settle_summary_attempts") ? { data: { charged: 0, released: 2 } } : {},
+    );
+    await recordBatchCreate(w.client, round, { ok: false, error: "timeout" });
+    expect(w.calls.map(callName)).toEqual(["rpc:settle_summary_attempts", "llm_batches.update"]);
+    expect(w.calls[0]).toEqual({
+      kind: "rpc",
+      fn: "settle_summary_attempts",
+      args: {
+        charged: [],
+        released: [
+          { id: "a", error: "batch_create_failed: timeout" },
+          { id: "b", error: "batch_create_failed: timeout" },
+        ],
+        lease_deadline: "2026-10-10T12:00:00.000Z",
+      },
+    });
+    expect(argOf(w.calls[1], "update")).toEqual([
+      { status: "expired_unknown", resolved_at: expect.any(String), last_error: "create_failed: timeout" },
+    ]);
+  });
+});
+
+describe("resolveStaleLedger", () => {
+  const NOW = Date.parse("2026-10-09T12:00:00Z");
+
+  it("36h を超えた claimed だけを対象にし、Batches の行は予約を解放してから終端する", async () => {
+    const w = createRecorder((c) => {
+      if (isFrom(c, "llm_batches", "update")) return {};
+      if (isFrom(c, "llm_batches", "select"))
+        return {
+          data: [
+            { id: "B1", selection: { mode: "batch", ids: ["a"], lease_deadline: "LD" } },
+            { id: "S1", selection: { pool: 1 } },
+          ],
+        };
+      if (isRpc(c, "settle_summary_attempts")) return { data: { charged: 0, released: 1 } };
+      return {};
+    });
+    const r = await resolveStaleLedger(w.client, NOW);
+    expect(r).toEqual({
+      resolved: [
+        { ledgerId: "B1", isBatch: true },
+        { ledgerId: "S1", isBatch: false },
+      ],
+      error: null,
+    });
+    expect(w.calls.map(callName)).toEqual([
+      "llm_batches.select",
+      "rpc:settle_summary_attempts",
+      "llm_batches.update",
+    ]);
+    expect(argOf(w.calls[0], "eq")).toEqual(["purpose", "summarize"]);
+    expect(argOf(w.calls[0], "lt")).toEqual(["submitted_at", "2026-10-08T00:00:00.000Z"]);
+    const statusEq = (w.calls[0] as { chain: { method: string; args: unknown[] }[] }).chain.filter(
+      (s) => s.method === "eq",
+    );
+    expect(statusEq.map((s) => s.args)).toContainEqual(["status", "claimed"]);
+    expect(argOf(w.calls[2], "in")).toEqual(["id", ["B1", "S1"]]);
+  });
+
+  it("対象が無ければ何も書かない", async () => {
+    const w = createRecorder(() => ({ data: [] }));
+    expect(await resolveStaleLedger(w.client, NOW)).toEqual({ resolved: [], error: null });
+    expect(w.calls.map(callName)).toEqual(["llm_batches.select"]);
   });
 });

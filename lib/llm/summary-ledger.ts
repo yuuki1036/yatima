@@ -8,6 +8,7 @@ import {
   type SettleFailure,
 } from "./failure-attribution";
 import {
+  STALE_LEDGER_HOURS,
   SUMMARIZE_PER_FEED,
   utcDayStartIso,
   type SummaryUsage,
@@ -384,4 +385,226 @@ export async function closeSummaryRound(
     lastError: settleError ?? o.ledger.lastError,
   });
   return { charged: charged.length, released: released.length, settleError, ledgerClosed };
+}
+
+// ── Batches のラウンド（YAT-79）─────────────────────────────────────────────
+//
+// 台帳の status 遷移（Batches の行）:
+//   claimed ─create 成功→ submitted ─回収→ collected
+//      │                    └─retrieve/results 失敗→ unresolved ─回収→ collected
+//      ├─create 失敗→ expired_unknown（予約はその場で解放）
+//      └─batch_id の記録失敗（孤児）─36h→ expired_unknown（resolveStaleLedger）
+// submitted / unresolved が 36h を超えて回収されないのは batchStuck の担当（自動では諦めない）。
+
+/** Batches の未回収ラウンド（collect が 1 run で見る上限）。未回収は inflight_cap で 12 本に抑える。 */
+export const OPEN_ROUNDS_LIMIT = 24;
+
+// collect（別 run）がラウンドを閉じるのに要る情報を selection から読む。
+export function parseRoundSelection(
+  sel: unknown,
+): { ok: true; ids: string[]; leaseDeadline: string } | { ok: false; error: string } {
+  if (!sel || typeof sel !== "object") return { ok: false, error: "selection が無い" };
+  const s = sel as { mode?: unknown; ids?: unknown; lease_deadline?: unknown };
+  if (s.mode !== "batch") return { ok: false, error: "Batches の行ではない" };
+  if (!Array.isArray(s.ids) || s.ids.length === 0 || !s.ids.every((x) => typeof x === "string")) {
+    return { ok: false, error: "selection.ids が読めない" };
+  }
+  if (typeof s.lease_deadline !== "string" || s.lease_deadline === "") {
+    return { ok: false, error: "selection.lease_deadline が読めない" };
+  }
+  return { ok: true, ids: s.ids as string[], leaseDeadline: s.lease_deadline };
+}
+
+// batches.create の結果を台帳に書く。
+// 成功: batch_id と submitted。書けなければ孤児（batch_id を知っているのはこの run のメモリだけ）。
+// 失敗: batch_id が分からない以上、裏でバッチができていても結果は回収できない。予約を持っていても
+//   記事が遅れるだけなので、その場で解放して expired_unknown で終端する（二重課金 1 回分は受容・
+//   design doc open 13）。この失敗経路自身の失敗は warn のみ（呼び出し側が submitDead で赤くする）。
+export async function recordBatchCreate(
+  supabase: SupabaseClient,
+  round: SummaryRound,
+  created: { ok: true; batchId: string } | { ok: false; error: string },
+): Promise<{ ledgerWriteError: string | null }> {
+  if (created.ok) {
+    try {
+      const { error } = await supabase
+        .from("llm_batches")
+        .update({ batch_id: created.batchId, status: "submitted" })
+        .eq("id", round.ledgerId)
+        .eq("status", "claimed");
+      if (error) throw error;
+      return { ledgerWriteError: null };
+    } catch (e) {
+      return { ledgerWriteError: errorText(e) };
+    }
+  }
+
+  const released = round.ids.map((id) => ({
+    id,
+    error: `batch_create_failed: ${created.error}`,
+  }));
+  const settled = await settleAttempts(supabase, [], released, round.leaseDeadline);
+  if (!settled.ok) {
+    console.warn("バッチ作成失敗後の予約解放に失敗（36h で失効する）:", settled.error);
+  }
+  try {
+    const { error } = await supabase
+      .from("llm_batches")
+      .update({
+        status: "expired_unknown",
+        resolved_at: new Date().toISOString(),
+        last_error: `create_failed: ${created.error}`,
+      })
+      .eq("id", round.ledgerId);
+    if (error) throw error;
+  } catch (e) {
+    console.warn("バッチ作成失敗の台帳終端に失敗（36h 後に掃除される）:", errorText(e));
+  }
+  return { ledgerWriteError: null };
+}
+
+export type OpenBatchRound = { round: SummaryRound; batchId: string; submittedAt: string };
+
+// 回収を待っている Batches のラウンド（submitted / unresolved）。古い順。selection が読めない行は
+// malformed として返す（呼び出し側が unresolved にして、36h で batchStuck が赤くする）。
+export async function listOpenBatchRounds(
+  supabase: SupabaseClient,
+): Promise<
+  | { ok: true; rounds: OpenBatchRound[]; malformed: { ledgerId: string; error: string }[] }
+  | { ok: false; error: string }
+> {
+  try {
+    const { data, error } = await supabase
+      .from("llm_batches")
+      .select("id, batch_id, submitted_at, selection")
+      .eq("purpose", "summarize")
+      .is("collected_at", null)
+      .in("status", ["submitted", "unresolved"])
+      .order("submitted_at", { ascending: true })
+      .limit(OPEN_ROUNDS_LIMIT);
+    if (error) throw error;
+    const rounds: OpenBatchRound[] = [];
+    const malformed: { ledgerId: string; error: string }[] = [];
+    for (const r of (data ?? []) as {
+      id: string;
+      batch_id: string | null;
+      submitted_at: string;
+      selection: unknown;
+    }[]) {
+      const sel = parseRoundSelection(r.selection);
+      if (!r.batch_id) {
+        malformed.push({ ledgerId: r.id, error: "batch_id が無い" });
+      } else if (!sel.ok) {
+        malformed.push({ ledgerId: r.id, error: sel.error });
+      } else {
+        rounds.push({
+          round: { ledgerId: r.id, ids: sel.ids, leaseDeadline: sel.leaseDeadline },
+          batchId: r.batch_id,
+          submittedAt: r.submitted_at,
+        });
+      }
+    }
+    return { ok: true, rounds, malformed };
+  } catch (e) {
+    return { ok: false, error: errorText(e) };
+  }
+}
+
+// 回収を試みたが閉じられなかった（retrieve / results の失敗・selection 不正）。次 run で再試行する。
+// 書けなくても submitted のまま残って次 run で再試行されるので warn のみ。
+export async function markRoundUnresolved(
+  supabase: SupabaseClient,
+  ledgerId: string,
+  error: string,
+): Promise<void> {
+  try {
+    const { error: upErr } = await supabase
+      .from("llm_batches")
+      .update({ status: "unresolved", last_error: error })
+      .eq("id", ledgerId);
+    if (upErr) throw upErr;
+  } catch (e) {
+    console.warn(`要約台帳を unresolved にできなかった [${ledgerId}]:`, errorText(e));
+  }
+}
+
+// 未回収の Batches ラウンドの本数と最古の submitted_at（inflight_cap と batchStuck の材料）。
+export async function readBatchBacklog(
+  supabase: SupabaseClient,
+): Promise<{ ok: true; open: number; oldestSubmittedAt: string | null } | { ok: false; error: string }> {
+  try {
+    const { data, error, count } = await supabase
+      .from("llm_batches")
+      .select("submitted_at", { count: "exact" })
+      .eq("purpose", "summarize")
+      .is("collected_at", null)
+      .in("status", ["submitted", "unresolved"])
+      .order("submitted_at", { ascending: true })
+      .limit(1);
+    if (error) throw error;
+    const rows = (data ?? []) as { submitted_at: string }[];
+    return { ok: true, open: count ?? rows.length, oldestSubmittedAt: rows[0]?.submitted_at ?? null };
+  } catch (e) {
+    return { ok: false, error: errorText(e) };
+  }
+}
+
+/** resolveStaleLedger が 1 run で終端する上限。 */
+const STALE_RESOLVE_LIMIT = 50;
+
+// claimed のまま 36h を超えた行を expired_unknown で終端する（YAT-79）。対象は、create の手前で
+// 落ちた run・batch_id の記録に失敗した孤児・途中で落ちた同期 run。予約は lease で既に失効しているが、
+// selection に ids があれば痕跡（summary_last_error）を書いて解放する（所有者チェックで他 run の
+// 予約は触らない）。unresolved は対象外: batch_id を持つ回収待ちで、batchStuck の担当。
+export async function resolveStaleLedger(
+  supabase: SupabaseClient,
+  now: number = Date.now(),
+): Promise<{ resolved: { ledgerId: string; isBatch: boolean }[]; error: string | null }> {
+  const cutoff = new Date(now - STALE_LEDGER_HOURS * 3_600_000).toISOString();
+  let rows: { id: string; selection: unknown }[];
+  try {
+    const { data, error } = await supabase
+      .from("llm_batches")
+      .select("id, selection")
+      .eq("purpose", "summarize")
+      .eq("status", "claimed")
+      .is("collected_at", null)
+      .lt("submitted_at", cutoff)
+      .order("submitted_at", { ascending: true })
+      .limit(STALE_RESOLVE_LIMIT);
+    if (error) throw error;
+    rows = (data ?? []) as { id: string; selection: unknown }[];
+  } catch (e) {
+    return { resolved: [], error: errorText(e) };
+  }
+  if (rows.length === 0) return { resolved: [], error: null };
+
+  const resolved: { ledgerId: string; isBatch: boolean }[] = [];
+  for (const r of rows) {
+    const sel = parseRoundSelection(r.selection);
+    if (sel.ok) {
+      const released = sel.ids.map((id) => ({ id, error: "stale_claimed" }));
+      const settled = await settleAttempts(supabase, [], released, sel.leaseDeadline);
+      if (!settled.ok) console.warn(`孤児の予約解放に失敗 [${r.id}]:`, settled.error);
+    }
+    resolved.push({ ledgerId: r.id, isBatch: sel.ok });
+  }
+  try {
+    const { error } = await supabase
+      .from("llm_batches")
+      .update({
+        status: "expired_unknown",
+        resolved_at: new Date(now).toISOString(),
+        last_error: "stale_claimed",
+      })
+      .in(
+        "id",
+        rows.map((r) => r.id),
+      )
+      .eq("status", "claimed");
+    if (error) throw error;
+  } catch (e) {
+    return { resolved, error: errorText(e) };
+  }
+  return { resolved, error: null };
 }
