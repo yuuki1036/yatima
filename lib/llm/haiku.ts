@@ -31,6 +31,57 @@ const ANNOTATE_SYSTEM_PROMPT = [
   `タグ候補: ${TAG_VOCAB_PROMPT}`,
 ].join("\n");
 
+// annotate のリクエスト（YAT-79）。同期の HaikuSummarizer.annotate と Batches 経路（annotate-batch.ts）が
+// 同じ params を送るよう 1 か所に置く。段階 9（YAT-80）の字数・max_tokens 変更もここ 1 か所で両方に効く。
+export function buildAnnotateParams(
+  input: SummarizeInput,
+): Anthropic.MessageCreateParamsNonStreaming {
+  const userText = [
+    input.title ? `タイトル: ${input.title}` : null,
+    `本文: ${input.text}`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  return {
+    model: MODEL,
+    max_tokens: 1400, // 字数固定なしの長め要約 + tags の JSON 分のマージン（途中切れ防止）
+    thinking: { type: "disabled" },
+    system: ANNOTATE_SYSTEM_PROMPT,
+    messages: [{ role: "user", content: userText }],
+  };
+}
+
+// annotate の応答の解釈（YAT-79）。同期の応答と Batches の succeeded 結果の message は同じ形なので、
+// どちらもここを通す。失敗は throw（呼び出し側が帰責する）。
+export function interpretAnnotateMessage(res: {
+  content: Anthropic.ContentBlock[];
+}): Annotation {
+  const text = res.content
+    .filter((b): b is Anthropic.TextBlock => b.type === "text")
+    .map((b) => b.text)
+    .join("");
+
+  const parsed = parseAnnotation(text);
+  if (!parsed) {
+    // JSON 化失敗 → 生テキストを要約として救済し、タグは諦める（fail-soft）。
+    // タグ欠落は興味順スコアに効くため、無痕跡にせず警告を残す（プロンプト崩れの検知用）。
+    console.warn(
+      "annotate の JSON パース失敗。要約のみ救済しタグは空にフォールバック:",
+      text.slice(0, 120),
+    );
+    // ただし JSON を返そうとした形跡（"summary" キー）があるなら生テキストは JSON 断片や
+    // モデルの注記を含むため救済しない。throw → summary NULL のまま次回 cron で再試行させる。
+    if (/"summary"\s*:/.test(text)) throw new Error("annotate の JSON が壊れている");
+    const summary = sanitizeSummary(text);
+    if (!summary) throw new Error("要約が空");
+    return { summary, tags: [] };
+  }
+  // tags は coerceTags で語彙外/重複を捨て最大3件に。summary は二重保険で sanitize。
+  const summary = sanitizeSummary(parsed.summary);
+  if (!summary) throw new Error("要約が空");
+  return { summary, tags: coerceTags(parsed.tags) };
+}
+
 class HaikuSummarizer implements Summarizer {
   private client: Anthropic;
 
@@ -65,45 +116,8 @@ class HaikuSummarizer implements Summarizer {
   }
 
   async annotate(input: SummarizeInput): Promise<Annotation> {
-    const userText = [
-      input.title ? `タイトル: ${input.title}` : null,
-      `本文: ${input.text}`,
-    ]
-      .filter(Boolean)
-      .join("\n\n");
-
-    const res = await this.client.messages.create({
-      model: MODEL,
-      max_tokens: 1400, // 字数固定なしの長め要約 + tags の JSON 分のマージン（途中切れ防止）
-      thinking: { type: "disabled" },
-      system: ANNOTATE_SYSTEM_PROMPT,
-      messages: [{ role: "user", content: userText }],
-    });
-
-    const text = res.content
-      .filter((b): b is Anthropic.TextBlock => b.type === "text")
-      .map((b) => b.text)
-      .join("");
-
-    const parsed = parseAnnotation(text);
-    if (!parsed) {
-      // JSON 化失敗 → 生テキストを要約として救済し、タグは諦める（fail-soft）。
-      // タグ欠落は興味順スコアに効くため、無痕跡にせず警告を残す（プロンプト崩れの検知用）。
-      console.warn(
-        "annotate の JSON パース失敗。要約のみ救済しタグは空にフォールバック:",
-        text.slice(0, 120),
-      );
-      // ただし JSON を返そうとした形跡（"summary" キー）があるなら生テキストは JSON 断片や
-      // モデルの注記を含むため救済しない。throw → summary NULL のまま次回 cron で再試行させる。
-      if (/"summary"\s*:/.test(text)) throw new Error("annotate の JSON が壊れている");
-      const summary = sanitizeSummary(text);
-      if (!summary) throw new Error("要約が空");
-      return { summary, tags: [] };
-    }
-    // tags は coerceTags で語彙外/重複を捨て最大3件に。summary は二重保険で sanitize。
-    const summary = sanitizeSummary(parsed.summary);
-    if (!summary) throw new Error("要約が空");
-    return { summary, tags: coerceTags(parsed.tags) };
+    const res = await this.client.messages.create(buildAnnotateParams(input));
+    return interpretAnnotateMessage(res);
   }
 }
 
