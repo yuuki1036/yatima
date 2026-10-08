@@ -86,7 +86,7 @@ describe("findStaleFeeds", () => {
 
   it("stale が長い順に並ぶ", () => {
     const results = [
-      failed({ feedId: "short", lastFetchedAt: hoursAgo(7) }),
+      failed({ feedId: "short", lastFetchedAt: hoursAgo(30) }),
       failed({ feedId: "longest", lastFetchedAt: hoursAgo(24 * 15) }),
       failed({ feedId: "mid", lastFetchedAt: hoursAgo(48) }),
     ];
@@ -108,8 +108,15 @@ describe("findStaleFeeds", () => {
     ]);
   });
 
-  it("閾値は 6 時間（変更時はこのテストを仕様変更として書き換える）", () => {
-    expect(STALE_ALERT_HOURS).toBe(6);
+  it("cron の 1 回の間隔ぶん（7 時間）だけ失敗した feed では鳴らない", () => {
+    // YAT-85: 毎時 cron の実際の発火は 1 日 4〜7 回で、run 間隔が 6 時間を超える。閾値 6h の頃は
+    // 直前の run で成功していた feed が 1 回落ちただけで赤くなっていた（実測 6.2〜7.4h で 4 回）。
+    const oneMissedRun = failed({ lastFetchedAt: hoursAgo(7.4) });
+    expect(findStaleFeeds([oneMissedRun], NOW)).toEqual([]);
+  });
+
+  it("閾値は 24 時間（変更時はこのテストを仕様変更として書き換える）", () => {
+    expect(STALE_ALERT_HOURS).toBe(24);
   });
 });
 

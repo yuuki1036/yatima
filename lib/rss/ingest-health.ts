@@ -14,9 +14,13 @@ import type { EmbedSkipReason } from "./embed";
 //
 // 純関数に閉じて DB I/O は呼び出し側に置く（feed-health.ts と同じ方針）。
 
-// 継続失敗とみなす経過時間。ingest は毎時なので 6h ≒ 6 回連続失敗。
-// 単発の瞬断で鳴らさず、恒常的な失敗は 15 日でなく 6 時間で拾う狙いの暫定値。
-export const STALE_ALERT_HOURS = 6;
+// 継続失敗とみなす経過時間。単発の瞬断で鳴らさず、恒常的な失敗は 15 日でなく 1 日で拾う。
+//
+// 当初は「ingest は毎時なので 6h ≒ 6 回連続失敗」として 6 にしていたが、毎時 cron の実際の
+// 発火は 1 日 4〜7 回で、run 間隔が 6 時間を超えることが多い（YAT-85）。6h では直前の run で
+// 成功していた feed が 1 回落ちただけで鳴り、09-28〜10-08 の赤 4 回はすべてこの誤報だった。
+// 閾値は名目の schedule でなく実際の発火間隔から決める。24h なら今の頻度で約 4〜7 回連続の失敗。
+export const STALE_ALERT_HOURS = 24;
 
 const HOUR_MS = 3_600_000;
 
@@ -78,7 +82,7 @@ export function findStaleFeeds(
   return stale.sort((a, b) => b.staleMs - a.staleMs);
 }
 
-// ログ用の経過時間表記。6h 未満は出ない前提だが、境界付近を読めるよう時間で刻む。
+// ログ用の経過時間表記。STALE_ALERT_HOURS 未満は出ない前提だが、境界付近を読めるよう 48h 未満は時間で刻む。
 export function formatStale(staleMs: number): string {
   const hours = staleMs / HOUR_MS;
   return hours >= 48
