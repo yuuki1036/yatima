@@ -9,6 +9,12 @@ import {
   type SettleFailure,
   type SettleEntry,
 } from "./failure-attribution";
+import {
+  DAILY_SUMMARIZE_CAP,
+  PER_RUN_MAX,
+  SUMMARIZE_PER_FEED,
+  SUMMARY_MAX_ATTEMPTS,
+} from "./summarize-policy";
 
 // 取得→保存の後に呼ぶバッチ要約。ingestAllFeeds と同じく SupabaseClient を注入して使う。
 // summary IS NULL の記事を拾って要約し、articles.summary を埋める。
@@ -23,30 +29,11 @@ export type SummarizeBatchResult = {
 
 type Row = { id: string; title: string | null; content_html: string | null };
 
-const DEFAULT_LIMIT = 20; // 1 回の実行で要約する上限（コスト暴走を防ぐ。残りは次回消化）
+// 件数上限の定数は summarize-policy.ts に集めた（YAT-79）。既存の import 先を壊さないよう再 export する。
+export { DAILY_SUMMARIZE_CAP, SUMMARIZE_PER_FEED, SUMMARY_MAX_ATTEMPTS } from "./summarize-policy";
 
-// 1 UTC 日あたりの要約上限（YAT-74 → YAT-78）。**run をまたぐ唯一の支出天井。**
-//
-// DEFAULT_LIMIT は 1 run の上限でしかなく、日次の消費は cron の発火回数に比例する。
-// その発火回数は GitHub Actions の best-effort スケジューリングで実測 2〜23 回/日 と
-// 10 倍振れるため、日次消費は制御できていなかった（2026-08-19 のクレジット枯渇の直接原因）。
-//
-// YAT-78 で 300 → 120 に絞る（月 $20 → 約 $8）。**率でなく実数で置く**（率だと絞り込みの
-// ノブを回すたびに閾値も動く）。下流の必要量から引く: デッキ 10 件/日 × 72h 窓 = 360 件が
-// 常時候補にいればよく、feed RR で 120 件/日 でも流入 3.75/日 未満の feed は実質 100% 要約される。
-// 判定は articles.summarized_at（着地）でなく llm_batches の当日 request_count 合計（投入基準）。
-// 非同期化（YAT-79）で投入と着地が正当に乖離するため、上限は投入で数える（着地を待つと
-// submit を止められない）。summarized_at は着地の観測として残し、乖離＝未回収量として監視する。
-export const DAILY_SUMMARIZE_CAP = 120;
-
-// claim_summary_candidates の per_feed。1 run で 1 feed から取る上限（rn 昇順の RR の粒度）。
-// 120 ÷ 32 feed ≒ 3.75 の切り上げ。バックログを持つ feed が 5 本未満のときだけ run 枠が余るが、
-// それはバックログがほぼ捌けた状態。dev.to（流入の 35%）を日次 4 件/日 に抑える効果もここ。
-export const SUMMARIZE_PER_FEED = 4;
-
-// 記事固有の失敗の隔離閾値（0017 の claim RPC 既定 max_attempts と同値）。unquarantine と
-// 隔離増加ガードが読む。**claim 時には増やさない**（証人ゲート・ADR-20260906205227）。
-export const SUMMARY_MAX_ATTEMPTS = 3;
+// 1 回の実行で要約する上限（コスト暴走を防ぐ。残りは次回消化）。annotateMissing では Batches と同期の合計。
+const DEFAULT_LIMIT = PER_RUN_MAX;
 
 // 隔離増加ガードの観測窓（YAT-78）。summary_attempts が閾値に達した時刻 = 最後の失敗時刻。
 export const QUARANTINE_WINDOW_HOURS = 24;
