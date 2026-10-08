@@ -24,6 +24,11 @@ describe("buildAnnotateParams", () => {
     ]);
   });
 
+  it("タイトルと本文の孤立したサロゲートは U+FFFD にして送る（YAT-79）", () => {
+    const p = buildAnnotateParams({ title: "T\uD83D", text: "B\uDE80x" });
+    expect(p.messages).toEqual([{ role: "user", content: "タイトル: T\uFFFD\n\n本文: B\uFFFDx" }]);
+  });
+
   it("タイトルが無ければ本文だけ", () => {
     expect(buildAnnotateParams({ title: null, text: "B" }).messages).toEqual([
       { role: "user", content: "本文: B" },

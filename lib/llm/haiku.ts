@@ -36,9 +36,10 @@ const ANNOTATE_SYSTEM_PROMPT = [
 export function buildAnnotateParams(
   input: SummarizeInput,
 ): Anthropic.MessageCreateParamsNonStreaming {
+  // タイトルは feed 由来で htmlToInputText を通らないので、ここでも well-formed にする（extract-text.ts 参照）。
   const userText = [
-    input.title ? `タイトル: ${input.title}` : null,
-    `本文: ${input.text}`,
+    input.title ? `タイトル: ${input.title.toWellFormed()}` : null,
+    `本文: ${input.text.toWellFormed()}`,
   ]
     .filter(Boolean)
     .join("\n\n");
