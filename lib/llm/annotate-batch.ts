@@ -40,18 +40,24 @@ export type BatchesPort = {
     options: { maxRetries: 0 },
   ): Promise<MessageBatch>;
   retrieve(id: string): Promise<MessageBatch>;
-  results(id: string): Promise<AsyncIterable<MessageBatchIndividualResponse>>;
+  results(
+    id: string,
+    options?: { signal?: AbortSignal },
+  ): Promise<AsyncIterable<MessageBatchIndividualResponse>>;
 };
 
-// SDK の既定 timeout は 10 分。collect は run の先頭にあるので、詰まると後段（取得・キュレーション・
-// embed）を巻き添えにする。1 リクエストは 1 分で打ち切る。
+// SDK の既定は timeout 10 分・再試行 2 回。collect は run の先頭にあるので、詰まると後段（取得・
+// キュレーション・embed）を巻き添えにする。1 リクエストは 1 分で打ち切り、再試行もしない
+// （回収の失敗は unresolved にして次 run で再試行するので、run 内で粘る理由が無い）。
+// timeout が効くのは応答ヘッダまでなので、results の本文の読み出しは collect 側の signal で打ち切る。
 const BATCH_API_TIMEOUT_MS = 60_000;
 
 // ANTHROPIC_API_KEY が無ければ null（submit / collect は no_api_key で見送る）。
 export function createBatchesPort(): BatchesPort | null {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return null;
-  return new Anthropic({ apiKey, timeout: BATCH_API_TIMEOUT_MS }).messages.batches;
+  return new Anthropic({ apiKey, timeout: BATCH_API_TIMEOUT_MS, maxRetries: 0 }).messages
+    .batches;
 }
 
 // ── 純関数 ─────────────────────────────────────────────────────────────────
@@ -326,7 +332,10 @@ export async function submitAnnotateBatch(
 
 // ── 回収 ───────────────────────────────────────────────────────────────────
 
-/** 1 run で回収に使う時間。行の境界でだけ見る（超えたら残りは次 run に持ち越す）。 */
+/**
+ * 1 run で回収に使う時間。ラウンドの境界と結果の取得の前で見て、超えたら残りは次 run に持ち越す。
+ * 結果の本文の読み出しはこの残り時間で打ち切る（途中で切れたら unresolved にして次 run で読み直す）。
+ */
 export const COLLECT_BUDGET_MS = 120_000;
 
 export type CollectSkipReason = "collect_disabled" | "no_api_key";
@@ -343,7 +352,10 @@ type CollectCounts = {
   unresolved: number;
   /** 時間予算を超えて次 run に回したラウンド数。 */
   deferred: number;
-  /** 書き込みを試みた件数（succeeded ＋ 帰責対象の失敗）。collectDead が読む。 */
+  /**
+   * 書き込みか帰責の対象になった件数（succeeded ＋ errored ＋ 結果に無い id）。collectDead が読む。
+   * expired / canceled は含めない（予約を外すだけで、書き込みも帰責もしない）。
+   */
   attempted: number;
   succeeded: number;
   errored: number;
@@ -461,10 +473,17 @@ export async function collectAnnotateBatches(
       continue;
     }
 
+    // retrieve に時間を使って予算を超えていたら、結果の取得は次 run に回す（台帳は触らない）。
+    if (now() > deadline) {
+      c.deferred += 1;
+      continue;
+    }
+
     // 結果は書く前に全部読み切る。途中で落ちても記事は 1 件も書かず、次 run で読み直す。
     const items: MessageBatchIndividualResponse[] = [];
     try {
-      for await (const it of await port.results(batchId)) items.push(it);
+      const signal = AbortSignal.timeout(Math.max(1_000, deadline - now()));
+      for await (const it of await port.results(batchId, { signal })) items.push(it);
     } catch (e) {
       const msg = errorText(e);
       console.warn(`要約バッチの結果取得に失敗 [${batchId}]:`, msg);

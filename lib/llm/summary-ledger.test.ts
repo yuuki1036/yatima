@@ -3,6 +3,7 @@ import {
   buildClosePatch,
   buildSelection,
   parseRoundSelection,
+  readBatchBacklog,
   recordBatchCreate,
   resolveStaleLedger,
   tallyUsage,
@@ -220,11 +221,63 @@ describe("resolveStaleLedger", () => {
     );
     expect(statusEq.map((s) => s.args)).toContainEqual(["status", "claimed"]);
     expect(argOf(w.calls[2], "in")).toEqual(["id", ["B1", "S1"]]);
+    // Batches の行は selection の lease_deadline で予約の痕跡を書いて解放する
+    expect(w.calls[1]).toEqual({
+      kind: "rpc",
+      fn: "settle_summary_attempts",
+      args: { charged: [], released: [{ id: "a", error: "stale_claimed" }], lease_deadline: "LD" },
+    });
+    // 終端は expired_unknown。update 側でも claimed に限る（他経路で既に動いた行を巻き戻さない）
+    expect(argOf(w.calls[2], "update")).toEqual([
+      { status: "expired_unknown", resolved_at: "2026-10-09T12:00:00.000Z", last_error: "stale_claimed" },
+    ]);
+    const updEq = (w.calls[2] as { chain: { method: string; args: unknown[] }[] }).chain.filter(
+      (s) => s.method === "eq",
+    );
+    expect(updEq.map((s) => s.args)).toEqual([["status", "claimed"]]);
   });
 
   it("対象が無ければ何も書かない", async () => {
     const w = createRecorder(() => ({ data: [] }));
     expect(await resolveStaleLedger(w.client, NOW)).toEqual({ resolved: [], error: null });
     expect(w.calls.map(callName)).toEqual(["llm_batches.select"]);
+  });
+});
+
+describe("readBatchBacklog", () => {
+  const chainOf = (c: unknown) =>
+    (c as { chain: { method: string; args: unknown[] }[] }).chain.map((s) => [s.method, ...s.args]);
+
+  it("未回収（submitted / unresolved）の Batches 行を古い順に 1 件だけ引き、件数は count で数える", async () => {
+    const w = createRecorder(() => ({ data: [{ submitted_at: "2026-10-08T01:00:00Z" }], count: 3 }));
+    expect(await readBatchBacklog(w.client)).toEqual({
+      ok: true,
+      open: 3,
+      oldestSubmittedAt: "2026-10-08T01:00:00Z",
+    });
+    // unresolved を外すと回収が恒常的に失敗している行が batchStuck と inflight_cap から消える
+    expect(chainOf(w.calls[0])).toEqual([
+      ["select", "submitted_at", { count: "exact" }],
+      ["eq", "purpose", "summarize"],
+      ["is", "collected_at", null],
+      ["in", "status", ["submitted", "unresolved"]],
+      ["order", "submitted_at", { ascending: true }],
+      ["limit", 1],
+    ]);
+  });
+
+  it("未回収が無ければ 0 本・最古なし", async () => {
+    const w = createRecorder(() => ({ data: [], count: 0 }));
+    expect(await readBatchBacklog(w.client)).toEqual({ ok: true, open: 0, oldestSubmittedAt: null });
+  });
+
+  it("count が返らなければ取得した行数に倒す", async () => {
+    const w = createRecorder(() => ({ data: [{ submitted_at: "x" }], count: null }));
+    expect(await readBatchBacklog(w.client)).toMatchObject({ ok: true, open: 1 });
+  });
+
+  it("読めなければ ok:false（batchStuck は判定不能として不活性）", async () => {
+    const w = createRecorder(() => ({ error: { message: "boom" } }));
+    expect(await readBatchBacklog(w.client)).toEqual({ ok: false, error: "boom" });
   });
 });

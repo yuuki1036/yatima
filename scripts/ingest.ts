@@ -344,10 +344,14 @@ async function main() {
   const collectDead = isCollectDead(col);
   if (collectDead) {
     console.error(
-      `\n⚠ 回収した要約バッチの結果を ${col.attempted} 件すべて書けなかった（成功 0）`,
+      `\n⚠ 回収した要約バッチの結果が ${col.attempted} 件あるのに、記事に 1 件も書けなかった（着地 0）`,
     );
+    // 全件がバッチ側の errored なら API 側の全滅（クレジット・レート制限・過負荷）で、記事への書き込みには
+    // 届いていない。それ以外は応答は返っているのに書けていない。原因が違うので案内を分ける。
     console.error(
-      `  応答の JSON が壊れている（プロンプト・max_tokens の変更）か、DB 書き込みが落ちている可能性が高い`,
+      col.errored === col.attempted
+        ? `  全件がバッチの errored で返った。API キー・クレジット残高・レート制限を確認（2026-08 のクレジット枯渇と同じ型）`
+        : `  応答の JSON が壊れている（プロンプト・max_tokens の変更）か、DB 書き込みが落ちている可能性が高い`,
     );
   }
   // 回収の後の未回収の最古（この run の collect を反映した状態）で判定する。

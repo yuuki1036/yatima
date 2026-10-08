@@ -9,6 +9,7 @@ import {
   type BatchesPort,
 } from "./annotate-batch";
 import { buildAnnotateParams } from "./haiku";
+import { isCollectDead } from "@/lib/rss/ingest-health";
 import {
   argOf,
   callName,
@@ -53,6 +54,17 @@ const message = (summary: string, input = 100, output = 50) =>
     usage: { input_tokens: input, output_tokens: output },
   }) as unknown as Anthropic.Messages.Message;
 
+// "summary" キーを含む壊れた JSON（interpretAnnotateMessage が throw する）を返した成功結果。
+const okBroken = (id: string): Item => ({
+  custom_id: id,
+  result: {
+    type: "succeeded",
+    message: {
+      ...message("x"),
+      content: [{ type: "text", text: '{"summary": "途中で切れ', citations: null }],
+    } as unknown as Anthropic.Messages.Message,
+  },
+});
 const ok = (id: string, summary = `要点-${id}`, input = 100, output = 50): Item => ({
   custom_id: id,
   result: { type: "succeeded", message: message(summary, input, output) },
@@ -115,11 +127,13 @@ type SubmitWorld = {
   claim?: StubResponse;
   rows?: { id: string; title: string | null; content_html: string | null }[];
   batchUpdate?: StubResponse;
+  insert?: StubResponse;
+  fetch?: StubResponse;
 };
 
 function submitWorld(w: SubmitWorld = {}) {
   return createRecorder((c: RecordedCall) => {
-    if (isFrom(c, "llm_batches", "insert")) return { data: { id: "L1" } };
+    if (isFrom(c, "llm_batches", "insert")) return w.insert ?? { data: { id: "L1" } };
     if (isFrom(c, "llm_batches", "update")) return w.batchUpdate ?? {};
     if (isFrom(c, "llm_batches", "select")) {
       const cols = argOf(c, "select")?.[0];
@@ -129,7 +143,7 @@ function submitWorld(w: SubmitWorld = {}) {
     if (isRpc(c, "claim_summary_candidates"))
       return w.claim ?? { data: { pool: 9, pool_capped: false, ids: ["a", "b"], lease_deadline: LEASE } };
     if (isFrom(c, "articles", "select"))
-      return {
+      return w.fetch ?? {
         data: w.rows ?? [
           { id: "a", title: "A", content_html: "<p>本文A</p>" },
           { id: "b", title: "B", content_html: "<p>本文B</p>" },
@@ -153,9 +167,9 @@ function fakePort(over: Partial<BatchesPort> = {}) {
       if (over.retrieve) return over.retrieve(id);
       return batchOf();
     },
-    results: async (id) => {
-      log.push({ op: "results", args: [id] });
-      if (over.results) return over.results(id);
+    results: async (id, options) => {
+      log.push({ op: "results", args: [id, options] });
+      if (over.results) return over.results(id, options);
       return (async function* () {})();
     },
   };
@@ -252,6 +266,31 @@ describe("submitAnnotateBatch", () => {
     expect((argOf(tail[1], "update") as [{ status: string }])[0].status).toBe("expired_unknown");
   });
 
+  it("claim の失敗は poolError（pool=-1）で返し、台帳も create も触らない", async () => {
+    const w = submitWorld({ claim: { error: { message: "timeout" } } });
+    const { port, log } = fakePort();
+    const r = await submitAnnotateBatch(w.client, { cap: 20, port });
+    expect(r).toMatchObject({ skipped: false, pool: -1, poolError: "timeout", ledgerCounted: 0, reserved: 0 });
+    expect(w.calls.some((c) => isFrom(c, "llm_batches", "insert"))).toBe(false);
+    expect(log).toEqual([]);
+  });
+
+  it("台帳 insert の失敗は ledgerError で返し、台帳に載っていないので同期の枠は減らさない", async () => {
+    const w = submitWorld({ insert: { error: { message: "denied" } } });
+    const { port, log } = fakePort();
+    const r = await submitAnnotateBatch(w.client, { cap: 20, port });
+    expect(r).toMatchObject({ ledgerError: "denied", selected: 2, ledgerCounted: 0, reserved: 0, batchId: null });
+    expect(log).toEqual([]);
+  });
+
+  it("対象行の取得の失敗は poolError で返し、台帳に載った件数は同期の枠から引く", async () => {
+    const w = submitWorld({ fetch: { error: { message: "fetch boom" } } });
+    const { port, log } = fakePort();
+    const r = await submitAnnotateBatch(w.client, { cap: 20, port });
+    expect(r).toMatchObject({ poolError: "fetch boom", selected: 2, ledgerCounted: 2, reserved: 0 });
+    expect(log).toEqual([]);
+  });
+
   it("batch_id を台帳に書けなければ batchIdWriteError（孤児）", async () => {
     const w = submitWorld({ batchUpdate: { error: { message: "denied" } } });
     const r = await submitAnnotateBatch(w.client, { cap: 20, port: fakePort().port });
@@ -269,11 +308,26 @@ const openRow = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-function collectWorld(rows: unknown[] = [openRow()]) {
+type CollectKnobs = {
+  /** 回収待ちの一覧の取得を失敗させる。 */
+  listError?: boolean;
+  /** settle_summary_attempts の応答（既定は要求どおりの件数を反映）。 */
+  settle?: StubResponse;
+  /** 台帳（llm_batches）の update の応答。 */
+  ledgerUpdate?: StubResponse;
+  /** この記事 id の articles.update を失敗させる。 */
+  failArticle?: string;
+};
+
+function collectWorld(rows: unknown[] = [openRow()], k: CollectKnobs = {}) {
   return createRecorder((c: RecordedCall) => {
-    if (isFrom(c, "llm_batches", "update")) return {};
-    if (isFrom(c, "llm_batches", "select")) return { data: rows };
+    if (isFrom(c, "llm_batches", "update")) return k.ledgerUpdate ?? {};
+    if (isFrom(c, "llm_batches", "select"))
+      return k.listError ? { error: { message: "list boom" } } : { data: rows };
+    if (isFrom(c, "articles", "update"))
+      return argOf(c, "eq")?.[1] === k.failArticle ? { error: { message: "update boom" } } : {};
     if (isRpc(c, "settle_summary_attempts")) {
+      if (k.settle) return k.settle;
       const a = (c as { args: { charged: unknown[]; released: unknown[] } }).args;
       return { data: { charged: a.charged.length, released: a.released.length } };
     }
@@ -419,28 +473,130 @@ describe("collectAnnotateBatches", () => {
     expect(r).toMatchObject({ open: 1, unresolved: 1 });
   });
 
-  it("時間予算を超えた行は次 run に持ち越す", async () => {
+  it("時間予算を超えた行は次 run に持ち越す（ラウンドの先頭）", async () => {
     const w = collectWorld([openRow(), openRow({ id: "L2", batch_id: "msgbatch_2" })]);
     let t = 0;
-    const r = await collectAnnotateBatches(w.client, {
-      enabled: true,
-      port: fakePort({ results: resultsOf([]) }).port,
-      budgetMs: 10,
-      now: () => (t += 8),
+    const { port, log } = fakePort({
+      // 1 本目の結果の取得で予算 100 を使い切る
+      results: async () => {
+        t = 150;
+        return (async function* () {})();
+      },
     });
-    expect(r).toMatchObject({ open: 2, deferred: 1 });
+    const r = await collectAnnotateBatches(w.client, { enabled: true, port, budgetMs: 100, now: () => t });
+    expect(r).toMatchObject({ open: 2, returned: 1, deferred: 1 });
+    expect(log.map((l) => l.op)).toEqual(["retrieve", "results"]);
   });
 
-  it("同じ結果を 2 回回収しても書き込む内容は同じ（台帳を閉じる前に落ちた run の再回収）", async () => {
-    const items = [ok("a", "新モデルの発表")];
-    const run = async () => {
-      const w = collectWorld([openRow({ selection: { mode: "batch", lease_deadline: LEASE, ids: ["a"] } })]);
-      await collectAnnotateBatches(w.client, { enabled: true, port: fakePort({ results: resultsOf(items) }).port });
-      const up = w.calls.find((c) => isFrom(c, "articles", "update"))!;
-      const patch = { ...(argOf(up, "update") as [Record<string, unknown>])[0] };
-      delete patch.summarized_at; // 書いた時刻だけは回ごとに違う
-      return patch;
+  it("retrieve で予算を超えたら結果を取りに行かず、台帳も触らずに持ち越す", async () => {
+    const w = collectWorld();
+    let t = 0;
+    const { port, log } = fakePort({
+      retrieve: async () => {
+        t = 200;
+        return batchOf();
+      },
+    });
+    const r = await collectAnnotateBatches(w.client, { enabled: true, port, budgetMs: 100, now: () => t });
+    expect(r).toMatchObject({ open: 1, deferred: 1, returned: 0, unresolved: 0 });
+    expect(log.map((l) => l.op)).toEqual(["retrieve"]);
+    expect(w.calls.map(callName)).toEqual(["llm_batches.select"]);
+  });
+
+  it("結果の取得には残り時間で切れる signal を渡す（本文の読み出しは SDK の timeout が効かないため）", async () => {
+    const w = collectWorld();
+    const { port, log } = fakePort({ results: resultsOf([]) });
+    await collectAnnotateBatches(w.client, { enabled: true, port });
+    const results = log.find((l) => l.op === "results")!;
+    expect((results.args[1] as { signal: unknown }).signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("応答が壊れて書けなかった記事は、証人がいれば課金して数える", async () => {
+    const w = collectWorld([
+      openRow({ selection: { mode: "batch", lease_deadline: LEASE, ids: ["a", "b"] } }),
+    ]);
+    const r = await collectAnnotateBatches(w.client, {
+      enabled: true,
+      port: fakePort({ results: resultsOf([okBroken("a"), ok("b")]) }).port,
+    });
+    expect(r).toMatchObject({ attempted: 2, applied: 1, succeeded: 2, charged: 1, released: 0 });
+    const settle = w.calls.find((c) => isRpc(c, "settle_summary_attempts")) as {
+      args: { charged: { id: string; error: string }[] };
     };
-    expect(await run()).toEqual(await run());
+    expect(settle.args.charged).toEqual([{ id: "a", error: "annotate の JSON が壊れている" }]);
+    expect(isCollectDead(r)).toBe(false);
+  });
+
+  it("全件の応答が壊れていれば 1 件も着地せず collectDead になり、証人がいないので誰も課金しない", async () => {
+    const w = collectWorld([
+      openRow({ selection: { mode: "batch", lease_deadline: LEASE, ids: ["a", "b"] } }),
+    ]);
+    const r = await collectAnnotateBatches(w.client, {
+      enabled: true,
+      port: fakePort({ results: resultsOf([okBroken("a"), okBroken("b")]) }).port,
+    });
+    expect(r).toMatchObject({ attempted: 2, applied: 0, charged: 0, released: 2 });
+    expect(isCollectDead(r)).toBe(true);
+  });
+
+  it("DB の書き込みに失敗した記事も帰責の対象にする（要約は書かれない）", async () => {
+    const w = collectWorld(
+      [openRow({ selection: { mode: "batch", lease_deadline: LEASE, ids: ["a", "b"] } })],
+      { failArticle: "a" },
+    );
+    const r = await collectAnnotateBatches(w.client, {
+      enabled: true,
+      port: fakePort({ results: resultsOf([ok("a"), ok("b")]) }).port,
+    });
+    expect(r).toMatchObject({ attempted: 2, applied: 1, charged: 1 });
+    const settle = w.calls.find((c) => isRpc(c, "settle_summary_attempts")) as {
+      args: { charged: { id: string; error: string }[] };
+    };
+    expect(settle.args.charged).toEqual([{ id: "a", error: "update boom" }]);
+  });
+
+  it("回収待ちの一覧を読めなければ listError で返す", async () => {
+    const w = collectWorld([], { listError: true });
+    const r = await collectAnnotateBatches(w.client, { enabled: true, port: fakePort().port });
+    expect(r).toMatchObject({ skipped: false, listError: "list boom", open: 0 });
+  });
+
+  it("settle の失敗は settleError に残し、台帳の last_error にも書く", async () => {
+    const w = collectWorld(
+      [openRow({ selection: { mode: "batch", lease_deadline: LEASE, ids: ["a", "b"] } })],
+      { settle: { error: { message: "settle boom" } } },
+    );
+    const r = await collectAnnotateBatches(w.client, {
+      enabled: true,
+      port: fakePort({ results: resultsOf([ok("a"), errored("b", "invalid_request_error")]) }).port,
+    });
+    expect(r).toMatchObject({ settleError: "settle boom", returned: 1 });
+    const close = w.calls[w.calls.length - 1];
+    expect((argOf(close, "update") as [{ last_error: string }])[0].last_error).toBe("settle boom");
+  });
+
+  it("台帳を閉じられなかった回は回収済みに数えず、次 run の再回収で閉じる（2 回目の settle は 0 件反映でも障害にしない）", async () => {
+    const row = openRow({ selection: { mode: "batch", lease_deadline: LEASE, ids: ["a", "b"] } });
+    const items = [ok("a"), errored("b", "invalid_request_error")];
+
+    // 1 回目: 記事は書けたが、台帳の終端（llm_batches.update）に失敗した
+    const w1 = collectWorld([row], { ledgerUpdate: { error: { message: "close boom" } } });
+    const r1 = await collectAnnotateBatches(w1.client, {
+      enabled: true,
+      port: fakePort({ results: resultsOf(items) }).port,
+    });
+    expect(r1).toMatchObject({ applied: 1, returned: 0, settleError: null });
+
+    // 2 回目: 同じラウンドを読み直す。予約は 1 回目の settle で外れているので、所有者チェックで 0 件反映になる
+    const w2 = collectWorld([row], { settle: { data: { charged: 0, released: 0 } } });
+    const r2 = await collectAnnotateBatches(w2.client, {
+      enabled: true,
+      port: fakePort({ results: resultsOf(items) }).port,
+    });
+    expect(r2).toMatchObject({ applied: 1, returned: 1, settleError: null });
+    const settle = w2.calls.find((c) => isRpc(c, "settle_summary_attempts")) as {
+      args: { lease_deadline: string };
+    };
+    expect(settle.args.lease_deadline).toBe(LEASE);
   });
 });

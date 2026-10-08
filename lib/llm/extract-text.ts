@@ -17,6 +17,6 @@ export function htmlToInputText(html: string | null, maxChars = 2000): string {
     // slice は UTF-16 のコード単位で切るので、絵文字などのサロゲートペアが境界で割れると上位サロゲート
     // だけが残る。そのまま JSON に載せると Anthropic API が本文ごと 400（no low surrogate in string）で
     // 拒否し、Batches では 1 件の記事がバッチ全体の create を毎回落とす（YAT-79）。孤立したサロゲートは
-    // U+FFFD に置き換えて、送る文字列を常に well-formed にする。
+    // U+FFFD に置き換えて、返す文字列を well-formed にする（呼び出し側で切り直すなら、そこで同じ処理が要る）。
     .toWellFormed();
 }

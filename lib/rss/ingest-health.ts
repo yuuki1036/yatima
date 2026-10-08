@@ -224,10 +224,11 @@ export function isBatchStuck(
   return now - t > BATCH_STUCK_HOURS * HOUR_MS;
 }
 
-// 回収した結果を書こうとしたのに 1 件も書けない＝ Batches 版の annotateDead。CAP=120 では同期経路が
+// 回収した結果が 1 件も記事に着地しない＝ Batches 版の annotateDead。CAP=120 では同期経路が
 // 毎 run no_run_budget で見送るので annotateDead が評価されなくなる。その穴を埋める（プロンプトの
-// 退行で JSON が全部壊れる・DB 書き込みが全部落ちる、を deckStarved の 72h より先に拾う）。
-// 期限切れ・取消だけのバッチ（attempted=0）は書き込みを試みていないので発火しない。
+// 退行で JSON が全部壊れる・DB 書き込みが全部落ちる・バッチの結果が全件 errored、を deckStarved の
+// 72h より先に拾う）。attempted は succeeded ＋ errored ＋ 結果に無い id で、期限切れ・取消だけの
+// バッチ（attempted=0）は書き込みも帰責もしないので発火しない。
 export function isCollectDead(col: {
   skipped: boolean;
   attempted: number;
