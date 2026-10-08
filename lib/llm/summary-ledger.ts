@@ -61,8 +61,8 @@ async function settleAttempts(
 
 // ── 当日の消費 ─────────────────────────────────────────────────────────────
 
-// 台帳の行を同期と Batches に分けて数える。selection.mode === "batch" の行だけが Batches。
-// mode を持たない行（同期・YAT-79 以前の行）は同期として数える。status は問わない（投入基準）。
+// 台帳の行を同期と Batches に分けて数える。selection.mode === "batch" の行だけが Batches で、
+// それ以外（同期・YAT-79 以前の行）は同期。status は問わない（投入基準）。
 export function tallyUsage(
   rows: { request_count: number | null; selection: unknown }[],
 ): SummaryUsage {
@@ -510,8 +510,8 @@ export async function listOpenBatchRounds(
   }
 }
 
-// 回収を試みたが閉じられなかった（retrieve / results の失敗・selection 不正）。次 run で再試行する。
-// 書けなくても submitted のまま残って次 run で再試行されるので warn のみ。
+// 回収を試みたが閉じられなかった（retrieve / results の失敗・selection 不正）。
+// 書けなくても submitted のまま残り次 run で再試行されるので warn のみ。
 export async function markRoundUnresolved(
   supabase: SupabaseClient,
   ledgerId: string,
