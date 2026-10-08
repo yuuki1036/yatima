@@ -9,6 +9,9 @@ import {
   isEmbedSelectStalled,
   isSelectionDead,
   isQuarantineSurging,
+  isSubmitDead,
+  isBatchStuck,
+  isCollectDead,
   QUARANTINE_SURGE_LIMIT,
   DECK_STARVED_FLOOR,
   STALE_ALERT_HOURS,
@@ -308,5 +311,55 @@ describe("isQuarantineSurging", () => {
 
   it("カウント取得失敗（-1）は不活性", () => {
     expect(isQuarantineSurging({ quarantinedLast24h: -1 })).toBe(false);
+  });
+});
+
+describe("isSubmitDead（YAT-79）", () => {
+  it("予約して create を試みたのに batch_id が無ければ dead", () => {
+    expect(isSubmitDead({ skipped: false, reserved: 20, batchId: null })).toBe(true);
+  });
+  it("batch_id があれば dead ではない", () => {
+    expect(isSubmitDead({ skipped: false, reserved: 20, batchId: "msgbatch_1" })).toBe(false);
+  });
+  it("create を呼んでいない（reserved=0）・見送り（skipped）は dead ではない", () => {
+    expect(isSubmitDead({ skipped: false, reserved: 0, batchId: null })).toBe(false);
+    expect(isSubmitDead({ skipped: true, reserved: 0, batchId: null })).toBe(false);
+  });
+});
+
+describe("isBatchStuck（YAT-79）", () => {
+  const at = (h: number) => ({ oldestSubmittedAt: hoursAgo(h) });
+
+  it("未回収の最古が 36h ちょうどは stuck ではなく、超えたら stuck", () => {
+    expect(isBatchStuck(at(36), NOW)).toBe(false);
+    expect(isBatchStuck({ oldestSubmittedAt: new Date(NOW - 36 * HOUR_MS - 1).toISOString() }, NOW)).toBe(true);
+  });
+  it("cron 1 回分の遅れ（7.4h）では鳴らない", () => {
+    expect(isBatchStuck(at(7.4), NOW)).toBe(false);
+  });
+  it("読めなかった・未回収なし・時刻が読めないは不活性", () => {
+    expect(isBatchStuck(null, NOW)).toBe(false);
+    expect(isBatchStuck({ oldestSubmittedAt: null }, NOW)).toBe(false);
+    expect(isBatchStuck({ oldestSubmittedAt: "not-a-date" }, NOW)).toBe(false);
+  });
+});
+
+describe("isCollectDead（YAT-79）", () => {
+  it("書こうとした結果が 1 件も書けなければ dead", () => {
+    expect(isCollectDead({ skipped: false, attempted: 20, applied: 0 })).toBe(true);
+  });
+  it("1 件でも書ければ dead ではない", () => {
+    expect(isCollectDead({ skipped: false, attempted: 20, applied: 1 })).toBe(false);
+  });
+  it("回収対象が無い・期限切れだけ（attempted=0）・停止中は dead ではない", () => {
+    expect(isCollectDead({ skipped: false, attempted: 0, applied: 0 })).toBe(false);
+    expect(isCollectDead({ skipped: true, attempted: 0, applied: 0 })).toBe(false);
+  });
+});
+
+describe("isSelectionDead と Batches の見送り（YAT-79）", () => {
+  it("投入の見送り・同期の no_run_budget は skipped なので発火しない", () => {
+    // inflight_cap / batch_capped / batch_disabled / no_run_budget はどれも skipped=true で返る
+    expect(isSelectionDead({ skipped: true, pool: 5, selected: 0, poolError: null })).toBe(false);
   });
 });

@@ -1,5 +1,6 @@
 import type { IngestResult } from "./ingest";
 import type { EmbedSkipReason } from "./embed";
+import { BATCH_STUCK_HOURS } from "@/lib/llm/summarize-policy";
 
 // ingest の「継続失敗」検知（YAT-68）。
 //
@@ -192,4 +193,45 @@ export const QUARANTINE_SURGE_LIMIT = 5;
 
 export function isQuarantineSurging(c: { quarantinedLast24h: number }): boolean {
   return c.quarantinedLast24h > QUARANTINE_SURGE_LIMIT;
+}
+
+// ── 要約の Batches 経路の静かな死の検知（YAT-79）──────────────────────────────
+//
+// Batches は投入と着地が別の run になるので、同期の annotateDead（その run の全滅）だけでは
+// 「投入できていない」「回収できていない」「回収した結果が全部書けない」を拾えない。
+// 正常な抑制（batch_disabled / inflight_cap / batch_capped / collect_disabled 等）は skipped で外す。
+
+// 予約して create を試みたのに batch_id が無い＝投入の失敗（投入は fail-soft にしない・ADR-20260906205226）。
+export function isSubmitDead(sub: {
+  skipped: boolean;
+  reserved: number;
+  batchId: string | null;
+}): boolean {
+  return !sub.skipped && sub.reserved > 0 && sub.batchId === null;
+}
+
+// 未回収のバッチが 36h を超えて残っている＝回収が止まっている。run 数でなく経過時間で見る
+// （cron の実発火間隔は最大 7.4h とぶれるため・YAT-85）。予約も同じ 36h で切れるので、ここで赤くなる頃に
+// 同期経路が同じ記事を取り直し始める（二重課金 1 バッチ分）。読めなかった（null）・最古の時刻が
+// 読めない場合は判定不能として不活性（NaN を「超えた」側に倒さない。findStaleFeeds と同じ作法）。
+export function isBatchStuck(
+  backlog: { oldestSubmittedAt: string | null } | null,
+  now: number = Date.now(),
+): boolean {
+  if (!backlog || !backlog.oldestSubmittedAt) return false;
+  const t = Date.parse(backlog.oldestSubmittedAt);
+  if (!Number.isFinite(t)) return false;
+  return now - t > BATCH_STUCK_HOURS * HOUR_MS;
+}
+
+// 回収した結果を書こうとしたのに 1 件も書けない＝ Batches 版の annotateDead。CAP=120 では同期経路が
+// 毎 run no_run_budget で見送るので annotateDead が評価されなくなる。その穴を埋める（プロンプトの
+// 退行で JSON が全部壊れる・DB 書き込みが全部落ちる、を deckStarved の 72h より先に拾う）。
+// 期限切れ・取消だけのバッチ（attempted=0）は書き込みを試みていないので発火しない。
+export function isCollectDead(col: {
+  skipped: boolean;
+  attempted: number;
+  applied: number;
+}): boolean {
+  return !col.skipped && col.attempted > 0 && col.applied === 0;
 }
