@@ -1,20 +1,22 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Summarizer } from "./types";
-import { createHaikuSummarizer, MODEL } from "./haiku";
+import { createHaikuSummarizer } from "./haiku";
 import { htmlToInputText } from "./extract-text";
 import { enrichArticleBody, isThinBody } from "@/lib/rss/enrich";
-import {
-  splitSettle,
-  errorText,
-  type SettleFailure,
-  type SettleEntry,
-} from "./failure-attribution";
+import type { SettleFailure } from "./failure-attribution";
 import {
   DAILY_SUMMARIZE_CAP,
   PER_RUN_MAX,
-  SUMMARIZE_PER_FEED,
   SUMMARY_MAX_ATTEMPTS,
+  SYNC_LEASE_HOURS,
+  planSyncRun,
 } from "./summarize-policy";
+import {
+  applyAnnotation,
+  closeSummaryRound,
+  openSummaryRound,
+  readSummaryUsage,
+} from "./summary-ledger";
 
 // 取得→保存の後に呼ぶバッチ要約。ingestAllFeeds と同じく SupabaseClient を注入して使う。
 // summary IS NULL の記事を拾って要約し、articles.summary を埋める。
@@ -404,8 +406,11 @@ export async function annotateRows(
 // (2) 日次上限を articles.summarized_at から llm_batches の当日 request_count 合計へ（投入基準）
 // (3) 失敗の帰責を「同ラウンドの証人」で分け settle_summary_attempts で反映する。
 
-/** 正常な抑制で要約を見送った理由。**障害はここに入れない**（capUnavailable / *Error は別フィールド）。 */
-export type SummarizeSkipReason = "no_api_key" | "daily_capped";
+/**
+ * 正常な抑制で要約を見送った理由。**障害はここに入れない**（capUnavailable / *Error は別フィールド）。
+ * no_run_budget は Batches がこの run の枠を使い切った状態（YAT-79）。
+ */
+export type SummarizeSkipReason = "no_api_key" | "daily_capped" | "no_run_budget";
 
 type AnnotateBatchCounts = {
   /**
@@ -461,66 +466,10 @@ const EMPTY_ANNOTATE_COUNTS: AnnotateBatchCounts = {
   capUnavailable: false,
 };
 
-// 予約解除／帰責を settle_summary_attempts に投げる（fail-closed パスと本線で共用）。
-// 失敗しても 30h の lease 満了で自然復帰する。本線（[7]）は戻り値の settleError を呼び出し側へ
-// 返して exit 1 させる。fail-closed パス（台帳 insert 失敗 [3] / 対象取得失敗 [4]）は戻り値を
-// **捨てる**（settle の成否は見ない）——それらの経路は既に ledgerError / poolError で赤くなり、
-// 予約は lease 失効で解放されるため、ここでの失敗を二重に鳴らす必要がない。この関数自体は
-// warn を出さない（本線は settleError で可視化、fail-closed は上流の障害フラグで可視化される）。
-async function settleAttempts(
-  supabase: SupabaseClient,
-  charged: SettleEntry[],
-  released: SettleEntry[],
-  leaseDeadline: string,
-): Promise<{ ok: true; charged: number; released: number } | { ok: false; error: string }> {
-  if (charged.length + released.length === 0) {
-    return { ok: true, charged: 0, released: 0 };
-  }
-  try {
-    const { data, error } = await supabase.rpc("settle_summary_attempts", {
-      charged,
-      released,
-      lease_deadline: leaseDeadline,
-    });
-    if (error) throw error;
-    const settled = (data ?? { charged: 0, released: 0 }) as {
-      charged: number;
-      released: number;
-    };
-    return { ok: true, charged: settled.charged, released: settled.released };
-  } catch (e) {
-    return { ok: false, error: errorText(e) };
-  }
-}
-
-// 台帳行を終端する（fail-soft・warn のみ）。回収の成否は run を落とさない。
-async function collectLedger(
-  supabase: SupabaseClient,
-  id: string,
-  r: { succeeded: number; errored: number; applied: number; lastError: string | null },
-): Promise<void> {
-  try {
-    const now = new Date().toISOString();
-    const { error } = await supabase
-      .from("llm_batches")
-      .update({
-        status: "collected",
-        succeeded: r.succeeded,
-        errored: r.errored,
-        applied: r.applied,
-        ended_at: now,
-        collected_at: now,
-        last_error: r.lastError,
-      })
-      .eq("id", id);
-    if (error) throw error;
-  } catch (e) {
-    console.warn("要約台帳（llm_batches）の終端に失敗:", errorText(e));
-  }
-}
-
-// Phase3 → YAT-78: 取得→保存の後に呼ぶバッチ「アノテート」。要約とタグを同時生成して保存する。
-// summarizeMissing の上位互換（要約も埋める）。cron / refreshNow / resummarize から呼ぶ。
+// Phase3 → YAT-78 → YAT-79: 取得→保存の後に呼ぶバッチ「アノテート」。要約とタグを同時生成して保存する。
+// summarizeMissing の上位互換（要約も埋める）。cron（Batches に回した残り）/ refreshNow / resummarize から呼ぶ。
+// 台帳・予約・書き込みは summary-ledger.ts と共有し、ここは同期の LLM 呼び出しだけを持つ。
+// SUMMARIZE_BATCH_CAP=0 のロールバック先なので、戻り値と I/O の順は特性テストで固定している。
 export async function annotateMissing(
   supabase: SupabaseClient,
   opts: {
@@ -541,165 +490,83 @@ export async function annotateMissing(
   if (!summarizer) {
     return { ...EMPTY_ANNOTATE_COUNTS, skipped: true, skipReason: "no_api_key" };
   }
+  // [0'] この run の枠を Batches が使い切った（YAT-79）。台帳も読まない。claim を max_rows=0 で
+  // 呼ぶと「候補はあるのに予約 0 件」になって isSelectionDead が誤って鳴るので、その手前で見送る。
+  if (limit <= 0) {
+    return { ...EMPTY_ANNOTATE_COUNTS, skipped: true, skipReason: "no_run_budget" };
+  }
 
-  // [1] 日次の支出天井（YAT-74 → YAT-78）。判定を llm_batches の当日 request_count 合計に移す
-  // （投入基準）。起点は UTC 0 時（cron が UTC 基準なので、ローカル時刻で切ると日境界が run の
-  // 途中に来る）。台帳 read の失敗は「上限到達」ではなく障害。capUnavailable で返し、pool=-1 に
-  // することで isSelectionDead の pool>0 を偽にする（0 に潰すと「絞り込み 0 件」と誤検知する）。
-  const dayStart = new Date();
-  dayStart.setUTCHours(0, 0, 0, 0);
-  let dailyUsed = 0;
-  try {
-    const { data, error } = await supabase
-      .from("llm_batches")
-      .select("request_count")
-      .eq("purpose", "summarize")
-      .gte("submitted_at", dayStart.toISOString());
-    if (error) throw error;
-    dailyUsed = ((data ?? []) as { request_count: number | null }[]).reduce(
-      (n, r) => n + (r.request_count ?? 0),
-      0,
-    );
-  } catch (e) {
+  // [1] 日次の支出天井（YAT-74 → YAT-78）。llm_batches の当日 request_count 合計（投入基準）で判定する。
+  // 同じ run で Batches が先に投入していれば、その行も入った状態で読む（二重には引かない）。
+  // 台帳 read の失敗は「上限到達」ではなく障害。capUnavailable で返し、pool=-1 にすることで
+  // isSelectionDead の pool>0 を偽にする（0 に潰すと「絞り込み 0 件」と誤検知する）。
+  const usage = await readSummaryUsage(supabase);
+  if (!usage.ok) {
     console.warn(
       "日次要約数（llm_batches）の取得に失敗。上限が確認できないので要約を見送る:",
-      e,
+      usage.error,
     );
     return { ...EMPTY_ANNOTATE_COUNTS, skipped: false, pool: -1, capUnavailable: true };
   }
-  const remaining = Math.max(0, DAILY_SUMMARIZE_CAP - dailyUsed);
-  if (remaining === 0) {
-    return {
-      ...EMPTY_ANNOTATE_COUNTS,
-      skipped: true,
-      skipReason: "daily_capped",
-      dailyUsed,
-    };
-  }
-  const effectiveLimit = Math.min(limit, remaining);
-
-  // [2] claim（選抜と予約の原子実行・feed ラウンドロビン）。credibility はタイブレークで、
-  // 並べ替えは RPC 側が担う（JS の credibility リランクは廃止）。claim 失敗は poolError に残し、
-  // pool=-1 を返して isSelectionDead で赤くする（embed 側 selectError / isEmbedSelectStalled と同型）。
-  let pool = 0;
-  let poolCapped = false;
-  let ids: string[] = [];
-  let leaseDeadline: string;
-  try {
-    const { data, error } = await supabase.rpc("claim_summary_candidates", {
-      per_feed: SUMMARIZE_PER_FEED,
-      max_rows: effectiveLimit,
-    });
-    if (error) throw error;
-    const claim = (data ?? {}) as {
-      pool?: number;
-      pool_capped?: boolean;
-      ids?: string[];
-      lease_deadline?: string;
-    };
-    pool = claim.pool ?? 0;
-    poolCapped = claim.pool_capped === true;
-    ids = claim.ids ?? [];
-    leaseDeadline = claim.lease_deadline ?? "";
-  } catch (e) {
-    const msg = errorText(e);
-    console.warn("要約候補の claim に失敗:", msg);
-    return {
-      ...EMPTY_ANNOTATE_COUNTS,
-      skipped: false,
-      pool: -1,
-      poolError: msg,
-      dailyUsed,
-    };
-  }
-  if (ids.length === 0) {
-    // pool>0 ∧ selected=0 は選抜の全閉（isSelectionDead が拾う）。pool=0 は対象ゼロ＝正常。
-    return { ...EMPTY_ANNOTATE_COUNTS, skipped: false, pool, poolCapped, dailyUsed };
+  const dailyUsed = usage.usage.total;
+  const plan = planSyncRun(limit, dailyUsed);
+  if (!plan.run) {
+    return { ...EMPTY_ANNOTATE_COUNTS, skipped: true, skipReason: plan.reason, dailyUsed };
   }
 
-  // [3] 台帳 insert（**LLM を呼ぶ前・fail-closed の要**）。ここを LLM の後に置くと insert 失敗時に
-  // 「課金したのに request_count が残らない」→ 翌 run が同枠を使い日次上限が実質無効化される。
-  // insert が落ちたら LLM を 1 回も呼ばず、全 ids を released で解放して ledgerError で赤くする。
-  let ledgerId: string;
-  try {
-    const { data, error } = await supabase
-      .from("llm_batches")
-      .insert({
-        purpose: "summarize",
-        batch_id: null,
-        status: "claimed",
-        model: MODEL,
-        request_count: ids.length,
-        run_kind: runKind,
-        selection: {
-          pool,
-          pool_capped: poolCapped,
-          per_feed: SUMMARIZE_PER_FEED,
-          max_rows: effectiveLimit,
-          picked: ids.length,
-        },
-      })
-      .select("id")
-      .single();
-    if (error) throw error;
-    ledgerId = (data as { id: string }).id;
-  } catch (e) {
-    const msg = errorText(e);
-    console.error(
-      "要約台帳（llm_batches）の記録に失敗。LLM を呼ばず予約を解放して赤くする:",
-      msg,
-    );
-    const released: SettleEntry[] = ids.map((id) => ({
-      id,
-      error: "ledger_insert_failed",
-    }));
-    await settleAttempts(supabase, [], released, leaseDeadline);
-    return {
-      ...EMPTY_ANNOTATE_COUNTS,
-      skipped: false,
-      pool,
-      poolCapped,
-      selected: ids.length,
-      released: ids.length,
-      ledgerError: msg,
-      dailyUsed,
-    };
+  // [2] claim → 台帳 insert（LLM の前・fail-closed）→ 対象行の取得。失敗経路の予約解放・台帳の
+  // 終端は openSummaryRound が済ませている。claim 失敗は pool=-1 で isSelectionDead を赤くする。
+  const opened = await openSummaryRound(supabase, {
+    mode: "sync",
+    runKind,
+    maxRows: plan.maxRows,
+    leaseHours: SYNC_LEASE_HOURS,
+  });
+  switch (opened.kind) {
+    case "claim_failed":
+      return {
+        ...EMPTY_ANNOTATE_COUNTS,
+        skipped: false,
+        pool: -1,
+        poolError: opened.error,
+        dailyUsed,
+      };
+    case "empty":
+      // pool>0 ∧ selected=0 は選抜の全閉（isSelectionDead が拾う）。pool=0 は対象ゼロ＝正常。
+      return {
+        ...EMPTY_ANNOTATE_COUNTS,
+        skipped: false,
+        pool: opened.pool,
+        poolCapped: opened.poolCapped,
+        dailyUsed,
+      };
+    case "ledger_failed":
+      return {
+        ...EMPTY_ANNOTATE_COUNTS,
+        skipped: false,
+        pool: opened.pool,
+        poolCapped: opened.poolCapped,
+        selected: opened.selected,
+        released: opened.selected,
+        ledgerError: opened.error,
+        dailyUsed,
+      };
+    case "fetch_failed":
+      // 選抜は成功したが対象を読めない＝静かな死。poolError に載せて isSelectionDead で赤くする。
+      return {
+        ...EMPTY_ANNOTATE_COUNTS,
+        skipped: false,
+        pool: opened.pool,
+        poolCapped: opened.poolCapped,
+        selected: opened.selected,
+        released: opened.selected,
+        poolError: opened.error,
+        dailyUsed,
+      };
   }
 
-  // [4] 対象行の取得（ids <= effectiveLimit(<=20) なので .in() の URL 長は安全）。
-  let rows: Row[] = [];
-  try {
-    const { data, error } = await supabase
-      .from("articles")
-      .select("id, title, content_html")
-      .in("id", ids);
-    if (error) throw error;
-    rows = (data ?? []) as Row[];
-  } catch (e) {
-    const msg = errorText(e);
-    console.warn("要約対象の取得に失敗（予約を解放）:", msg);
-    const released: SettleEntry[] = ids.map((id) => ({ id, error: "fetch_failed" }));
-    await settleAttempts(supabase, [], released, leaseDeadline);
-    await collectLedger(supabase, ledgerId, {
-      succeeded: 0,
-      errored: 0,
-      applied: 0,
-      lastError: msg,
-    });
-    // 選抜は成功したが対象を読めない＝静かな死。poolError に載せて isSelectionDead で赤くする。
-    return {
-      ...EMPTY_ANNOTATE_COUNTS,
-      skipped: false,
-      pool,
-      poolCapped,
-      selected: ids.length,
-      released: ids.length,
-      poolError: msg,
-      dailyUsed,
-    };
-  }
-
-  // [5] LLM チャンクループ（concurrency ずつ Promise.allSettled）。
+  // [3] LLM チャンクループ（concurrency ずつ Promise.allSettled）。
+  const { round, rows } = opened;
   let succeeded = 0;
   const failures: SettleFailure[] = [];
   for (let i = 0; i < rows.length; i += concurrency) {
@@ -708,40 +575,12 @@ export async function annotateMissing(
       chunk.map(async (row) => {
         const text = htmlToInputText(row.content_html);
         if (!text && !row.title) throw new Error("本文・タイトルとも空");
-        const { summary, tags } = await summarizer.annotate({
+        const annotation = await summarizer.annotate({
           title: row.title,
           text,
         });
-        if (!summary) throw new Error("要約が空");
-        // タグ upsert（先）→ summary 更新（後）。要約が埋まった記事は必ずタグも持つ
-        // （途中失敗時は summary NULL のまま予約解放され、次 run 再収束）。
-        if (tags.length) {
-          const tagRows = tags.map((t) => ({
-            article_id: row.id,
-            tag_slug: t,
-            source: "llm",
-          }));
-          const { error: tagErr } = await supabase
-            .from("article_tags")
-            .upsert(tagRows, {
-              onConflict: "article_id,tag_slug",
-              ignoreDuplicates: true,
-            });
-          if (tagErr) throw tagErr;
-        }
-        // 成功記事の予約解除は summary と同じ 1 回の update で行う（settle には渡さない）。
-        // settle に回すと summary_reserved_until=null を書いた後の行に所有者チェックが効かず
-        // 0 件更新になる。summarized_at は着地の観測台帳（YAT-74）。
-        const { error: upErr } = await supabase
-          .from("articles")
-          .update({
-            summary,
-            summarized_at: new Date().toISOString(),
-            summary_reserved_until: null,
-            summary_batch_id: null,
-          })
-          .eq("id", row.id);
-        if (upErr) throw upErr;
+        if (!annotation.summary) throw new Error("要約が空");
+        await applyAnnotation(supabase, row.id, annotation);
       }),
     );
     results.forEach((r, idx) => {
@@ -754,51 +593,32 @@ export async function annotateMissing(
     });
   }
 
-  // [6] 帰責の分割（run 単位の証人ゲート・ADR-20260906205227）。1 件でも成功していれば
-  // witness=true で、chargeable な失敗だけ summary_attempts +1。全滅ラウンドは誰の責任にもしない。
-  const witness = succeeded > 0;
-  const { charged, released } = splitSettle(failures, witness);
-
-  // [7] settle RPC。失敗は settleError に残して呼び出し側が exit 1（settle が黙って落ちると
-  // 予約が残る＝別の静かな死）。反映件数が要求と違えば予約失効を warn。
-  let settleError: string | null = null;
-  const settled = await settleAttempts(supabase, charged, released, leaseDeadline);
-  if (!settled.ok) {
-    settleError = settled.error;
-    console.error("settle_summary_attempts に失敗（予約が残る）:", settleError);
-  } else if (
-    settled.charged !== charged.length ||
-    settled.released !== released.length
-  ) {
-    console.warn(
-      `settle の反映件数が要求と不一致（予約が失効し他 run に取られた可能性）: ` +
-        `要求 charged ${charged.length}/released ${released.length}、` +
-        `反映 charged ${settled.charged}/released ${settled.released}`,
-    );
-  }
-
-  // [8] 台帳 update（fail-soft・warn のみ）。
-  await collectLedger(supabase, ledgerId, {
-    succeeded,
-    errored: failures.length,
+  // [4] 証人ゲートで帰責 → settle → 台帳の終端。settle の失敗は呼び出し側が exit 1。
+  const closed = await closeSummaryRound(supabase, round, {
     applied: succeeded,
-    lastError: settleError,
+    failures,
+    ledger: {
+      succeeded,
+      errored: failures.length,
+      applied: succeeded,
+      lastError: null,
+    },
   });
 
   return {
     skipped: false,
-    pool,
-    poolCapped,
-    selected: ids.length,
+    pool: opened.pool,
+    poolCapped: opened.poolCapped,
+    selected: round.ids.length,
     succeeded,
     failed: failures.length,
-    charged: charged.length,
-    released: released.length,
+    charged: closed.charged,
+    released: closed.released,
     dailyUsed,
     dailyCap: DAILY_SUMMARIZE_CAP,
     poolError: null,
     ledgerError: null,
-    settleError,
+    settleError: closed.settleError,
     capUnavailable: false,
   };
 }

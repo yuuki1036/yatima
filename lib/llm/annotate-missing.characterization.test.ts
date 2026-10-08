@@ -111,7 +111,8 @@ describe("annotateMissing（特性テスト）", () => {
     });
     await run(w.client);
     const sel = w.calls[0];
-    expect(argOf(sel, "select")).toEqual(["request_count"]);
+    // YAT-79 で宣言した差分 (a): Batches の行を見分けるため selection も読む（合計の値は同じ）。
+    expect(argOf(sel, "select")).toEqual(["request_count, selection"]);
     expect(argOf(sel, "eq")).toEqual(["purpose", "summarize"]);
     const gte = argOf(sel, "gte") as [string, string];
     expect(gte[0]).toBe("submitted_at");
@@ -119,8 +120,26 @@ describe("annotateMissing（特性テスト）", () => {
     expect(w.calls[1]).toEqual({
       kind: "rpc",
       fn: "claim_summary_candidates",
-      args: { per_feed: 4, max_rows: 10 },
+      // YAT-79 で宣言した差分 (b): lease_hours を明示して渡す（0017 の既定 30 と同じ値）。
+      args: { per_feed: 4, max_rows: 10, lease_hours: 30 },
     });
+  });
+
+  it("Batches の行も当日合計に数える（同じ run で Batches が先に投入した分を二重に引かない）", async () => {
+    const w = world({
+      usage: { data: [{ request_count: 20, selection: { mode: "batch" } }, { request_count: 95 }] },
+      claim: { data: { pool: 0, pool_capped: false, ids: [], lease_deadline: LEASE } },
+    });
+    const r = await run(w.client);
+    expect(r.dailyUsed).toBe(115);
+    expect((w.calls[1] as { args: { max_rows: number } }).args.max_rows).toBe(5);
+  });
+
+  it("この run の枠が 0 なら台帳も読まずに no_run_budget で見送る（YAT-79）", async () => {
+    const w = world();
+    const r = await run(w.client, 0);
+    expect(r).toEqual({ ...BASE, skipped: true, skipReason: "no_run_budget" });
+    expect(w.calls).toEqual([]);
   });
 
   it("claim の失敗は poolError（pool=-1）", async () => {

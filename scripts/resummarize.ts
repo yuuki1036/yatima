@@ -71,8 +71,10 @@ async function main() {
         console.log(
           `日次上限（${r.dailyCap} 件）に達したので中断。残りは翌 UTC 日に再実行してください`,
         );
-      } else {
+      } else if (r.skipReason === "no_api_key") {
         console.warn("ANTHROPIC_API_KEY 未設定でスキップ");
+      } else {
+        console.warn(`要約を見送った（${r.skipReason}）`);
       }
       break;
     }
