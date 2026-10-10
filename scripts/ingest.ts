@@ -356,7 +356,7 @@ async function main() {
         : `  応答の JSON が壊れている（プロンプト・max_tokens の変更）か、DB 書き込みが落ちている可能性が高い`,
     );
   }
-  // 回収の後の未回収の最古（この run の collect を反映した状態）で判定する。
+  // この run の回収を反映した、未回収の最古で判定する。
   const backlog = await readBatchBacklog(supabase);
   if (!backlog.ok) console.warn("未回収の要約バッチ数を読めなかった:", backlog.error);
   const batchStuck = isBatchStuck(backlog.ok ? backlog : null);

@@ -32,7 +32,7 @@ const ANNOTATE_SYSTEM_PROMPT = [
 ].join("\n");
 
 // annotate のリクエスト（YAT-79）。同期の HaikuSummarizer.annotate と Batches 経路（annotate-batch.ts）が
-// 同じ params を送るよう 1 か所に置く。段階 9（YAT-80）の字数・max_tokens 変更もここ 1 か所で両方に効く。
+// 同じ params を送るよう 1 か所に置く（段階 9・YAT-80 の字数・max_tokens 変更も両方に効く）。
 export function buildAnnotateParams(
   input: SummarizeInput,
 ): Anthropic.MessageCreateParamsNonStreaming {
