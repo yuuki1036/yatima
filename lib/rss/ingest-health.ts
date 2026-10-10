@@ -228,11 +228,13 @@ export function isBatchStuck(
 // 毎 run no_run_budget で見送るので annotateDead が評価されなくなる。その穴を埋める（プロンプトの
 // 退行で JSON が全部壊れる・DB 書き込みが全部落ちる・バッチの結果が全件 errored、を deckStarved の
 // 72h より先に拾う）。attempted は succeeded ＋ errored ＋ 結果に無い id で、期限切れ・取消だけの
-// バッチ（attempted=0）は書き込みも帰責もしないので発火しない。
+// バッチ（attempted=0）は書き込みも帰責もしないので発火しない。要約済みで見送った結果（superseded）は
+// 別の経路で着地済みなので着地に数える（台帳を閉じ損ねた回の再回収が全件 superseded になっても鳴らさない）。
 export function isCollectDead(col: {
   skipped: boolean;
   attempted: number;
   applied: number;
+  superseded: number;
 }): boolean {
-  return !col.skipped && col.attempted > 0 && col.applied === 0;
+  return !col.skipped && col.attempted > 0 && col.applied + col.superseded === 0;
 }

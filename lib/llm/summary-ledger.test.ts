@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   buildClosePatch,
   buildSelection,
+  findSummarized,
+  listOpenBatchRounds,
   parseRoundSelection,
   readBatchBacklog,
   recordBatchCreate,
@@ -279,5 +281,81 @@ describe("readBatchBacklog", () => {
   it("読めなければ ok:false（batchStuck は判定不能として不活性）", async () => {
     const w = createRecorder(() => ({ error: { message: "boom" } }));
     expect(await readBatchBacklog(w.client)).toEqual({ ok: false, error: "boom" });
+  });
+});
+
+describe("listOpenBatchRounds", () => {
+  const chainOf = (c: unknown) =>
+    (c as { chain: { method: string; args: unknown[] }[] }).chain.map((s) => [s.method, ...s.args]);
+  const sel = { mode: "batch", lease_hours: 36, lease_deadline: "LD", ids: ["a", "b"] };
+
+  it("回収待ち（submitted / unresolved）の Batches 行を古い順に上限 24 本引く", async () => {
+    const w = createRecorder(() => ({
+      data: [{ id: "L1", batch_id: "msgbatch_1", submitted_at: "2026-10-08T01:00:00Z", selection: sel }],
+    }));
+    expect(await listOpenBatchRounds(w.client)).toEqual({
+      ok: true,
+      rounds: [
+        {
+          round: { ledgerId: "L1", ids: ["a", "b"], leaseDeadline: "LD" },
+          batchId: "msgbatch_1",
+          submittedAt: "2026-10-08T01:00:00Z",
+        },
+      ],
+      malformed: [],
+    });
+    // unresolved を外すと、一過性の失敗を 1 回踏んだラウンドが二度と回収されない（課金済みの結果を捨て、
+    // 36h 後に同じ記事を取り直して二重課金になる）
+    expect(chainOf(w.calls[0])).toEqual([
+      ["select", "id, batch_id, submitted_at, selection"],
+      ["eq", "purpose", "summarize"],
+      ["is", "collected_at", null],
+      ["in", "status", ["submitted", "unresolved"]],
+      ["order", "submitted_at", { ascending: true }],
+      ["limit", 24],
+    ]);
+  });
+
+  it("batch_id が無い行・selection が読めない行は malformed に分ける", async () => {
+    const w = createRecorder(() => ({
+      data: [
+        { id: "L1", batch_id: null, submitted_at: "x", selection: sel },
+        { id: "L2", batch_id: "msgbatch_2", submitted_at: "x", selection: { pool: 1 } },
+      ],
+    }));
+    expect(await listOpenBatchRounds(w.client)).toEqual({
+      ok: true,
+      rounds: [],
+      malformed: [
+        { ledgerId: "L1", error: "batch_id が無い" },
+        { ledgerId: "L2", error: "Batches の行ではない" },
+      ],
+    });
+  });
+
+  it("読めなければ ok:false", async () => {
+    const w = createRecorder(() => ({ error: { message: "boom" } }));
+    expect(await listOpenBatchRounds(w.client)).toEqual({ ok: false, error: "boom" });
+  });
+});
+
+describe("findSummarized", () => {
+  it("要約が埋まっている記事 id だけを返す", async () => {
+    const w = createRecorder(() => ({ data: [{ id: "a" }] }));
+    const r = await findSummarized(w.client, ["a", "b"]);
+    expect(r).toEqual({ ok: true, ids: new Set(["a"]) });
+    expect(argOf(w.calls[0], "in")).toEqual(["id", ["a", "b"]]);
+    expect(argOf(w.calls[0], "not")).toEqual(["summary", "is", null]);
+  });
+
+  it("対象が無ければ DB を引かない", async () => {
+    const w = createRecorder(() => ({}));
+    expect(await findSummarized(w.client, [])).toEqual({ ok: true, ids: new Set() });
+    expect(w.calls).toEqual([]);
+  });
+
+  it("読めなければ ok:false", async () => {
+    const w = createRecorder(() => ({ error: { message: "boom" } }));
+    expect(await findSummarized(w.client, ["a"])).toEqual({ ok: false, error: "boom" });
   });
 });

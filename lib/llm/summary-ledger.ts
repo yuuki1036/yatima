@@ -278,6 +278,28 @@ export async function applyAnnotation(
   if (upErr) throw upErr;
 }
 
+// 要約が既に埋まっている記事（Batches の回収が書く前に除く）。予約（36h）が切れた後の回収では、
+// 同じ記事を取り直した別のラウンドが先に書いていることがある。上書きすると要約が入れ替わり、
+// タグは upsert が既存を消さないので和集合になって coerceTags の上限 3 件を超える。
+// cron の run は concurrency で直列なので、書く直前の 1 回の読み取りで足りる。
+export async function findSummarized(
+  supabase: SupabaseClient,
+  ids: string[],
+): Promise<{ ok: true; ids: Set<string> } | { ok: false; error: string }> {
+  if (ids.length === 0) return { ok: true, ids: new Set() };
+  try {
+    const { data, error } = await supabase
+      .from("articles")
+      .select("id")
+      .in("id", ids)
+      .not("summary", "is", null);
+    if (error) throw error;
+    return { ok: true, ids: new Set(((data ?? []) as { id: string }[]).map((r) => r.id)) };
+  } catch (e) {
+    return { ok: false, error: errorText(e) };
+  }
+}
+
 // ── ラウンドを閉じる ─────────────────────────────────────────────────────────
 
 export type LedgerTally = {

@@ -74,7 +74,9 @@ async function main() {
         (col.archived ? `（archived ${col.archived}）` : "") +
         ` / 処理中 ${col.pending} / 未解決 ${col.unresolved}` +
         (col.deferred ? ` / 持ち越し ${col.deferred}` : "") +
-        `・書込 ${col.applied}（成功 ${col.succeeded} / 失敗 ${col.errored} / 期限切れ ${col.expired} / 取消 ${col.canceled}）` +
+        `・書込 ${col.applied}` +
+        (col.superseded ? ` / 要約済みで見送り ${col.superseded}` : "") +
+        `（成功 ${col.succeeded} / 失敗 ${col.errored} / 期限切れ ${col.expired} / 取消 ${col.canceled}）` +
         `・課金 ${col.charged} / 解放 ${col.released}・tokens in ${col.inputTokens} / out ${col.outputTokens}`,
     );
   }

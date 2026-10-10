@@ -346,14 +346,17 @@ describe("isBatchStuck（YAT-79）", () => {
 
 describe("isCollectDead（YAT-79）", () => {
   it("書こうとした結果が 1 件も書けなければ dead", () => {
-    expect(isCollectDead({ skipped: false, attempted: 20, applied: 0 })).toBe(true);
+    expect(isCollectDead({ skipped: false, attempted: 20, applied: 0, superseded: 0 })).toBe(true);
   });
   it("1 件でも書ければ dead ではない", () => {
-    expect(isCollectDead({ skipped: false, attempted: 20, applied: 1 })).toBe(false);
+    expect(isCollectDead({ skipped: false, attempted: 20, applied: 1, superseded: 0 })).toBe(false);
+  });
+  it("要約済みで見送った結果は着地に数える（再回収が全件 superseded でも dead ではない）", () => {
+    expect(isCollectDead({ skipped: false, attempted: 2, applied: 0, superseded: 1 })).toBe(false);
   });
   it("回収対象が無い・期限切れだけ（attempted=0）・停止中は dead ではない", () => {
-    expect(isCollectDead({ skipped: false, attempted: 0, applied: 0 })).toBe(false);
-    expect(isCollectDead({ skipped: true, attempted: 0, applied: 0 })).toBe(false);
+    expect(isCollectDead({ skipped: false, attempted: 0, applied: 0, superseded: 0 })).toBe(false);
+    expect(isCollectDead({ skipped: true, attempted: 0, applied: 0, superseded: 0 })).toBe(false);
   });
 });
 

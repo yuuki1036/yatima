@@ -11,6 +11,7 @@ import {
 import {
   applyAnnotation,
   closeSummaryRound,
+  findSummarized,
   listOpenBatchRounds,
   markRoundUnresolved,
   openSummaryRound,
@@ -363,6 +364,8 @@ type CollectCounts = {
   canceled: number;
   /** 記事に書けた件数。 */
   applied: number;
+  /** 成功したが、要約が既に埋まっていたので書かずに予約だけ外した件数（attempted に含む）。 */
+  superseded: number;
   charged: number;
   released: number;
   inputTokens: number;
@@ -388,6 +391,7 @@ const EMPTY_COLLECT: CollectCounts = {
   expired: 0,
   canceled: 0,
   applied: 0,
+  superseded: 0,
   charged: 0,
   released: 0,
   inputTokens: 0,
@@ -499,11 +503,26 @@ export async function collectAnnotateBatches(
       );
     }
 
-    // タグ → 要約の順で書く（applyAnnotation）。同じ結果を 2 回書いても同じ状態になるので、
-    // 台帳を閉じる前に落ちても次 run の再回収で収束する（settle は所有者チェックで 2 回目は 0 件）。
+    // 要約が既に埋まった記事は書かずに予約だけ外す（findSummarized）。予約切れの後に別ラウンドが書いた
+    // 記事と、前の run で書いたが台帳を閉じ損ねた記事がここで外れる。確かめられなければ 1 件も書かずに
+    // unresolved にして次 run で読み直す。
+    const done = await findSummarized(supabase, cls.succeeded.map((s) => s.id));
+    if (!done.ok) {
+      console.warn(`要約済みの確認に失敗 [${batchId}]:`, done.error);
+      await markRoundUnresolved(supabase, round.ledgerId, `summarized: ${done.error}`);
+      c.unresolved += 1;
+      continue;
+    }
+    const superseded: SettleEntry[] = cls.succeeded
+      .filter((s) => done.ids.has(s.id))
+      .map((s) => ({ id: s.id, error: "already_summarized" }));
+
+    // タグ → 要約の順で書く（applyAnnotation）。台帳を閉じる前に落ちても、次 run の再回収では
+    // 書けた記事が superseded に回るだけで収束する（settle は所有者チェックで 2 回目は 0 件）。
     let applied = 0;
     const writeFailures: SettleFailure[] = [];
     for (const s of cls.succeeded) {
+      if (done.ids.has(s.id)) continue;
       try {
         await applyAnnotation(supabase, s.id, interpretAnnotateMessage(s.message));
         applied += 1;
@@ -516,12 +535,12 @@ export async function collectAnnotateBatches(
     const closed = await closeSummaryRound(supabase, round, {
       applied,
       failures: [...cls.failures, ...writeFailures],
-      releases: cls.releases,
+      releases: [...cls.releases, ...superseded],
       ledger: {
         succeeded: cls.counts.succeeded,
         errored: cls.counts.errored,
         applied,
-        lastError: null,
+        lastError: superseded.length ? `already_summarized: ${superseded.length}` : null,
         expired: cls.counts.expired,
         canceled: cls.counts.canceled,
         inputTokens: cls.tokens.input,
@@ -536,6 +555,7 @@ export async function collectAnnotateBatches(
     c.expired += cls.counts.expired;
     c.canceled += cls.counts.canceled;
     c.applied += applied;
+    c.superseded += superseded.length;
     c.charged += closed.charged;
     c.released += closed.released;
     c.inputTokens += cls.tokens.input;
