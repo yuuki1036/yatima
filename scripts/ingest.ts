@@ -346,14 +346,17 @@ async function main() {
   const collectDead = isCollectDead(col);
   if (collectDead) {
     console.error(
-      `\n⚠ 回収した要約バッチの結果が ${col.attempted} 件あるのに、記事に 1 件も書けなかった（着地 0）`,
+      `\n⚠ 回収した要約バッチの結果が ${col.attempted + col.expired + col.canceled} 件あるのに、記事に 1 件も書けなかった（着地 0）`,
     );
+    // 原因ごとに案内を分ける。期限切れ・取消だけなら Batches 側が 24h 以内に処理しなかった（非課金）。
     // 全件がバッチ側の errored なら API 側の全滅（クレジット・レート制限・過負荷）で、記事への書き込みには
-    // 届いていない。それ以外は応答は返っているのに書けていない。原因が違うので案内を分ける。
+    // 届いていない。それ以外は応答は返っているのに書けていない。
     console.error(
-      col.errored === col.attempted
-        ? `  全件がバッチの errored で返った。API キー・クレジット残高・レート制限を確認（2026-08 のクレジット枯渇と同じ型）`
-        : `  応答の JSON が壊れている（プロンプト・max_tokens の変更）か、DB 書き込みが落ちている可能性が高い`,
+      col.attempted === 0
+        ? `  全件が期限切れ・取消で返った（Batches 側の処理遅延）。続くなら SUMMARIZE_BATCH_CAP=0 で同期に戻す`
+        : col.errored === col.attempted
+          ? `  全件がバッチの errored で返った。API キー・クレジット残高・レート制限を確認（2026-08 のクレジット枯渇と同じ型）`
+          : `  応答の JSON が壊れている（プロンプト・max_tokens の変更）か、DB 書き込みが落ちている可能性が高い`,
     );
   }
   // この run の回収を反映した、未回収の最古で判定する。

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type Anthropic from "@anthropic-ai/sdk";
 import {
   buildBatchRequests,
@@ -360,7 +360,7 @@ describe("collectAnnotateBatches", () => {
 
   it("終わったバッチ: 成功はタグ→要約で書き、証人ゲートで帰責し、トークン数を台帳に書いて閉じる", async () => {
     const w = collectWorld();
-    const { port } = fakePort({
+    const { port, log } = fakePort({
       retrieve: async () =>
         batchOf({ request_counts: { processing: 0, succeeded: 1, errored: 2, canceled: 0, expired: 1 } }),
       results: resultsOf([
@@ -371,6 +371,11 @@ describe("collectAnnotateBatches", () => {
       ]),
     });
     const r = await collectAnnotateBatches(w.client, { enabled: true, port });
+    // 台帳の id（L1）ではなく batch_id（msgbatch_1）で引く
+    expect(log).toEqual([
+      { op: "retrieve", args: ["msgbatch_1"] },
+      { op: "results", args: ["msgbatch_1", { signal: expect.any(AbortSignal) }] },
+    ]);
     expect(r).toMatchObject({
       skipped: false,
       open: 1,
@@ -521,11 +526,56 @@ describe("collectAnnotateBatches", () => {
   });
 
   it("結果の取得には残り時間で切れる signal を渡す（本文の読み出しは SDK の timeout が効かないため）", async () => {
-    const w = collectWorld();
-    const { port, log } = fakePort({ results: resultsOf([]) });
-    await collectAnnotateBatches(w.client, { enabled: true, port });
-    const results = log.find((l) => l.op === "results")!;
-    expect((results.args[1] as { signal: unknown }).signal).toBeInstanceOf(AbortSignal);
+    const timeout = vi.spyOn(AbortSignal, "timeout");
+    try {
+      // 予算 100s のうち retrieve で 40s 使った → 残り 60s で切る
+      let t = 0;
+      const port = fakePort({
+        retrieve: async () => {
+          t += 40_000;
+          return batchOf();
+        },
+        results: resultsOf([]),
+      }).port;
+      await collectAnnotateBatches(collectWorld().client, {
+        enabled: true,
+        port,
+        budgetMs: 100_000,
+        now: () => t,
+      });
+      expect(timeout).toHaveBeenLastCalledWith(60_000);
+
+      // 残りが 1 秒を切っていても 1 秒は待つ（0 や負数で即中断しない）
+      t = 0;
+      const port2 = fakePort({
+        retrieve: async () => {
+          t += 99_500;
+          return batchOf();
+        },
+        results: resultsOf([]),
+      }).port;
+      await collectAnnotateBatches(collectWorld().client, {
+        enabled: true,
+        port: port2,
+        budgetMs: 100_000,
+        now: () => t,
+      });
+      expect(timeout).toHaveBeenLastCalledWith(1_000);
+    } finally {
+      timeout.mockRestore();
+    }
+  });
+
+  it("全件が期限切れで返ったラウンドは書き込みも帰責もしないが collectDead になる", async () => {
+    const w = collectWorld([
+      openRow({ selection: { mode: "batch", lease_deadline: LEASE, ids: ["a", "b"] } }),
+    ]);
+    const r = await collectAnnotateBatches(w.client, {
+      enabled: true,
+      port: fakePort({ results: resultsOf([expired("a"), expired("b")]) }).port,
+    });
+    expect(r).toMatchObject({ attempted: 0, expired: 2, applied: 0, charged: 0, released: 2, returned: 1 });
+    expect(isCollectDead(r)).toBe(true);
   });
 
   it("応答が壊れて書けなかった記事は、証人がいれば課金して数える", async () => {

@@ -227,14 +227,18 @@ export function isBatchStuck(
 // 回収した結果が 1 件も記事に着地しない＝ Batches 版の annotateDead。CAP=120 では同期経路が
 // 毎 run no_run_budget で見送るので annotateDead が評価されなくなる。その穴を埋める（プロンプトの
 // 退行で JSON が全部壊れる・DB 書き込みが全部落ちる・バッチの結果が全件 errored、を deckStarved の
-// 72h より先に拾う）。attempted は succeeded ＋ errored ＋ 結果に無い id で、期限切れ・取消だけの
-// バッチ（attempted=0）は書き込みも帰責もしないので発火しない。要約済みで見送った結果（superseded）は
-// 別の経路で着地済みなので着地に数える（台帳を閉じ損ねた回の再回収が全件 superseded になっても鳴らさない）。
+// 72h より先に拾う）。期限切れ・取消（expired / canceled）も母数に入れる: 書き込みも帰責もしないが、
+// Batches 側の処理遅延が続くと全件期限切れのラウンドが閉じ続け（batchStuck にも乗らない）、解放した
+// 記事を取り直してはまた期限切れになる。要約済みで見送った結果（superseded）は別の経路で着地済みなので
+// 着地に数える（台帳を閉じ損ねた回の再回収が全件 superseded になっても鳴らさない）。
 export function isCollectDead(col: {
   skipped: boolean;
   attempted: number;
+  expired: number;
+  canceled: number;
   applied: number;
   superseded: number;
 }): boolean {
-  return !col.skipped && col.attempted > 0 && col.applied + col.superseded === 0;
+  const returned = col.attempted + col.expired + col.canceled;
+  return !col.skipped && returned > 0 && col.applied + col.superseded === 0;
 }

@@ -345,18 +345,33 @@ describe("isBatchStuck（YAT-79）", () => {
 });
 
 describe("isCollectDead（YAT-79）", () => {
+  const col = (o: Partial<Parameters<typeof isCollectDead>[0]>) =>
+    isCollectDead({
+      skipped: false,
+      attempted: 0,
+      expired: 0,
+      canceled: 0,
+      applied: 0,
+      superseded: 0,
+      ...o,
+    });
+
   it("書こうとした結果が 1 件も書けなければ dead", () => {
-    expect(isCollectDead({ skipped: false, attempted: 20, applied: 0, superseded: 0 })).toBe(true);
+    expect(col({ attempted: 20 })).toBe(true);
   });
   it("1 件でも書ければ dead ではない", () => {
-    expect(isCollectDead({ skipped: false, attempted: 20, applied: 1, superseded: 0 })).toBe(false);
+    expect(col({ attempted: 20, applied: 1 })).toBe(false);
   });
   it("要約済みで見送った結果は着地に数える（再回収が全件 superseded でも dead ではない）", () => {
-    expect(isCollectDead({ skipped: false, attempted: 2, applied: 0, superseded: 1 })).toBe(false);
+    expect(col({ attempted: 2, superseded: 1 })).toBe(false);
   });
-  it("回収対象が無い・期限切れだけ（attempted=0）・停止中は dead ではない", () => {
-    expect(isCollectDead({ skipped: false, attempted: 0, applied: 0, superseded: 0 })).toBe(false);
-    expect(isCollectDead({ skipped: true, attempted: 0, applied: 0, superseded: 0 })).toBe(false);
+  it("全件が期限切れ・取消で返ったラウンドも dead（Batches 側の処理遅延が続くとどのガードにも掛からないため）", () => {
+    expect(col({ expired: 20 })).toBe(true);
+    expect(col({ canceled: 3 })).toBe(true);
+  });
+  it("回収対象が無い・停止中は dead ではない", () => {
+    expect(col({})).toBe(false);
+    expect(col({ skipped: true, expired: 20 })).toBe(false);
   });
 });
 

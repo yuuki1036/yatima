@@ -354,8 +354,8 @@ type CollectCounts = {
   /** 時間予算を超えて次 run に回したラウンド数。 */
   deferred: number;
   /**
-   * 書き込みか帰責の対象になった件数（succeeded ＋ errored ＋ 結果に無い id）。collectDead が読む。
-   * expired / canceled は含めない（予約を外すだけで、書き込みも帰責もしない）。
+   * 書き込みか帰責の対象になった件数（succeeded ＋ errored ＋ 結果に無い id）。
+   * expired / canceled は含めない（予約を外すだけで、書き込みも帰責もしない。collectDead は別に足して読む）。
    */
   attempted: number;
   succeeded: number;
