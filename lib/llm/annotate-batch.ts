@@ -82,7 +82,7 @@ export function buildBatchRequests(rows: RoundRow[]): {
   return { requests, unsendable };
 }
 
-// archived（結果が消えた）を先に見る。results() を呼ぶと throw するので、呼ぶ前に分ける。
+// archived（結果が消えた）は results() が throw するので、呼ぶ前に分ける。
 export function decideCollectAction(
   b: Pick<MessageBatch, "processing_status" | "archived_at">,
 ): "pending" | "archived" | "drain" {
@@ -251,7 +251,7 @@ export async function submitAnnotateBatch(
   const plan = planBatchSubmit({ cap: opts.cap, usage: usage.usage, inflight: backlog.open });
   if (!plan.submit) return { ...known, skipped: true, skipReason: plan.reason };
 
-  // [3] claim → 台帳 insert（create の前・fail-closed）→ 対象行の取得。予約は 36h。
+  // [3] claim → 台帳 insert（create の前・fail-closed）→ 対象行の取得。
   const opened = await openSummaryRound(supabase, {
     mode: "batch",
     runKind: opts.runKind ?? "cron",

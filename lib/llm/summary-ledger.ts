@@ -31,8 +31,7 @@ export type LedgerMode = "sync" | "batch";
 export type SummaryRound = { ledgerId: string; ids: string[]; leaseDeadline: string };
 
 // settle_summary_attempts に予約解除／帰責を投げる。失敗しても lease 満了で自然復帰する。
-// この関数自体は warn を出さない（本線は closeSummaryRound が settleError で可視化し、open の
-// 失敗経路は上流の障害フラグで可視化されるので、ここで二重に鳴らさない）。
+// warn は出さない（失敗の可視化は呼び出し側が持つ。ここで鳴らすと二重になる）。
 async function settleAttempts(
   supabase: SupabaseClient,
   charged: SettleEntry[],
