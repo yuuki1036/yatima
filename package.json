@@ -39,7 +39,7 @@
     "@supabase/ssr": "^0.10.3",
     "@supabase/supabase-js": "^2.107.0",
     "jose": "^6.2.3",
-    "next": "16.2.7",
+    "next": "16.4.1",
     "pg": "^8.22.0",
     "react": "19.2.4",
     "react-dom": "19.2.4",
