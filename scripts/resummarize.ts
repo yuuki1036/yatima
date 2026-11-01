@@ -5,6 +5,7 @@ config({ path: ".env.local" });
 
 import { createAdminClient } from "../lib/supabase/admin";
 import { annotateMissing } from "../lib/llm/summarize-batch";
+import { readBatchBacklog } from "../lib/llm/summary-ledger";
 
 // 既存記事の要約を作り直す「一回限り」のメンテスクリプト。
 // プロンプト変更（要約 1〜2文→3〜4文 + タグ付与）を既存記事に反映するために使う。
@@ -97,7 +98,19 @@ async function main() {
       break;
     }
     if (r.selected === 0) {
-      console.log("全件完了");
+      // Batches の回収待ち（36h 予約）の記事は claim から外れるので、summary NULL のまま 0 件になる。
+      // それらは後の cron の回収が投入時のプロンプトで書くので、完了と言い切らずに知らせる（YAT-79）。
+      const backlog = await readBatchBacklog(supabase);
+      if (!backlog.ok) {
+        console.warn(`全件完了（Batches の回収待ちを確認できなかった: ${backlog.error}）`);
+      } else if (backlog.open > 0) {
+        console.warn(
+          `同期で取れる記事は完了。ただし Batches の回収待ちが ${backlog.open} 本あり、その記事は投入時のプロンプトで書かれる。` +
+            `新プロンプトで揃えるなら SUMMARIZE_BATCH_CAP=0 にして回収が済んでから再実行する`,
+        );
+      } else {
+        console.log("全件完了");
+      }
       break;
     }
     totalOk += r.succeeded;
