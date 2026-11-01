@@ -42,6 +42,12 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
+          # 要約を Message Batches に回す日次件数（YAT-79・DAILY_SUMMARIZE_CAP=120 の内数）。
+          # Settings > Secrets and variables > Actions の Variables に置く（secrets ではない）。
+          # 未設定・空・不正値は 0 ＝ 全件同期（公式のロールバック手順）。20 → 60 → 120 と上げる。
+          SUMMARIZE_BATCH_CAP: ${{ vars.SUMMARIZE_BATCH_CAP }}
+          # "0" で Batches の回収だけ止める（運用実験・障害対応）。未設定なら回収する。
+          SUMMARIZE_BATCH_COLLECT: ${{ vars.SUMMARIZE_BATCH_COLLECT }}
 
       # 失敗を Issue に昇格させる（YAT-74）。検知が動いていても通知が無いと放置される
       # ——実際 2026-08-26〜09-06 の 11 日間、全 run が赤のまま誰も見なかった。

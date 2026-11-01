@@ -16,6 +16,8 @@ import {
   isEmbedSelectStalled,
   isSelectionDead,
   isQuarantineSurging,
+  evaluateBatchGuards,
+  anyBatchGuard,
   DECK_STARVED_FLOOR,
   STALE_ALERT_HOURS,
 } from "../lib/rss/ingest-health";
@@ -24,6 +26,15 @@ import {
   annotateMissing,
   summaryQuarantineCounts,
 } from "../lib/llm/summarize-batch";
+import { collectAnnotateBatches, submitAnnotateBatch } from "../lib/llm/annotate-batch";
+import { readBatchBacklog, resolveStaleLedger } from "../lib/llm/summary-ledger";
+import {
+  BATCH_LEASE_HOURS,
+  BATCH_STUCK_HOURS,
+  MAX_INFLIGHT_BATCHES,
+  parseBatchEnv,
+  syncLimitAfterSubmit,
+} from "../lib/llm/summarize-policy";
 import {
   embedHealthCounts,
   embedMissing,
@@ -40,6 +51,50 @@ const EMBED_PRUNE_BACKLOG_LIMIT = 1000;
 
 async function main() {
   const supabase = createAdminClient();
+
+  // 要約の Batches（YAT-79）。SUMMARIZE_BATCH_CAP は日次 120 件のうち Batches に回す件数で、
+  // 未設定・不正値は 0（全件同期＝ロールバック）。SUMMARIZE_BATCH_COLLECT=0 で回収だけ止める。
+  // SUMMARIZE_BATCH_* を読むのはここだけ（解釈は summarize-policy.ts の純関数 parseBatchEnv）。
+  const batchEnv = parseBatchEnv(process.env);
+  if (batchEnv.capInvalid) {
+    console.warn(
+      `SUMMARIZE_BATCH_CAP="${batchEnv.capRaw}" は数として読めないので 0（全件同期）として扱う`,
+    );
+  }
+
+  // 前 run までのバッチを回収する。取得・キュレーションより先に置くと、同じ run のデッキ補充に乗る。
+  const col = await collectAnnotateBatches(supabase, { enabled: batchEnv.collectEnabled });
+  if (col.skipped && col.skipReason === "collect_disabled") {
+    console.warn(
+      `⚠ 要約バッチの回収を停止中（SUMMARIZE_BATCH_COLLECT=0）。未回収が ${BATCH_STUCK_HOURS}h を超えると batchStuck で赤くなる`,
+    );
+  } else if (!col.skipped && col.open > 0) {
+    console.log(
+      `要約回収（Batches）: 未回収 ${col.open} 本 → 終端 ${col.returned}` +
+        (col.archived ? `（archived ${col.archived}）` : "") +
+        ` / 処理中 ${col.pending} / 未解決 ${col.unresolved}` +
+        (col.deferred ? ` / 持ち越し ${col.deferred}` : "") +
+        `・書込 ${col.applied}` +
+        (col.superseded ? ` / 見送り（要約済み・他ラウンドの予約中）${col.superseded}` : "") +
+        `（成功 ${col.succeeded} / 失敗 ${col.errored} / 期限切れ ${col.expired} / 取消 ${col.canceled}）` +
+        `・課金 ${col.charged} / 解放 ${col.released}・tokens in ${col.inputTokens} / out ${col.outputTokens}`,
+    );
+  }
+
+  // claimed のまま 36h を超えた台帳行（create の手前で落ちた run・batch_id の記録に失敗した孤児）を終端する。
+  const staleLedger = await resolveStaleLedger(supabase);
+  if (staleLedger.error) {
+    console.warn("要約台帳の掃除に失敗:", staleLedger.error);
+  }
+  for (const r of staleLedger.resolved) {
+    console.warn(
+      `要約台帳の掃除: ${r.ledgerId} を expired_unknown に（claimed のまま 36h 超）` +
+        (r.isBatch
+          ? "。Batches の孤児の可能性があるので、Console の Batches 一覧で作成時刻付近と突き合わせる"
+          : ""),
+    );
+  }
+
   const results = await ingestAllFeeds(supabase);
 
   let total = 0;
@@ -63,11 +118,36 @@ async function main() {
     `本文補完: 取得 ${en.enriched} / 失敗 ${en.failed}（対象 ${en.thin} 件）`,
   );
 
-  // 取得後にバッチ要約+タグ付け（summary IS NULL を埋める）。個々の失敗は fail-soft で流し、
-  // 全滅・選抜死・帰責失敗・隔離暴走を末尾でまとめて赤くする（YAT-73 / YAT-78。判定は下の
-  // 「失敗の可視化」節）。選抜は feed ラウンドロビン（claim RPC）、日次上限は llm_batches の
-  // 当日 request_count 合計（投入基準・YAT-78）。
-  const s = await annotateMissing(supabase, { runKind: "cron" });
+  // 取得後に要約+タグ付け（summary IS NULL を埋める）。日次枠のうち SUMMARIZE_BATCH_CAP 分を
+  // Batches に投入し（YAT-79）、この run の残り枠を同期で処理する（1 run の合計は 20 件のまま）。
+  // 個々の失敗は fail-soft で流し、全滅・選抜死・投入死・帰責失敗・隔離暴走を末尾でまとめて赤くする
+  // （YAT-73 / YAT-78 / YAT-79。判定は下の「失敗の可視化」節）。選抜は feed ラウンドロビン（claim RPC）、
+  // 日次上限は llm_batches の当日 request_count 合計（投入基準・YAT-78）。
+  const sub = await submitAnnotateBatch(supabase, { cap: batchEnv.cap });
+  if (sub.skipped) {
+    console.log(
+      sub.skipReason === "batch_disabled"
+        ? `要約投入（Batches）: 無効（SUMMARIZE_BATCH_CAP=0・全件同期）`
+        : `要約投入（Batches）: 見送り（${sub.skipReason}）・当日 Batches ${sub.batchUsed}/${sub.batchCap}` +
+            `・未回収 ${sub.inflight}/${MAX_INFLIGHT_BATCHES}`,
+    );
+    if (sub.skipReason === "inflight_cap") {
+      console.warn(
+        `  ⚠ 未回収のバッチが ${MAX_INFLIGHT_BATCHES} 本に達したので投入を見送った（残りは同期）。回収が止まっていないか確認`,
+      );
+    }
+  } else if (!sub.capUnavailable) {
+    console.log(
+      `要約投入（Batches）: 母数 ${sub.pool}${sub.poolCapped ? "+" : ""} → 予約 ${sub.selected} → 送信 ${sub.reserved}` +
+        `（${sub.batchId ?? "バッチなし"}）・当日 Batches ${sub.batchUsed + sub.ledgerCounted}/${sub.batchCap}` +
+        `・未回収 ${sub.inflight}/${MAX_INFLIGHT_BATCHES}`,
+    );
+  }
+
+  const s = await annotateMissing(supabase, {
+    runKind: "cron",
+    limit: syncLimitAfterSubmit(sub),
+  });
   console.log(
     `要約+タグ: 母数 ${s.pool}${s.poolCapped ? "+" : ""} → 選抜 ${s.selected} / 成功 ${s.succeeded} / 失敗 ${s.failed}` +
       `（課金 ${s.charged} / 解放 ${s.released}）` +
@@ -75,9 +155,17 @@ async function main() {
   );
   // 消費台帳（YAT-74 → YAT-78）。分母は台帳（投入基準）＝ dailyUsed + この run の selected。
   // succeeded を足さない（fail-soft-return-breaks-ratio-logs: 分子と分母を別ステージ由来にしない）。
-  if (!s.skipped && !s.capUnavailable && !s.ledgerError) {
+  // 同期が no_run_budget（Batches が run の枠を使い切った）なら Batches 側の台帳の値で出す。
+  const dailyNow =
+    !s.skipped && !s.capUnavailable && !s.ledgerError
+      ? s.dailyUsed + s.selected
+      : s.skipped && s.skipReason === "no_run_budget" && !sub.capUnavailable
+        ? sub.dailyUsed + sub.ledgerCounted
+        : null;
+  if (dailyNow !== null) {
     console.log(
-      `  日次要約: ${s.dailyUsed + s.selected} / ${s.dailyCap} 件（UTC・投入基準）`,
+      `  日次要約: ${dailyNow} / ${s.dailyCap} 件（UTC・投入基準）` +
+        (batchEnv.cap > 0 ? `・うち Batches ${sub.batchUsed + sub.ledgerCounted}/${sub.batchCap}` : ""),
     );
   }
   if (s.skipped && s.skipReason === "daily_capped") {
@@ -203,7 +291,7 @@ async function main() {
 
   // 要約の選抜死（YAT-78）: claim RPC の恒常失敗、または「候補はあるのに 1 件も予約できない」。
   // annotateDead は failed>0 が要るが、選抜が 0 件だと failed=0 で素通りする穴を塞ぐ。
-  // 正常な抑制（daily_capped / no_api_key）は skipped で自動除外、capUnavailable は pool=-1 で不活性。
+  // 正常な抑制（daily_capped / no_api_key / no_run_budget）は skipped で自動除外、capUnavailable は pool=-1 で不活性。
   const selectionDead = isSelectionDead(s);
   if (selectionDead) {
     console.error(
@@ -211,6 +299,79 @@ async function main() {
     );
     console.error(
       `  claim_summary_candidates の失敗（timeout なら migration 0021 未適用）/ migration 0017 未適用 / RPC 権限（service_role）を疑う`,
+    );
+  }
+
+  // ── 要約の Batches 経路（YAT-79）──────────────────────────────────────────
+  // 投入と着地が別の run になるので、同期の annotateDead（その run の全滅）では拾えない死に方を
+  // ここで赤くする。正常な見送り（batch_disabled / inflight_cap / batch_capped / daily_capped /
+  // collect_disabled 等）は除く。判定は evaluateBatchGuards にまとめ、exit 条件も同じ結果を使う。
+  // batchStuck は、この run の回収を反映した未回収の最古で判定する。
+  const backlog = await readBatchBacklog(supabase);
+  if (!backlog.ok) console.warn("未回収の要約バッチ数を読めなかった:", backlog.error);
+  const bg = evaluateBatchGuards(sub, col, backlog.ok ? backlog : null);
+  if (bg.selectionDead) {
+    console.error(
+      `\n⚠ 要約（Batches）の選抜が死んでいる（母数 ${sub.pool}${sub.poolCapped ? "+" : ""} / 予約 ${sub.selected}${sub.poolError ? ` / エラー: ${sub.poolError}` : ""}）`,
+    );
+  }
+  if (sub.capUnavailable) {
+    console.error(
+      `\n⚠ 要約（Batches）の当日消費・未回収数が読めず投入を見送った。上限到達ではなく障害なので赤くする`,
+    );
+  }
+  if (sub.ledgerError) {
+    console.error(`\n⚠ 要約（Batches）の台帳記録に失敗した: ${sub.ledgerError}`);
+    console.error(
+      `  create を呼ばず予約の解放を試みた（失敗なら ${BATCH_LEASE_HOURS}h で失効）。台帳が書けないと支出天井が効かないので赤くする`,
+    );
+  }
+  if (bg.submitDead) {
+    console.error(
+      `\n⚠ 要約バッチの作成に失敗した（予約 ${sub.selected} 件の解放と台帳 ${sub.ledgerId} の expired_unknown への終端を試みた。失敗なら上に warn）: ${sub.createError}`,
+    );
+    console.error(
+      `  接続断・timeout なら裏でバッチができている可能性がある（batch_id が分からず回収できない＝二重課金 1 回分）`,
+    );
+  }
+  if (sub.batchIdWriteError) {
+    console.error(
+      `\n⚠ 要約バッチ ${sub.batchId} を作ったが、台帳 ${sub.ledgerId} に batch_id を書けなかった（孤児）: ${sub.batchIdWriteError}`,
+    );
+    console.error(
+      `  手で直せば次 run が回収する: update llm_batches set batch_id = '${sub.batchId}', status = 'submitted' where id = '${sub.ledgerId}';`,
+    );
+  }
+  if (sub.settleError) {
+    console.error(
+      `\n⚠ 要約（Batches）の送れる行が無いラウンドを閉じる settle に失敗した（予約が ${BATCH_LEASE_HOURS}h 残る）: ${sub.settleError}`,
+    );
+  }
+  if (col.listError) {
+    console.error(`\n⚠ 回収待ちの要約バッチを読めなかった: ${col.listError}`);
+  }
+  if (col.settleError) {
+    console.error(`\n⚠ 要約バッチの帰責（settle_summary_attempts）に失敗した: ${col.settleError}`);
+  }
+  if (bg.collectDead) {
+    console.error(
+      `\n⚠ 回収した要約バッチの結果が ${col.attempted + col.expired + col.canceled} 件あるのに、記事に 1 件も書けなかった（着地 0）`,
+    );
+    // 原因ごとに案内を分ける（期限切れ・取消は非課金）。
+    console.error(
+      col.attempted === 0
+        ? `  全件が期限切れ（Batches 側の処理遅延）か取消（手動 cancel）で返った。遅延が続くなら SUMMARIZE_BATCH_CAP=0 で同期に戻す`
+        : col.succeeded === 0
+          ? `  成功した結果が 1 件も無い（errored か送れなかった記事だけ）。API キー・クレジット残高・レート制限を確認（2026-08 のクレジット枯渇と同じ型）`
+          : `  応答の JSON が壊れている（プロンプト・max_tokens の変更）か、DB 書き込みが落ちている可能性が高い`,
+    );
+  }
+  if (bg.batchStuck && backlog.ok) {
+    console.error(
+      `\n⚠ 要約バッチが ${BATCH_STUCK_HOURS}h を超えて回収されていない（未回収 ${backlog.open} 本・最古 ${backlog.oldestSubmittedAt}）`,
+    );
+    console.error(
+      `  回収の停止（SUMMARIZE_BATCH_COLLECT=0）・retrieve / results の恒常失敗を疑う。予約も切れるので同期経路が同じ記事を取り直す`,
     );
   }
 
@@ -312,6 +473,7 @@ async function main() {
     stale.length > 0 ||
     annotateDead ||
     selectionDead ||
+    anyBatchGuard(bg) ||
     quarantineSurge ||
     s.ledgerError !== null ||
     s.settleError !== null ||
