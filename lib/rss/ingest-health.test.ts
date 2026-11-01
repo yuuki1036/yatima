@@ -12,6 +12,8 @@ import {
   isSubmitDead,
   isBatchStuck,
   isCollectDead,
+  evaluateBatchGuards,
+  anyBatchGuard,
   QUARANTINE_SURGE_LIMIT,
   DECK_STARVED_FLOOR,
   STALE_ALERT_HOURS,
@@ -379,5 +381,65 @@ describe("isSelectionDead と Batches の見送り（YAT-79）", () => {
   it("投入の見送り・同期の no_run_budget は skipped なので発火しない", () => {
     // inflight_cap / batch_capped / batch_disabled / no_run_budget はどれも skipped=true で返る
     expect(isSelectionDead({ skipped: true, pool: 5, selected: 0, poolError: null })).toBe(false);
+  });
+});
+
+// ingest.ts の exit 条件は evaluateBatchGuards の結果をそのまま使う。どの結果をどの判定に渡すか（配線）を
+// ここで固定する: 1 項目だけを壊した入力で赤くなり、健全な入力では赤くならないこと。
+describe("evaluateBatchGuards / anyBatchGuard（YAT-79）", () => {
+  const sub = (o: Record<string, unknown> = {}) => ({
+    skipped: false,
+    pool: 9,
+    selected: 2,
+    poolError: null,
+    reserved: 2,
+    batchId: "msgbatch_1",
+    capUnavailable: false,
+    ledgerError: null,
+    batchIdWriteError: null,
+    settleError: null,
+    ...o,
+  });
+  const col = (o: Record<string, unknown> = {}) => ({
+    skipped: false,
+    attempted: 2,
+    expired: 0,
+    canceled: 0,
+    applied: 2,
+    superseded: 0,
+    listError: null,
+    settleError: null,
+    ...o,
+  });
+  const fresh = { oldestSubmittedAt: new Date(NOW - 3_600_000).toISOString() };
+  const guards = (s = {}, c = {}, b: { oldestSubmittedAt: string | null } | null = fresh) =>
+    evaluateBatchGuards(sub(s), col(c), b, NOW);
+
+  it("健全な run は赤くない（未回収なし・backlog が読めない場合も含む）", () => {
+    expect(anyBatchGuard(guards())).toBe(false);
+    expect(anyBatchGuard(guards({}, {}, null))).toBe(false);
+  });
+
+  it.each([
+    ["selectionDead", { poolError: "timeout", pool: -1 }, {}],
+    ["capUnavailable", { capUnavailable: true, pool: -1 }, {}],
+    ["ledgerFailed", { ledgerError: "denied" }, {}],
+    ["submitDead", { batchId: null }, {}],
+    ["submitSettleFailed", { reserved: 0, batchId: null, settleError: "boom" }, {}],
+    ["orphaned", { batchIdWriteError: "denied" }, {}],
+    ["listFailed", {}, { listError: "boom" }],
+    ["collectSettleFailed", {}, { settleError: "boom" }],
+    ["collectDead", {}, { applied: 0 }],
+  ] as const)("%s だけで赤くなる", (key, s, c) => {
+    const g = guards(s, c);
+    expect(g[key]).toBe(true);
+    expect(Object.entries(g).filter(([, v]) => v).map(([k]) => k)).toEqual([key]);
+    expect(anyBatchGuard(g)).toBe(true);
+  });
+
+  it("batchStuck だけで赤くなる", () => {
+    const g = guards({}, {}, { oldestSubmittedAt: new Date(NOW - 37 * 3_600_000).toISOString() });
+    expect(Object.entries(g).filter(([, v]) => v).map(([k]) => k)).toEqual(["batchStuck"]);
+    expect(anyBatchGuard(g)).toBe(true);
   });
 });

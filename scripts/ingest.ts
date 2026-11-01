@@ -16,9 +16,8 @@ import {
   isEmbedSelectStalled,
   isSelectionDead,
   isQuarantineSurging,
-  isSubmitDead,
-  isBatchStuck,
-  isCollectDead,
+  evaluateBatchGuards,
+  anyBatchGuard,
   DECK_STARVED_FLOOR,
   STALE_ALERT_HOURS,
 } from "../lib/rss/ingest-health";
@@ -30,6 +29,7 @@ import {
 import { collectAnnotateBatches, submitAnnotateBatch } from "../lib/llm/annotate-batch";
 import { readBatchBacklog, resolveStaleLedger } from "../lib/llm/summary-ledger";
 import {
+  BATCH_LEASE_HOURS,
   BATCH_STUCK_HOURS,
   MAX_INFLIGHT_BATCHES,
   parseBatchEnv,
@@ -54,7 +54,7 @@ async function main() {
 
   // 要約の Batches（YAT-79）。SUMMARIZE_BATCH_CAP は日次 120 件のうち Batches に回す件数で、
   // 未設定・不正値は 0（全件同期＝ロールバック）。SUMMARIZE_BATCH_COLLECT=0 で回収だけ止める。
-  // process.env を読むのはここだけ（lib は純関数のまま）。
+  // SUMMARIZE_BATCH_* を読むのはここだけ（解釈は summarize-policy.ts の純関数 parseBatchEnv）。
   const batchEnv = parseBatchEnv(process.env);
   if (batchEnv.capInvalid) {
     console.warn(
@@ -75,7 +75,7 @@ async function main() {
         ` / 処理中 ${col.pending} / 未解決 ${col.unresolved}` +
         (col.deferred ? ` / 持ち越し ${col.deferred}` : "") +
         `・書込 ${col.applied}` +
-        (col.superseded ? ` / 要約済みで見送り ${col.superseded}` : "") +
+        (col.superseded ? ` / 見送り（要約済み・他ラウンドの予約中）${col.superseded}` : "") +
         `（成功 ${col.succeeded} / 失敗 ${col.errored} / 期限切れ ${col.expired} / 取消 ${col.canceled}）` +
         `・課金 ${col.charged} / 解放 ${col.released}・tokens in ${col.inputTokens} / out ${col.outputTokens}`,
     );
@@ -291,7 +291,7 @@ async function main() {
 
   // 要約の選抜死（YAT-78）: claim RPC の恒常失敗、または「候補はあるのに 1 件も予約できない」。
   // annotateDead は failed>0 が要るが、選抜が 0 件だと failed=0 で素通りする穴を塞ぐ。
-  // 正常な抑制（daily_capped / no_api_key）は skipped で自動除外、capUnavailable は pool=-1 で不活性。
+  // 正常な抑制（daily_capped / no_api_key / no_run_budget）は skipped で自動除外、capUnavailable は pool=-1 で不活性。
   const selectionDead = isSelectionDead(s);
   if (selectionDead) {
     console.error(
@@ -304,9 +304,13 @@ async function main() {
 
   // ── 要約の Batches 経路（YAT-79）──────────────────────────────────────────
   // 投入と着地が別の run になるので、同期の annotateDead（その run の全滅）では拾えない死に方を
-  // ここで赤くする。正常な見送り（batch_disabled / inflight_cap / batch_capped / collect_disabled）は除く。
-  const subSelectionDead = isSelectionDead(sub);
-  if (subSelectionDead) {
+  // ここで赤くする。正常な見送り（batch_disabled / inflight_cap / batch_capped / daily_capped /
+  // collect_disabled 等）は除く。判定は evaluateBatchGuards にまとめ、exit 条件も同じ結果を使う。
+  // batchStuck は、この run の回収を反映した未回収の最古で判定する。
+  const backlog = await readBatchBacklog(supabase);
+  if (!backlog.ok) console.warn("未回収の要約バッチ数を読めなかった:", backlog.error);
+  const bg = evaluateBatchGuards(sub, col, backlog.ok ? backlog : null);
+  if (bg.selectionDead) {
     console.error(
       `\n⚠ 要約（Batches）の選抜が死んでいる（母数 ${sub.pool}${sub.poolCapped ? "+" : ""} / 予約 ${sub.selected}${sub.poolError ? ` / エラー: ${sub.poolError}` : ""}）`,
     );
@@ -318,12 +322,13 @@ async function main() {
   }
   if (sub.ledgerError) {
     console.error(`\n⚠ 要約（Batches）の台帳記録に失敗した: ${sub.ledgerError}`);
-    console.error(`  create を呼ばず予約を解放した。台帳が書けないと支出天井が効かないので赤くする`);
-  }
-  const submitDead = isSubmitDead(sub);
-  if (submitDead) {
     console.error(
-      `\n⚠ 要約バッチの作成に失敗した（予約 ${sub.reserved} 件は解放・台帳 ${sub.ledgerId} は expired_unknown）: ${sub.createError}`,
+      `  create を呼ばず予約の解放を試みた（失敗なら ${BATCH_LEASE_HOURS}h で失効）。台帳が書けないと支出天井が効かないので赤くする`,
+    );
+  }
+  if (bg.submitDead) {
+    console.error(
+      `\n⚠ 要約バッチの作成に失敗した（予約 ${sub.selected} 件の解放と台帳 ${sub.ledgerId} の expired_unknown への終端を試みた。失敗なら上に warn）: ${sub.createError}`,
     );
     console.error(
       `  接続断・timeout なら裏でバッチができている可能性がある（batch_id が分からず回収できない＝二重課金 1 回分）`,
@@ -337,33 +342,31 @@ async function main() {
       `  手で直せば次 run が回収する: update llm_batches set batch_id = '${sub.batchId}', status = 'submitted' where id = '${sub.ledgerId}';`,
     );
   }
+  if (sub.settleError) {
+    console.error(
+      `\n⚠ 要約（Batches）の送れる行が無いラウンドを閉じる settle に失敗した（予約が ${BATCH_LEASE_HOURS}h 残る）: ${sub.settleError}`,
+    );
+  }
   if (col.listError) {
     console.error(`\n⚠ 回収待ちの要約バッチを読めなかった: ${col.listError}`);
   }
   if (col.settleError) {
     console.error(`\n⚠ 要約バッチの帰責（settle_summary_attempts）に失敗した: ${col.settleError}`);
   }
-  const collectDead = isCollectDead(col);
-  if (collectDead) {
+  if (bg.collectDead) {
     console.error(
       `\n⚠ 回収した要約バッチの結果が ${col.attempted + col.expired + col.canceled} 件あるのに、記事に 1 件も書けなかった（着地 0）`,
     );
-    // 原因ごとに案内を分ける。期限切れ・取消だけなら Batches 側が 24h 以内に処理しなかった（非課金）。
-    // 全件がバッチ側の errored なら API 側の全滅（クレジット・レート制限・過負荷）で、記事への書き込みには
-    // 届いていない。それ以外は応答は返っているのに書けていない。
+    // 原因ごとに案内を分ける（期限切れ・取消は非課金）。
     console.error(
       col.attempted === 0
-        ? `  全件が期限切れ・取消で返った（Batches 側の処理遅延）。続くなら SUMMARIZE_BATCH_CAP=0 で同期に戻す`
-        : col.errored === col.attempted
-          ? `  全件がバッチの errored で返った。API キー・クレジット残高・レート制限を確認（2026-08 のクレジット枯渇と同じ型）`
+        ? `  全件が期限切れ（Batches 側の処理遅延）か取消（手動 cancel）で返った。遅延が続くなら SUMMARIZE_BATCH_CAP=0 で同期に戻す`
+        : col.succeeded === 0
+          ? `  成功した結果が 1 件も無い（errored か送れなかった記事だけ）。API キー・クレジット残高・レート制限を確認（2026-08 のクレジット枯渇と同じ型）`
           : `  応答の JSON が壊れている（プロンプト・max_tokens の変更）か、DB 書き込みが落ちている可能性が高い`,
     );
   }
-  // この run の回収を反映した、未回収の最古で判定する。
-  const backlog = await readBatchBacklog(supabase);
-  if (!backlog.ok) console.warn("未回収の要約バッチ数を読めなかった:", backlog.error);
-  const batchStuck = isBatchStuck(backlog.ok ? backlog : null);
-  if (batchStuck && backlog.ok) {
+  if (bg.batchStuck && backlog.ok) {
     console.error(
       `\n⚠ 要約バッチが ${BATCH_STUCK_HOURS}h を超えて回収されていない（未回収 ${backlog.open} 本・最古 ${backlog.oldestSubmittedAt}）`,
     );
@@ -470,15 +473,7 @@ async function main() {
     stale.length > 0 ||
     annotateDead ||
     selectionDead ||
-    subSelectionDead ||
-    submitDead ||
-    batchStuck ||
-    collectDead ||
-    sub.capUnavailable ||
-    sub.ledgerError !== null ||
-    sub.batchIdWriteError !== null ||
-    col.listError !== null ||
-    col.settleError !== null ||
+    anyBatchGuard(bg) ||
     quarantineSurge ||
     s.ledgerError !== null ||
     s.settleError !== null ||

@@ -229,8 +229,9 @@ export function isBatchStuck(
 // 退行で JSON が全部壊れる・DB 書き込みが全部落ちる・バッチの結果が全件 errored、を deckStarved の
 // 72h より先に拾う）。期限切れ・取消（expired / canceled）も母数に入れる: 書き込みも帰責もしないが、
 // Batches 側の処理遅延が続くと全件期限切れのラウンドが閉じ続け（batchStuck にも乗らない）、解放した
-// 記事を取り直してはまた期限切れになる。要約済みで見送った結果（superseded）は別の経路で着地済みなので
-// 着地に数える（台帳を閉じ損ねた回の再回収が全件 superseded になっても鳴らさない）。
+// 記事を取り直してはまた期限切れになる。見送った結果（superseded）も着地に数える: 要約済みの記事は別の
+// 経路で着地済みで（台帳を閉じ損ねた回の再回収が全件見送りになっても鳴らさない）、他ラウンドが予約中の
+// 記事はそのラウンドが書く（失敗すれば、そのラウンドの経路のガードか次の回収が拾う）。
 export function isCollectDead(col: {
   skipped: boolean;
   attempted: number;
@@ -239,6 +240,73 @@ export function isCollectDead(col: {
   applied: number;
   superseded: number;
 }): boolean {
-  const returned = col.attempted + col.expired + col.canceled;
-  return !col.skipped && returned > 0 && col.applied + col.superseded === 0;
+  const results = col.attempted + col.expired + col.canceled;
+  return !col.skipped && results > 0 && col.applied + col.superseded === 0;
+}
+
+// Batches 経路の赤をまとめて評価する。ingest.ts の exit 条件はこの結果をそのまま使い、どの結果を
+// どの判定に渡すか（配線）をテストで固定する。項目を足せば anyBatchGuard に自動で入る。
+export type BatchGuards = {
+  /** 投入の選抜死（claim / 対象取得の失敗・候補はあるのに予約 0）。 */
+  selectionDead: boolean;
+  /** 当日消費・未回収数が読めず投入を見送った。 */
+  capUnavailable: boolean;
+  /** 台帳 insert の失敗。 */
+  ledgerFailed: boolean;
+  /** create の失敗。 */
+  submitDead: boolean;
+  /** 送れる行 0 件のラウンドを閉じる settle の失敗。 */
+  submitSettleFailed: boolean;
+  /** create は成功したが batch_id を台帳に書けなかった（孤児）。 */
+  orphaned: boolean;
+  /** 回収待ちの一覧が読めない。 */
+  listFailed: boolean;
+  /** 回収したラウンドの settle の失敗。 */
+  collectSettleFailed: boolean;
+  collectDead: boolean;
+  batchStuck: boolean;
+};
+
+export function evaluateBatchGuards(
+  sub: {
+    skipped: boolean;
+    pool: number;
+    selected: number;
+    poolError: string | null;
+    reserved: number;
+    batchId: string | null;
+    capUnavailable: boolean;
+    ledgerError: string | null;
+    batchIdWriteError: string | null;
+    settleError: string | null;
+  },
+  col: {
+    skipped: boolean;
+    attempted: number;
+    expired: number;
+    canceled: number;
+    applied: number;
+    superseded: number;
+    listError: string | null;
+    settleError: string | null;
+  },
+  backlog: { oldestSubmittedAt: string | null } | null,
+  now: number = Date.now(),
+): BatchGuards {
+  return {
+    selectionDead: isSelectionDead(sub),
+    capUnavailable: sub.capUnavailable,
+    ledgerFailed: sub.ledgerError !== null,
+    submitDead: isSubmitDead(sub),
+    submitSettleFailed: sub.settleError !== null,
+    orphaned: sub.batchIdWriteError !== null,
+    listFailed: col.listError !== null,
+    collectSettleFailed: col.settleError !== null,
+    collectDead: isCollectDead(col),
+    batchStuck: isBatchStuck(backlog, now),
+  };
+}
+
+export function anyBatchGuard(g: BatchGuards): boolean {
+  return Object.values(g).some(Boolean);
 }
