@@ -146,7 +146,7 @@ async function main() {
 
   const s = await annotateMissing(supabase, {
     runKind: "cron",
-    limit: syncLimitAfterSubmit(sub.ledgerCounted),
+    limit: syncLimitAfterSubmit(sub),
   });
   console.log(
     `要約+タグ: 母数 ${s.pool}${s.poolCapped ? "+" : ""} → 選抜 ${s.selected} / 成功 ${s.succeeded} / 失敗 ${s.failed}` +

@@ -38,6 +38,7 @@ export const SYNC_LEASE_HOURS = 30;
 // 最大 7.4h あり（YAT-85 の実測）、24h かかったバッチは 31h 付近で回収される。30h だと予約が先に切れて
 // 同期経路が同じ記事を取り直し、batchStuck も誤って鳴る。24h ＋ cron 間隔 2 回分で 36h。
 // 3 つは同じ値でなければならない（予約が停滞判定より先に切れると二重要約が赤より先に起きる）。
+// migration 0017 の列コメントにある 30h は、この訂正の前の設計値（適用済みなので書き換えない）。
 export const BATCH_LEASE_HOURS = 36;
 export const BATCH_STUCK_HOURS = 36;
 export const STALE_LEDGER_HOURS = 36;
@@ -109,10 +110,12 @@ export function planBatchSubmit(p: {
   return { submit: true, maxRows: Math.min(PER_RUN_MAX, batchLeft, daily) };
 }
 
-// Batches が台帳に載せた件数を引いた、この run の同期の残り枠。日次の残りは annotateMissing が
-// 自分で台帳を読み直して引く（Batches の行が既に入っているので二重には引かない）。
-export function syncLimitAfterSubmit(reserved: number): number {
-  return Math.max(0, PER_RUN_MAX - reserved);
+// Batches が台帳に載せた件数（ledgerCounted）を引いた、この run の同期の残り枠。create に渡した件数
+// （reserved）ではない: 送れる行 0 件や create 失敗でも台帳には載っている。投入の結果をそのまま受けて、
+// 呼び出し側でどの件数を渡すかを選ばせない。日次の残りは annotateMissing が自分で台帳を読み直して引く
+// （Batches の行が既に入っているので二重には引かない）。
+export function syncLimitAfterSubmit(sub: { ledgerCounted: number }): number {
+  return Math.max(0, PER_RUN_MAX - sub.ledgerCounted);
 }
 
 export type SyncPlan =

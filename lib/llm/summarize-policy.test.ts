@@ -99,10 +99,15 @@ describe("planBatchSubmit", () => {
 
 describe("syncLimitAfterSubmit / planSyncRun", () => {
   it("同期は 1 run の残り枠だけ使う", () => {
-    expect(syncLimitAfterSubmit(0)).toBe(20);
-    expect(syncLimitAfterSubmit(15)).toBe(5);
-    expect(syncLimitAfterSubmit(20)).toBe(0);
-    expect(syncLimitAfterSubmit(25)).toBe(0);
+    expect(syncLimitAfterSubmit({ ledgerCounted: 0 })).toBe(20);
+    expect(syncLimitAfterSubmit({ ledgerCounted: 15 })).toBe(5);
+    expect(syncLimitAfterSubmit({ ledgerCounted: 20 })).toBe(0);
+    expect(syncLimitAfterSubmit({ ledgerCounted: 25 })).toBe(0);
+  });
+
+  it("引くのは台帳に載せた件数で、create に渡した件数ではない（送れる行 0 件・create 失敗でも台帳には載る）", () => {
+    const noSendable = { ledgerCounted: 20, reserved: 0 };
+    expect(syncLimitAfterSubmit(noSendable)).toBe(0);
   });
 
   it("残り枠 0 は no_run_budget、日次上限は daily_capped、それ以外は小さい方", () => {
@@ -124,7 +129,7 @@ function simulateDay(cap: number, runs: number) {
     const reserved = p && p.submit ? p.maxRows : 0;
     usage.total += reserved;
     usage.batch += reserved;
-    const s = planSyncRun(syncLimitAfterSubmit(reserved), usage.total);
+    const s = planSyncRun(syncLimitAfterSubmit({ ledgerCounted: reserved }), usage.total);
     if (s.run) usage.total += s.maxRows;
     out.push({
       batch: p === null ? "disabled" : p.submit ? p.maxRows : p.reason,
