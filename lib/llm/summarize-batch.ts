@@ -430,7 +430,7 @@ type AnnotateBatchCounts = {
   charged: number;
   /** 予約解除のみ（attempts 据え置き）の件数。 */
   released: number;
-  /** 実行開始時点の当日投入数（台帳 request_count 合計。この run を含まない）。 */
+  /** annotateMissing 開始時点の当日投入数（台帳 request_count 合計。同じ run で先に投入した Batches の行を含み、この同期ラウンドは含まない）。 */
   dailyUsed: number;
   dailyCap: number;
   /** claim RPC / 対象 select の失敗理由。null なら正常。isSelectionDead が読む。 */
@@ -490,8 +490,7 @@ export async function annotateMissing(
   if (!summarizer) {
     return { ...EMPTY_ANNOTATE_COUNTS, skipped: true, skipReason: "no_api_key" };
   }
-  // [0'] この run の枠を Batches が使い切った（YAT-79）。台帳も読まない。claim を max_rows=0 で
-  // 呼ぶと「候補はあるのに予約 0 件」になって isSelectionDead が誤って鳴るので、その手前で見送る。
+  // [0'] この run の枠を Batches が使い切った（YAT-79）。台帳も読まずに見送る（理由は planSyncRun）。
   if (limit <= 0) {
     return { ...EMPTY_ANNOTATE_COUNTS, skipped: true, skipReason: "no_run_budget" };
   }
@@ -515,7 +514,7 @@ export async function annotateMissing(
   }
 
   // [2] claim → 台帳 insert（LLM の前・fail-closed）→ 対象行の取得。失敗経路の予約解放・台帳の
-  // 終端は openSummaryRound が済ませている。claim 失敗は pool=-1 で isSelectionDead を赤くする。
+  // 終端は openSummaryRound が試みる（失敗なら lease で失効）。claim 失敗は pool=-1 で isSelectionDead を赤くする。
   const opened = await openSummaryRound(supabase, {
     mode: "sync",
     runKind,
@@ -600,7 +599,6 @@ export async function annotateMissing(
     ledger: {
       succeeded,
       errored: failures.length,
-      applied: succeeded,
       lastError: null,
     },
   });

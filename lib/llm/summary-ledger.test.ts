@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyAnnotation,
   buildClosePatch,
   buildSelection,
   findSummarized,
   listOpenBatchRounds,
+  openSummaryRound,
   parseRoundSelection,
   readBatchBacklog,
   recordBatchCreate,
@@ -11,6 +13,7 @@ import {
   tallyUsage,
 } from "./summary-ledger";
 import { argOf, callName, createRecorder, isFrom, isRpc } from "./supabase-recorder.testkit";
+import type { Annotation } from "./types";
 
 // 台帳（llm_batches）に書く形と読む形の契約（YAT-79）。同期の行の形は YAT-78 から変えない。
 
@@ -137,6 +140,45 @@ describe("parseRoundSelection", () => {
     expect(parseRoundSelection({ ...sel, ids: [] }).ok).toBe(false);
     expect(parseRoundSelection({ ...sel, ids: "a" }).ok).toBe(false);
     expect(parseRoundSelection({ ...sel, lease_deadline: undefined }).ok).toBe(false);
+    expect(parseRoundSelection({ ...sel, lease_deadline: "" }).ok).toBe(false);
+  });
+});
+
+describe("openSummaryRound", () => {
+  it("claim の応答に lease_deadline が無ければ claim_failed で返し、台帳にも進まない", async () => {
+    const w = createRecorder((c) =>
+      isRpc(c, "claim_summary_candidates") ? { data: { pool: 3, ids: ["a"] } } : {},
+    );
+    const r = await openSummaryRound(w.client, {
+      mode: "batch",
+      runKind: "cron",
+      maxRows: 20,
+      leaseHours: 36,
+    });
+    expect(r).toEqual({ kind: "claim_failed", error: "claim の応答に lease_deadline が無い" });
+    expect(w.calls.map(callName)).toEqual(["rpc:claim_summary_candidates"]);
+  });
+});
+
+describe("applyAnnotation", () => {
+  const a: Annotation = { summary: "要点", tags: ["tech/ai"] };
+
+  it("既定（同期）は id だけで書く", async () => {
+    const w = createRecorder(() => ({}));
+    expect(await applyAnnotation(w.client, "a", a)).toBe(true);
+    const up = w.calls.find((c) => isFrom(c, "articles", "update"))!;
+    expect(argOf(up, "is")).toBeUndefined();
+  });
+
+  it("ifUnsummarized は summary IS NULL のときだけ書き、別の書き手が先に書いていれば false", async () => {
+    const hit = createRecorder((c) => (isFrom(c, "articles", "update") ? { data: [{ id: "a" }] } : {}));
+    expect(await applyAnnotation(hit.client, "a", a, { ifUnsummarized: true })).toBe(true);
+    const up = hit.calls.find((c) => isFrom(c, "articles", "update"))!;
+    expect(argOf(up, "is")).toEqual(["summary", null]);
+    expect(argOf(up, "select")).toEqual(["id"]);
+
+    const lost = createRecorder((c) => (isFrom(c, "articles", "update") ? { data: [] } : {}));
+    expect(await applyAnnotation(lost.client, "a", a, { ifUnsummarized: true })).toBe(false);
   });
 });
 
@@ -340,22 +382,35 @@ describe("listOpenBatchRounds", () => {
 });
 
 describe("findSummarized", () => {
-  it("要約が埋まっている記事 id だけを返す", async () => {
-    const w = createRecorder(() => ({ data: [{ id: "a" }] }));
-    const r = await findSummarized(w.client, ["a", "b"]);
-    expect(r).toEqual({ ok: true, ids: new Set(["a"]) });
-    expect(argOf(w.calls[0], "in")).toEqual(["id", ["a", "b"]]);
+  const OWN = "2026-10-10T12:00:00.000Z";
+  const NOW = Date.parse("2026-10-10T00:00:00.000Z");
+
+  it("要約が埋まっている記事と、自分以外の生きた予約を持つ記事を返す（自分の予約は外す）", async () => {
+    const w = createRecorder((c) =>
+      argOf(c, "not")
+        ? { data: [{ id: "a" }] } // 要約済み（書いた側が予約を外した）
+        : {
+            data: [
+              { id: "b", summary_reserved_until: "2026-10-11T03:00:00+00:00" }, // 取り直した別ラウンド
+              { id: "c", summary_reserved_until: "2026-10-10T12:00:00+00:00" }, // 自分の予約（書式違い）
+            ],
+          },
+    );
+    const r = await findSummarized(w.client, ["a", "b", "c", "d"], OWN, NOW);
+    expect(r).toEqual({ ok: true, ids: new Set(["a", "b"]) });
+    expect(argOf(w.calls[0], "in")).toEqual(["id", ["a", "b", "c", "d"]]);
     expect(argOf(w.calls[0], "not")).toEqual(["summary", "is", null]);
+    expect(argOf(w.calls[1], "gt")).toEqual(["summary_reserved_until", "2026-10-10T00:00:00.000Z"]);
   });
 
   it("対象が無ければ DB を引かない", async () => {
     const w = createRecorder(() => ({}));
-    expect(await findSummarized(w.client, [])).toEqual({ ok: true, ids: new Set() });
+    expect(await findSummarized(w.client, [], OWN, NOW)).toEqual({ ok: true, ids: new Set() });
     expect(w.calls).toEqual([]);
   });
 
   it("読めなければ ok:false", async () => {
     const w = createRecorder(() => ({ error: { message: "boom" } }));
-    expect(await findSummarized(w.client, ["a"])).toEqual({ ok: false, error: "boom" });
+    expect(await findSummarized(w.client, ["a"], OWN, NOW)).toEqual({ ok: false, error: "boom" });
   });
 });

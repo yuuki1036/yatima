@@ -9,7 +9,7 @@ import {
   type BatchesPort,
 } from "./annotate-batch";
 import { buildAnnotateParams } from "./haiku";
-import { isCollectDead } from "@/lib/rss/ingest-health";
+import { isCollectDead, isSubmitDead } from "@/lib/rss/ingest-health";
 import {
   argOf,
   callName,
@@ -129,6 +129,7 @@ type SubmitWorld = {
   batchUpdate?: StubResponse;
   insert?: StubResponse;
   fetch?: StubResponse;
+  settle?: StubResponse;
 };
 
 function submitWorld(w: SubmitWorld = {}) {
@@ -149,7 +150,7 @@ function submitWorld(w: SubmitWorld = {}) {
           { id: "b", title: "B", content_html: "<p>本文B</p>" },
         ],
       };
-    if (isRpc(c, "settle_summary_attempts")) return { data: { charged: 0, released: 2 } };
+    if (isRpc(c, "settle_summary_attempts")) return w.settle ?? { data: { charged: 0, released: 2 } };
     return {};
   });
 }
@@ -296,6 +297,47 @@ describe("submitAnnotateBatch", () => {
     const r = await submitAnnotateBatch(w.client, { cap: 20, port: fakePort().port });
     expect(r).toMatchObject({ batchId: "msgbatch_1", batchIdWriteError: "denied" });
   });
+
+  it("未回収数が読めなければ capUnavailable（pool=-1）で、claim もしない", async () => {
+    const w = submitWorld({ backlog: { error: { message: "boom" } } });
+    const r = await submitAnnotateBatch(w.client, { cap: 20, port: fakePort().port });
+    expect(r).toMatchObject({ skipped: false, capUnavailable: true, pool: -1 });
+    expect(w.calls.some((c) => isRpc(c, "claim_summary_candidates"))).toBe(false);
+  });
+
+  it("送れる行が無ければ create を呼ばずに閉じる（送れない記事と消えた記事を帰責に回し、submitDead にしない）", async () => {
+    const w = submitWorld({ rows: [{ id: "a", title: null, content_html: "<p></p>" }] });
+    const { port, log } = fakePort();
+    const r = await submitAnnotateBatch(w.client, { cap: 20, port });
+    expect(log).toEqual([]);
+    expect(r).toMatchObject({ reserved: 0, batchId: null, ledgerCounted: 2, settleError: null });
+    expect(isSubmitDead(r)).toBe(false);
+    const settle = w.calls.find((c) => isRpc(c, "settle_summary_attempts")) as {
+      args: { charged: unknown[]; released: unknown[] };
+    };
+    // 証人がいないので課金せずに解放する
+    expect(settle.args).toMatchObject({
+      charged: [],
+      released: [
+        { id: "a", error: "本文・タイトルとも空" },
+        { id: "b", error: "対象行が無い" },
+      ],
+    });
+    const close = w.calls[w.calls.length - 1];
+    expect((argOf(close, "update") as [{ status: string; last_error: string }])[0]).toMatchObject({
+      status: "collected",
+      last_error: "no_sendable_rows",
+    });
+  });
+
+  it("送れる行が無いラウンドの settle の失敗は settleError で返す（submitDead に乗らない経路でも赤くする）", async () => {
+    const w = submitWorld({
+      rows: [{ id: "a", title: null, content_html: "<p></p>" }],
+      settle: { error: { message: "settle boom" } },
+    });
+    const r = await submitAnnotateBatch(w.client, { cap: 20, port: fakePort().port });
+    expect(r).toMatchObject({ reserved: 0, settleError: "settle boom" });
+  });
 });
 
 // ── 回収 ──────────────────────────────────────────────────────────────────
@@ -317,6 +359,8 @@ type CollectKnobs = {
   ledgerUpdate?: StubResponse;
   /** この記事 id の articles.update を失敗させる。 */
   failArticle?: string;
+  /** この記事 id の articles.update を 0 行にする（確認の後に別の書き手が先に書いた）。 */
+  lostRace?: string;
   /** 要約が既に埋まっている記事 id（findSummarized の応答）。 */
   summarized?: string[];
   /** findSummarized を失敗させる。 */
@@ -328,8 +372,11 @@ function collectWorld(rows: unknown[] = [openRow()], k: CollectKnobs = {}) {
     if (isFrom(c, "llm_batches", "update")) return k.ledgerUpdate ?? {};
     if (isFrom(c, "llm_batches", "select"))
       return k.listError ? { error: { message: "list boom" } } : { data: rows };
-    if (isFrom(c, "articles", "update"))
-      return argOf(c, "eq")?.[1] === k.failArticle ? { error: { message: "update boom" } } : {};
+    if (isFrom(c, "articles", "update")) {
+      const id = argOf(c, "eq")?.[1];
+      if (id === k.failArticle) return { error: { message: "update boom" } };
+      return { data: id === k.lostRace ? [] : [{ id }] };
+    }
     if (isFrom(c, "articles", "select"))
       return k.summarizedError
         ? { error: { message: "summarized boom" } }
@@ -394,16 +441,21 @@ describe("collectAnnotateBatches", () => {
     expect(w.calls.map(callName)).toEqual([
       "llm_batches.select",
       "articles.select",
+      "articles.select",
       "article_tags.upsert",
       "articles.update",
       "rpc:settle_summary_attempts",
       "llm_batches.update",
     ]);
-    // 要約済みの確認は成功した記事だけを、要約が埋まっているかで引く
+    // 要約済みの確認は成功した記事だけを、要約が埋まっているか・生きた予約があるかで引く
     expect(argOf(w.calls[1], "in")).toEqual(["id", ["a"]]);
     expect(argOf(w.calls[1], "not")).toEqual(["summary", "is", null]);
-    expect((argOf(w.calls[3], "update") as [{ summary: string }])[0].summary).toBe("新モデルの発表");
-    expect(w.calls[4]).toEqual({
+    expect(argOf(w.calls[2], "in")).toEqual(["id", ["a"]]);
+    expect(argOf(w.calls[2], "gt")?.[0]).toBe("summary_reserved_until");
+    expect((argOf(w.calls[4], "update") as [{ summary: string }])[0].summary).toBe("新モデルの発表");
+    // 要約の update は summary IS NULL のときだけ当てる
+    expect(argOf(w.calls[4], "is")).toEqual(["summary", null]);
+    expect(w.calls[5]).toEqual({
       kind: "rpc",
       fn: "settle_summary_attempts",
       args: {
@@ -415,7 +467,7 @@ describe("collectAnnotateBatches", () => {
         lease_deadline: LEASE,
       },
     });
-    expect(argOf(w.calls[5], "update")).toEqual([
+    expect(argOf(w.calls[6], "update")).toEqual([
       {
         status: "collected",
         succeeded: 1,
@@ -491,8 +543,15 @@ describe("collectAnnotateBatches", () => {
 
   it("selection が読めない行は unresolved にする", async () => {
     const w = collectWorld([openRow({ selection: { pool: 1 } })]);
-    const r = await collectAnnotateBatches(w.client, { enabled: true, port: fakePort().port });
+    const { port, log } = fakePort();
+    const r = await collectAnnotateBatches(w.client, { enabled: true, port });
     expect(r).toMatchObject({ open: 1, unresolved: 1 });
+    expect(log).toEqual([]);
+    expect(w.calls.map(callName)).toEqual(["llm_batches.select", "llm_batches.update"]);
+    expect(argOf(w.calls[1], "update")).toEqual([
+      { status: "unresolved", last_error: "malformed: Batches の行ではない" },
+    ]);
+    expect(argOf(w.calls[1], "eq")).toEqual(["id", "L1"]);
   });
 
   it("時間予算を超えた行は次 run に持ち越す（ラウンドの先頭）", async () => {
@@ -642,7 +701,7 @@ describe("collectAnnotateBatches", () => {
     expect((argOf(close, "update") as [{ last_error: string }])[0].last_error).toBe("settle boom");
   });
 
-  it("台帳を閉じられなかった回は回収済みに数えず、次 run の再回収で閉じる（2 回目の settle は 0 件反映でも障害にしない）", async () => {
+  it("台帳を閉じられなかった回は回収済みに数えず、次 run の再回収で閉じる（書けた記事は見送り、settle には渡さない）", async () => {
     const row = openRow({ selection: { mode: "batch", lease_deadline: LEASE, ids: ["a", "b"] } });
     const items = [ok("a"), errored("b", "invalid_request_error")];
 
@@ -655,7 +714,8 @@ describe("collectAnnotateBatches", () => {
     expect(r1).toMatchObject({ applied: 1, returned: 0, settleError: null });
 
     // 2 回目: 同じラウンドを読み直す。a は 1 回目で書けているので書き直さずに見送る。
-    // 予約は 1 回目の settle で外れているので、所有者チェックで 0 件反映になる
+    // a の予約は書いたときに外れているので settle には渡さない（b は 1 回目の settle で解放済みで、
+    // 所有者チェックにより 0 件反映になる）
     const w2 = collectWorld([row], {
       settle: { data: { charged: 0, released: 0 } },
       summarized: ["a"],
@@ -668,8 +728,9 @@ describe("collectAnnotateBatches", () => {
     expect(w2.calls.map(callName)).not.toContain("articles.update");
     expect(isCollectDead(r2)).toBe(false);
     const settle = w2.calls.find((c) => isRpc(c, "settle_summary_attempts")) as {
-      args: { lease_deadline: string };
+      args: { released: { id: string }[]; lease_deadline: string };
     };
+    expect(settle.args.released.map((x) => x.id)).toEqual(["b"]);
     expect(settle.args.lease_deadline).toBe(LEASE);
   });
 
@@ -682,7 +743,7 @@ describe("collectAnnotateBatches", () => {
       enabled: true,
       port: fakePort({ results: resultsOf([ok("a"), ok("b")]) }).port,
     });
-    expect(r).toMatchObject({ attempted: 2, applied: 1, superseded: 1, charged: 0, released: 1 });
+    expect(r).toMatchObject({ attempted: 2, applied: 1, superseded: 1, charged: 0, released: 0 });
     // b だけを書く（a にはタグの upsert も要約の update も出さない）
     const tagged = w.calls
       .filter((c) => isFrom(c, "article_tags", "upsert"))
@@ -690,14 +751,29 @@ describe("collectAnnotateBatches", () => {
     expect(tagged).toEqual(["b"]);
     const updated = w.calls.filter((c) => isFrom(c, "articles", "update")).map((c) => argOf(c, "eq"));
     expect(updated).toEqual([["id", "b"]]);
-    const settle = w.calls.find((c) => isRpc(c, "settle_summary_attempts")) as {
-      args: { charged: unknown[]; released: unknown[] };
-    };
-    expect(settle.args).toMatchObject({ charged: [], released: [{ id: "a", error: "already_summarized" }] });
+    // a の予約は書いた側が外しているので settle に渡さない（解放するものが無ければ RPC も呼ばない）
+    expect(w.calls.some((c) => isRpc(c, "settle_summary_attempts"))).toBe(false);
     const close = w.calls[w.calls.length - 1];
     expect((argOf(close, "update") as [{ applied: number; last_error: string }])[0]).toMatchObject({
       applied: 1,
-      last_error: "already_summarized: 1",
+      last_error: "superseded: 1",
+    });
+  });
+
+  it("確認の後に別の書き手が先に要約した記事は上書きせず、見送りに数える", async () => {
+    const w = collectWorld(
+      [openRow({ selection: { mode: "batch", lease_deadline: LEASE, ids: ["a", "b"] } })],
+      { lostRace: "a" },
+    );
+    const r = await collectAnnotateBatches(w.client, {
+      enabled: true,
+      port: fakePort({ results: resultsOf([ok("a"), ok("b")]) }).port,
+    });
+    expect(r).toMatchObject({ attempted: 2, applied: 1, superseded: 1, charged: 0, released: 0 });
+    const close = w.calls[w.calls.length - 1];
+    expect((argOf(close, "update") as [{ applied: number; last_error: string }])[0]).toMatchObject({
+      applied: 1,
+      last_error: "superseded: 1",
     });
   });
 
@@ -711,9 +787,10 @@ describe("collectAnnotateBatches", () => {
     expect(w.calls.map(callName)).toEqual([
       "llm_batches.select",
       "articles.select",
+      "articles.select",
       "llm_batches.update",
     ]);
-    expect(argOf(w.calls[2], "update")).toEqual([
+    expect(argOf(w.calls[3], "update")).toEqual([
       { status: "unresolved", last_error: "summarized: summarized boom" },
     ]);
   });

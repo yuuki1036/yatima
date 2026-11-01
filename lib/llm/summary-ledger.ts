@@ -31,7 +31,8 @@ export type LedgerMode = "sync" | "batch";
 export type SummaryRound = { ledgerId: string; ids: string[]; leaseDeadline: string };
 
 // settle_summary_attempts に予約解除／帰責を投げる。失敗しても lease 満了で自然復帰する。
-// warn は出さない（失敗の可視化は呼び出し側が持つ。ここで鳴らすと二重になる）。
+// warn は出さない（失敗の可視化は呼び出し側が持つ。ここで鳴らすと二重になる）。戻り値を捨ててよいのは、
+// 別のフラグで既に赤くなる経路（ledgerError / poolError / submitDead）だけ。本線は settleError で返す。
 async function settleAttempts(
   supabase: SupabaseClient,
   charged: SettleEntry[],
@@ -136,9 +137,9 @@ export type OpenRoundResult =
   /** 予約 0 件。pool > 0 なら選抜の全閉（isSelectionDead が拾う）、pool = 0 は対象ゼロ＝正常。 */
   | { kind: "empty"; pool: number; poolCapped: boolean }
   | { kind: "claim_failed"; error: string }
-  /** 台帳 insert の失敗。予約は解放済み、LLM / create は呼んでいない。 */
+  /** 台帳 insert の失敗。予約の解放は試みた（失敗なら lease で失効）、LLM / create は呼んでいない。 */
   | { kind: "ledger_failed"; pool: number; poolCapped: boolean; selected: number; error: string }
-  /** 対象行の取得失敗。予約は解放済み、台帳も終端済み。 */
+  /** 対象行の取得失敗。予約の解放と台帳の終端は試みた（失敗なら lease で失効・resolveStaleLedger）。 */
   | { kind: "fetch_failed"; pool: number; poolCapped: boolean; selected: number; error: string };
 
 export async function openSummaryRound(
@@ -174,6 +175,13 @@ export async function openSummaryRound(
     return { kind: "claim_failed", error: msg };
   }
   if (ids.length === 0) return { kind: "empty", pool, poolCapped };
+  // 期限が無いと settle で予約を解けず、Batches は selection が読めないバッチを作り続ける。
+  // 予約は lease で失効するので、台帳にも create にも進まずに claim の失敗として赤くする。
+  if (!leaseDeadline) {
+    const msg = "claim の応答に lease_deadline が無い";
+    console.warn(`要約候補の claim に失敗: ${msg}`);
+    return { kind: "claim_failed", error: msg };
+  }
 
   // [2] 台帳 insert（**LLM / create を呼ぶ前・fail-closed の要**）。後に置くと insert 失敗時に
   // 「課金したのに request_count が残らない」→ 翌 run が同枠を使い日次上限が実質無効化される。
@@ -246,11 +254,14 @@ export async function openSummaryRound(
 // findUntaggedSummarized の母集団に流れ込む。成功記事の予約解除は summary と同じ 1 回の update で
 // 行う（settle に回すと summary_reserved_until=null を書いた後の行に所有者チェックが効かず 0 件更新に
 // なる）。summarized_at は着地の観測台帳（YAT-74）。失敗は throw（呼び出し側が帰責する）。
+// ifUnsummarized は Batches の回収用: summary IS NULL のときだけ書き、別の書き手が先に書いていれば false を返す
+// （要約は上書きしない。タグは要約より先に upsert 済みで残るので、確認から書き込みまでの窓では和集合になる）。
 export async function applyAnnotation(
   supabase: SupabaseClient,
   articleId: string,
   a: Annotation,
-): Promise<void> {
+  opts: { ifUnsummarized?: boolean } = {},
+): Promise<boolean> {
   if (a.tags.length) {
     const tagRows = a.tags.map((t) => ({
       article_id: articleId,
@@ -265,7 +276,7 @@ export async function applyAnnotation(
       });
     if (tagErr) throw tagErr;
   }
-  const { error: upErr } = await supabase
+  const update = supabase
     .from("articles")
     .update({
       summary: a.summary,
@@ -274,26 +285,48 @@ export async function applyAnnotation(
       summary_batch_id: null,
     })
     .eq("id", articleId);
+  if (!opts.ifUnsummarized) {
+    const { error: upErr } = await update;
+    if (upErr) throw upErr;
+    return true;
+  }
+  const { data, error: upErr } = await update.is("summary", null).select("id");
   if (upErr) throw upErr;
+  return ((data ?? []) as unknown[]).length > 0;
 }
 
-// 要約が既に埋まっている記事（Batches の回収が書く前に除く）。予約（36h）が切れた後の回収では、
-// 同じ記事を取り直した別のラウンドが先に書いていることがある。上書きすると要約が入れ替わり、
-// タグは upsert が既存を消さないので和集合になって coerceTags の上限 3 件を超える。
-// cron の run は concurrency で直列なので、書く直前の 1 回の読み取りで足りる。
+// Batches の回収で書かずに見送る記事。予約（36h）が切れた後の回収では、同じ記事を別のラウンドが
+// 取り直している。上書きすると要約が入れ替わり、タグは upsert が既存を消さないので和集合になって
+// coerceTags の上限 3 件を超える。cron 同士は concurrency で直列だが、refreshNow / resummarize は
+// 直列でない。なので「要約が埋まっている」に加えて「自分以外の生きた予約がある」（取り直した側が
+// LLM を呼んでいる最中）も見送る。この読み取りと書き込みの間に割り込まれる窓は applyAnnotation の
+// ifUnsummarized が要約の上書きだけ防ぐ。
 export async function findSummarized(
   supabase: SupabaseClient,
   ids: string[],
+  ownLeaseDeadline: string,
+  now: number = Date.now(),
 ): Promise<{ ok: true; ids: Set<string> } | { ok: false; error: string }> {
   if (ids.length === 0) return { ok: true, ids: new Set() };
   try {
-    const { data, error } = await supabase
-      .from("articles")
-      .select("id")
-      .in("id", ids)
-      .not("summary", "is", null);
-    if (error) throw error;
-    return { ok: true, ids: new Set(((data ?? []) as { id: string }[]).map((r) => r.id)) };
+    // 「要約あり」と「生きた予約あり」を別のクエリで引く（.or() の文字列構文に時刻を埋め込まない）。
+    const [summarized, reserved] = await Promise.all([
+      supabase.from("articles").select("id").in("id", ids).not("summary", "is", null),
+      supabase
+        .from("articles")
+        .select("id, summary_reserved_until")
+        .in("id", ids)
+        .gt("summary_reserved_until", new Date(now).toISOString()),
+    ]);
+    if (summarized.error) throw summarized.error;
+    if (reserved.error) throw reserved.error;
+    const taken = new Set(((summarized.data ?? []) as { id: string }[]).map((r) => r.id));
+    // 自分の予約がまだ生きている行も返るので外す（時刻の書式は claim の jsonb と列で違いうるので数値で比べる）。
+    const own = Date.parse(ownLeaseDeadline);
+    for (const r of (reserved.data ?? []) as { id: string; summary_reserved_until: string | null }[]) {
+      if (!r.summary_reserved_until || Date.parse(r.summary_reserved_until) !== own) taken.add(r.id);
+    }
+    return { ok: true, ids: taken };
   } catch (e) {
     return { ok: false, error: errorText(e) };
   }
@@ -360,8 +393,8 @@ export type RoundOutcome = {
   failures: SettleFailure[];
   /** 証人に関係なく予約を外すだけのもの（Batches の expired / canceled / archived）。 */
   releases?: SettleEntry[];
-  /** 台帳に書く集計。lastError は settle が失敗すればそちらで上書きする。 */
-  ledger: LedgerTally;
+  /** 台帳に書く集計（applied は上の applied を使う）。lastError は settle が失敗すればそちらで上書きする。 */
+  ledger: Omit<LedgerTally, "applied">;
 };
 
 export type CloseRoundResult = {
@@ -403,6 +436,7 @@ export async function closeSummaryRound(
 
   const ledgerClosed = await closeLedger(supabase, round.ledgerId, {
     ...o.ledger,
+    applied: o.applied,
     lastError: settleError ?? o.ledger.lastError,
   });
   return { charged: charged.length, released: released.length, settleError, ledgerClosed };
@@ -412,7 +446,8 @@ export async function closeSummaryRound(
 //
 // 台帳の status 遷移（Batches の行）:
 //   claimed ─create 成功→ submitted ─回収→ collected
-//      │                    └─retrieve/results 失敗→ unresolved ─回収→ collected
+//      │                    └─retrieve / results / 要約済みの確認の失敗→ unresolved ─回収→ collected
+//      ├─送れる行 0 件・対象行の取得失敗→ collected（batch_id は null。API には届いていない）
 //      ├─create 失敗→ expired_unknown（予約はその場で解放）
 //      └─batch_id の記録失敗（孤児）─36h→ expired_unknown（resolveStaleLedger）
 // submitted / unresolved が 36h を超えて回収されないのは batchStuck の担当（自動では諦めない）。
@@ -531,7 +566,7 @@ export async function listOpenBatchRounds(
   }
 }
 
-// 回収を試みたが閉じられなかった（retrieve / results の失敗・selection 不正）。
+// 回収を試みたが閉じられなかった（retrieve / results / 要約済みの確認の失敗・selection 不正）。
 // 書けなくても submitted のまま残り次 run で再試行されるので warn のみ。
 export async function markRoundUnresolved(
   supabase: SupabaseClient,

@@ -64,7 +64,7 @@ export function createBatchesPort(): BatchesPort | null {
 // ── 純関数 ─────────────────────────────────────────────────────────────────
 
 // custom_id は記事 id（UUID は ^[a-zA-Z0-9_-]{1,64}$ に収まる）。本文もタイトルも空の記事は送れないので
-// 外す（collect で「結果に無い id」として帰責する）。params は同期と同じ buildAnnotateParams。
+// 外す（collect で「結果に無い id」として帰責する）。
 export function buildBatchRequests(rows: RoundRow[]): {
   requests: BatchRequest[];
   unsendable: string[];
@@ -171,11 +171,11 @@ type SubmitCounts = {
   /** claim が返した母数（下界）。-1 は取得不能（isSelectionDead を発火させない）。 */
   pool: number;
   poolCapped: boolean;
-  /** claim で予約できた件数（= 台帳の request_count）。 */
+  /** claim で予約できた件数（台帳に載ったかは ledgerCounted。ledger_failed では載っていない）。 */
   selected: number;
   /** 台帳に載せた件数。同期の残り枠はここから引く（create が失敗しても数える＝fail-closed）。 */
   ledgerCounted: number;
-  /** create に渡したリクエスト数。0 なら create を呼んでいない。submitDead が読む。 */
+  /** create に渡したリクエスト数（送れない記事を除く）。0 なら create を呼んでいない。submitDead が読む。 */
   reserved: number;
   batchId: string | null;
   ledgerId: string | null;
@@ -191,6 +191,8 @@ type SubmitCounts = {
   createError: string | null;
   /** create は成功したが batch_id を台帳に書けなかった（孤児）。 */
   batchIdWriteError: string | null;
+  /** 送れる行が無く create を呼ばずに閉じたラウンドの settle の失敗（予約が残る）。呼び出し側は exit 1。 */
+  settleError: string | null;
   capUnavailable: boolean;
 };
 
@@ -215,6 +217,7 @@ const EMPTY_SUBMIT: SubmitCounts = {
   ledgerError: null,
   createError: null,
   batchIdWriteError: null,
+  settleError: null,
   capUnavailable: false,
 };
 
@@ -302,15 +305,16 @@ export async function submitAnnotateBatch(
       id,
       reason: new Error(unsendable.includes(id) ? "本文・タイトルとも空" : "対象行が無い"),
     }));
-    await closeSummaryRound(supabase, round, {
+    // reserved=0 なので submitDead には乗らない。settle の失敗は settleError で返して赤くする。
+    const closed = await closeSummaryRound(supabase, round, {
       applied: 0,
       failures: unsent,
-      ledger: { succeeded: 0, errored: 0, applied: 0, lastError: "no_sendable_rows" },
+      ledger: { succeeded: 0, errored: 0, lastError: "no_sendable_rows" },
     });
-    return roundCounts;
+    return { ...roundCounts, settleError: closed.settleError };
   }
 
-  // [5] create（maxRetries 0）。例外は握らず submitDead で赤くする。
+  // [5] create（maxRetries 0）。例外は createError に残して返し、submitDead で赤くする（fail-soft にしない）。
   let batch: MessageBatch;
   try {
     batch = await port.create({ requests }, { maxRetries: 0 });
@@ -336,6 +340,8 @@ export async function submitAnnotateBatch(
 /**
  * 1 run で回収に使う時間。ラウンドの境界と結果の取得の前で見て、超えたら残りは次 run に持ち越す。
  * 結果の本文の読み出しはこの残り時間で打ち切る（途中で切れたら unresolved にして次 run で読み直す）。
+ * ただし SDK の results() は先頭で retrieve をもう 1 回呼び、そこには signal が届かない
+ * （BATCH_API_TIMEOUT_MS でしか切れない）。実効の上限は予算 ＋ 最大 60s。
  */
 export const COLLECT_BUDGET_MS = 120_000;
 
@@ -349,7 +355,7 @@ type CollectCounts = {
   archived: number;
   /** まだ処理中のバッチ数。 */
   pending: number;
-  /** 回収できず unresolved にしたラウンド数（retrieve / results の失敗・selection 不正）。 */
+  /** 回収できず unresolved にしたラウンド数（retrieve / results / 要約済みの確認の失敗・selection 不正）。 */
   unresolved: number;
   /** 時間予算を超えて次 run に回したラウンド数。 */
   deferred: number;
@@ -364,7 +370,10 @@ type CollectCounts = {
   canceled: number;
   /** 記事に書けた件数。 */
   applied: number;
-  /** 成功したが、要約が既に埋まっていたので書かずに予約だけ外した件数（attempted に含む）。 */
+  /**
+   * 成功したが書かずに見送った件数（attempted に含む）。要約が既に埋まっていたか、別のラウンドが
+   * 生きた予約を持っていた記事。予約は書いた側・持ち主が外すので settle には渡さない。
+   */
   superseded: number;
   charged: number;
   released: number;
@@ -461,7 +470,6 @@ export async function collectAnnotateBatches(
         ledger: {
           succeeded: rc.succeeded,
           errored: rc.errored,
-          applied: 0,
           lastError: "archived",
           expired: rc.expired,
           canceled: rc.canceled,
@@ -503,29 +511,34 @@ export async function collectAnnotateBatches(
       );
     }
 
-    // 要約が既に埋まった記事は書かずに予約だけ外す（findSummarized）。予約切れの後に別ラウンドが書いた
-    // 記事と、前の run で書いたが台帳を閉じ損ねた記事がここで外れる。確かめられなければ 1 件も書かずに
-    // unresolved にして次 run で読み直す。
-    const done = await findSummarized(supabase, cls.succeeded.map((s) => s.id));
+    // 書けない記事（要約済み・別ラウンドが生きた予約を持つ。経緯は findSummarized）は見送る。確かめられなければ
+    // 1 件も書かずに unresolved にして次 run で読み直す。
+    const done = await findSummarized(
+      supabase,
+      cls.succeeded.map((s) => s.id),
+      round.leaseDeadline,
+    );
     if (!done.ok) {
       console.warn(`要約済みの確認に失敗 [${batchId}]:`, done.error);
       await markRoundUnresolved(supabase, round.ledgerId, `summarized: ${done.error}`);
       c.unresolved += 1;
       continue;
     }
-    const superseded: SettleEntry[] = cls.succeeded
-      .filter((s) => done.ids.has(s.id))
-      .map((s) => ({ id: s.id, error: "already_summarized" }));
+    let superseded = cls.succeeded.filter((s) => done.ids.has(s.id)).length;
 
-    // タグ → 要約の順で書く（applyAnnotation）。台帳を閉じる前に落ちても、次 run の再回収では
-    // 書けた記事が superseded に回るだけで収束する（settle は所有者チェックで 2 回目は 0 件）。
+    // タグ → 要約の順で書く（applyAnnotation）。要約の update は summary IS NULL のときだけ当たるので、
+    // 確認の後に別の書き手が先に書いた記事も上書きしない（見送りに数える）。台帳を閉じる前に落ちても、
+    // 次 run の再回収では書けた記事が見送りに回るだけで収束する。
     let applied = 0;
     const writeFailures: SettleFailure[] = [];
     for (const s of cls.succeeded) {
       if (done.ids.has(s.id)) continue;
       try {
-        await applyAnnotation(supabase, s.id, interpretAnnotateMessage(s.message));
-        applied += 1;
+        const written = await applyAnnotation(supabase, s.id, interpretAnnotateMessage(s.message), {
+          ifUnsummarized: true,
+        });
+        if (written) applied += 1;
+        else superseded += 1;
       } catch (e) {
         writeFailures.push({ id: s.id, reason: e });
         console.warn(`アノテート失敗（Batches）[${s.id}]:`, e);
@@ -535,12 +548,11 @@ export async function collectAnnotateBatches(
     const closed = await closeSummaryRound(supabase, round, {
       applied,
       failures: [...cls.failures, ...writeFailures],
-      releases: [...cls.releases, ...superseded],
+      releases: cls.releases,
       ledger: {
         succeeded: cls.counts.succeeded,
         errored: cls.counts.errored,
-        applied,
-        lastError: superseded.length ? `already_summarized: ${superseded.length}` : null,
+        lastError: superseded ? `superseded: ${superseded}` : null,
         expired: cls.counts.expired,
         canceled: cls.counts.canceled,
         inputTokens: cls.tokens.input,
@@ -555,7 +567,7 @@ export async function collectAnnotateBatches(
     c.expired += cls.counts.expired;
     c.canceled += cls.counts.canceled;
     c.applied += applied;
-    c.superseded += superseded.length;
+    c.superseded += superseded;
     c.charged += closed.charged;
     c.released += closed.released;
     c.inputTokens += cls.tokens.input;
