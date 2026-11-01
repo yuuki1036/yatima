@@ -3,7 +3,7 @@ import { APIError, APIConnectionError } from "@anthropic-ai/sdk";
 // 要約失敗の帰責（ADR-20260906205227）。error type でなく「同ラウンドの証人」で分ける。
 //
 // なぜ純関数として切り出すか: 「どの失敗に summary_attempts +1 するか」は DB も LLM も無しで
-// 決められる（SDK のエラークラスだけに依存する）。summarize-batch.ts に混ぜると Supabase を
+// 決められる（SDK のエラークラスと Batches の error type だけに依存する）。summarize-batch.ts に混ぜると Supabase を
 // モックしないとテストできない。分類表が壊れると健全期に backlog 上位が全滅するので、
 // ここを機械強制（ユニットテスト）できる形に閉じるのが要件（ADR「機械強制できる部分」）。
 
@@ -18,6 +18,7 @@ export type SettleEntry = { id: string; error: string };
  * 環境起因（false）に確定できるのは、error type から「記事の中身と無関係」と断言できるものだけ:
  * - APIConnectionError（接続断 / timeout・status は undefined）
  * - APIError で status 401（認証）/ 429（レート制限）/ >= 500（サーバ側・529 overloaded 含む）
+ * - Batches の errored 結果（素の ErrorResponse）は error.type で NON_CHARGEABLE_ERROR_TYPES に写す（下の節）
  *
  * それ以外はすべて chargeable（true）:
  * - 400 invalid_request_error … クレジット切れも「本文が壊れている」も同じ型で来る（ADR。実測 100%）。
