@@ -90,9 +90,17 @@ jobs:
       # の 2 段で見る。secret は 1 つずつ名前を指定して env に取るので、通常の使い方と同じ形になる。
       #
       # fork からの PR には secrets が渡らず全件 missing に見えるため、その場合はスキップする。
+      #
+      # Dependabot が起こした run（github.actor が dependabot[bot]）も同じく Actions secrets が渡らない。
+      # 渡るのは Dependabot secrets だけで、別の人が re-run しても制限は残る（GitHub Docs の
+      # "Restrictions when Dependabot triggers events"）。そのため (b) だけを飛ばし、秘密の要らない (a) は回す。
+      # 登録漏れの検知は、マージ後の main の push run が全段を照合するので失われない。
+      # Dependabot secrets に本番の secret を複製する案は、依存更新の PR に本番の秘密を渡すうえ
+      # 2 か所の登録が食い違いうるので採らない（2026-11-25 決定）。
       - name: secrets 照合
         if: ${{ !cancelled() && github.event.pull_request.head.repo.fork != true }}
         env:
+          DEPENDABOT_RUN: ${{ github.actor == 'dependabot[bot]' }}
           # 参照集合と一致しているかは (a) が検証するので、workflow に secret を足したら
           # ここにも足すことになる。足し忘れは (a) が「未宣言」として落とす。
           DECLARED: "ANTHROPIC_API_KEY NEXT_PUBLIC_SUPABASE_URL SUPABASE_SERVICE_ROLE_KEY TAVILY_API_KEY VOYAGE_API_KEY"
@@ -146,6 +154,11 @@ jobs:
           fi
 
           # (b) DECLARED にあるが値が空＝未登録（または env への配線漏れ）
+          if [ "$DEPENDABOT_RUN" = "true" ]; then
+            echo "::notice::Dependabot の run には Actions secrets が渡らないため、値の照合 (b) を飛ばしました（main の push run で照合します）"
+            echo "参照 $(wc -l < /tmp/referenced.txt) 件・宣言 $(wc -l < /tmp/declared.txt) 件、宣言漏れなし"
+            exit 0
+          fi
           : > /tmp/empty.txt
           for name in $DECLARED; do
             [ -n "${!name-}" ] || echo "$name" >> /tmp/empty.txt
